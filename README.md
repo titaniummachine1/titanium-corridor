@@ -30,16 +30,17 @@ Play Human vs **Ishtar** or **Ka** (remote WebSocket engines).
 cd engine
 cargo build --release
 cargo test
-cargo run --release -- perft 2
-cargo run --release -- divide 1
+cargo run --release -- perft          # depth 3 (default) → 2_062_264 nodes
+cargo run --release -- divide         # divide at depth 3
 cargo run --release -- bench 2 20
 cargo bench
 ```
 
-Cross-check move generation vs scraped JS:
+Cross-check move generation (depth 3 = correctness gate):
 
 ```bash
 node benchmark/compare_moves.mjs
+node benchmark/perft_triple.mjs       # scraped JS + gorisanson + Rust
 ```
 
 ## Engine roadmap

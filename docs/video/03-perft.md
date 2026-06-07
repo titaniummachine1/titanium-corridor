@@ -21,7 +21,7 @@ cargo run --release -- perft 1
 cargo run --release -- divide 2
 ```
 
-Explain: depth 3+ explodes because of walls — use depth 1–2 for CI, higher for bench only.
+**Standard correctness depth: 3** → 2_062_264 nodes. Depth 4+ is for stress tests only.
 
 ## Talking points
 

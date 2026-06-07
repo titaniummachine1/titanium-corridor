@@ -1,0 +1,46 @@
+# Titanium Engine — video series overview
+
+Save this file. Record in any order; episodes are checkpointed in git.
+
+## Arc
+
+1. Scraped a Quoridor site — AI is on a server, not in the bundle
+2. Built **Titanium Engine** in Rust — rules first, speed second
+3. Perft caught our first real bug — fixed with divide debugging
+4. **Plot twist:** Rust crushes perft 3, but perft 4 still hurts — compute isn't enough without make/unmake + pruning + TT
+5. Threading prep — `Engine` layout + root-parallel perft bench (`thread-bench`)
+6. Next: αβ search (single-thread), then Lazy SMP like Stockfish
+
+## Episode list
+
+| #   | File                                                     | Topic                 |
+| --- | -------------------------------------------------------- | --------------------- |
+| 01  | [01-path-bfs.md](01-path-bfs.md)                         | Bitboards + BFS       |
+| 02  | [02-legal-moves.md](02-legal-moves.md)                   | 131 moves, JS parity  |
+| 03  | [03-perft.md](03-perft.md)                               | Divide harness        |
+| 04  | [04-bench.md](04-bench.md)                               | Criterion / NPS       |
+| 05  | [05-first-perft-bug.md](05-first-perft-bug.md)           | d8v lateral wall bug  |
+| 06  | [06-threading-prep.md](06-threading-prep.md)             | Titanium vs Titanium  |
+| 07  | [07-ai-opponents.md](07-ai-opponents.md)                 | Gorisanson local boss |
+| —   | [00-HOW-THE-ENGINE-WORKS.md](00-HOW-THE-ENGINE-WORKS.md) | Narration script      |
+| —   | [BUG-DIARY.md](BUG-DIARY.md)                             | All plot twists       |
+| —   | [PERFT-BENCHMARKS.md](PERFT-BENCHMARKS.md)               | Depth timings         |
+
+## Git checkpoints
+
+See [README.md](README.md) for branch names and commit hashes.
+
+**Future:** every tagged checkpoint → build → round-robin → **Elo ladder** ([TOURNAMENT-ROADMAP.md](TOURNAMENT-ROADMAP.md)). Playable opponents start at episode **07 (αβ)**; earlier tags are perft/speed benchmarks only.
+
+## Competitors (reference only)
+
+| Project                                                             | Role in our repo                       |
+| ------------------------------------------------------------------- | -------------------------------------- |
+| [gorisanson/quoridor-ai](https://github.com/gorisanson/quoridor-ai) | MCTS + heuristics; perft cross-check   |
+| [pavlosdais/Quoridor](https://github.com/pavlosdais/Quoridor)       | C αβ competition engine; wall geometry |
+| quoridor-ai.netlify.app                                             | Rules oracle (scraped)                 |
+
+## Do NOT run in videos
+
+- `perft 4` from startpos — **minutes**, looks like a hang
+- Use `perft-race 3` or `perft 3` instead

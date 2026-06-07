@@ -2,27 +2,68 @@
 
 use crate::board::{Board, Move, WallOrientation};
 use crate::grid::{can_step, has_wall, set_wall};
-use crate::path::both_players_reach_goals;
+use crate::path::BfsScratch;
 
 const DIRS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
 
+/// Upper bound on legal moves in any Quoridor position (startpos ≈ 131).
+pub const MAX_LEGAL_MOVES: usize = 140;
+
 pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
+    let mut copy = board.clone();
+    let mut out = Vec::new();
+    let mut scratch = BfsScratch::new();
+    generate_legal_moves_into(&mut copy, &mut out, &mut scratch);
+    out
+}
+
+/// Hot-path API — stack buffer in perft, zero heap allocs per node.
+pub fn generate_legal_moves_slice(
+    board: &mut Board,
+    out: &mut [Move],
+    scratch: &mut BfsScratch,
+) -> usize {
     if board.is_terminal().is_some() {
-        return Vec::new();
+        return 0;
     }
 
-    let mut moves = generate_pawn_moves(board);
+    let mut n = generate_pawn_moves_slice(board, out);
     if board.walls_remaining[board.side_to_move as usize] > 0 {
-        moves.extend(generate_wall_moves(board));
+        n += generate_wall_moves_slice(board, &mut out[n..], scratch);
     }
-    moves
+    debug_assert!(n <= MAX_LEGAL_MOVES);
+    n
+}
+
+/// Reuses `out` buffer and `scratch` BFS pool — board restored after wall trials.
+pub fn generate_legal_moves_into(
+    board: &mut Board,
+    out: &mut Vec<Move>,
+    scratch: &mut BfsScratch,
+) {
+    out.clear();
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let n = generate_legal_moves_slice(board, &mut buf, scratch);
+    out.extend_from_slice(&buf[..n]);
 }
 
 pub fn generate_pawn_moves(board: &Board) -> Vec<Move> {
+    let mut out = Vec::with_capacity(4);
+    generate_pawn_moves_into(board, &mut out);
+    out
+}
+
+pub fn generate_pawn_moves_into(board: &Board, out: &mut Vec<Move>) {
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; 8];
+    let n = generate_pawn_moves_slice(board, &mut buf);
+    out.extend_from_slice(&buf[..n]);
+}
+
+fn generate_pawn_moves_slice(board: &Board, out: &mut [Move]) -> usize {
     let side = board.side_to_move as usize;
     let (fr, fc) = board.pawns[side];
     let (or, oc) = board.pawns[1 - side];
-    let mut out = Vec::with_capacity(4);
+    let mut n = 0usize;
 
     for (dr, dc) in DIRS {
         if !can_step(board, fr, fc, dr, dc) {
@@ -32,14 +73,16 @@ pub fn generate_pawn_moves(board: &Board) -> Vec<Move> {
         let nc = (fc as i8 + dc) as u8;
 
         if (nr, nc) != (or, oc) {
-            out.push(Move::Pawn { row: nr, col: nc });
+            out[n] = Move::Pawn { row: nr, col: nc };
+            n += 1;
             continue;
         }
 
         if can_step(board, nr, nc, dr, dc) {
             let jr = (nr as i8 + dr) as u8;
             let jc = (nc as i8 + dc) as u8;
-            out.push(Move::Pawn { row: jr, col: jc });
+            out[n] = Move::Pawn { row: jr, col: jc };
+            n += 1;
             continue;
         }
 
@@ -52,45 +95,110 @@ pub fn generate_pawn_moves(board: &Board) -> Vec<Move> {
             if can_step(board, nr, nc, pdr, pdc) {
                 let sr = (nr as i8 + pdr) as u8;
                 let sc = (nc as i8 + pdc) as u8;
-                out.push(Move::Pawn { row: sr, col: sc });
+                out[n] = Move::Pawn { row: sr, col: sc };
+                n += 1;
             }
         }
     }
-
-    out
+    n
 }
 
 pub fn generate_wall_moves(board: &Board) -> Vec<Move> {
+    let mut copy = board.clone();
     let mut out = Vec::with_capacity(64);
-    for row in 0..8u8 {
-        for col in 0..8u8 {
-            for orientation in [WallOrientation::Horizontal, WallOrientation::Vertical] {
-                if is_legal_wall(board, row, col, orientation) {
-                    out.push(Move::Wall {
-                        row,
-                        col,
-                        orientation,
-                    });
-                }
-            }
-        }
-    }
+    let mut scratch = BfsScratch::new();
+    generate_wall_moves_into(&mut copy, &mut out, &mut scratch);
     out
 }
 
-fn is_legal_wall(board: &Board, row: u8, col: u8, orientation: WallOrientation) -> bool {
+pub fn generate_wall_moves_into(board: &mut Board, out: &mut Vec<Move>, scratch: &mut BfsScratch) {
+    let mut buf = [Move::Wall {
+        row: 0,
+        col: 0,
+        orientation: WallOrientation::Horizontal,
+    }; MAX_LEGAL_MOVES];
+    let n = generate_wall_moves_slice(board, &mut buf, scratch);
+    out.extend_from_slice(&buf[..n]);
+}
+
+fn generate_wall_moves_slice(
+    board: &mut Board,
+    out: &mut [Move],
+    scratch: &mut BfsScratch,
+) -> usize {
+    let mut n = 0usize;
+    n += collect_wall_orientation(
+        board,
+        !board.horizontal_walls,
+        WallOrientation::Horizontal,
+        &mut out[n..],
+        scratch,
+    );
+    n += collect_wall_orientation(
+        board,
+        !board.vertical_walls,
+        WallOrientation::Vertical,
+        &mut out[n..],
+        scratch,
+    );
+    n
+}
+
+/// Iterate only **empty** wall slots via `trailing_zeros` — skips occupied bits early.
+fn collect_wall_orientation(
+    board: &mut Board,
+    mut free: u64,
+    orientation: WallOrientation,
+    out: &mut [Move],
+    scratch: &mut BfsScratch,
+) -> usize {
+    let mut n = 0usize;
+    while free != 0 {
+        let bit = free.trailing_zeros();
+        free &= free - 1;
+        let row = (bit / 8) as u8;
+        let col = (bit % 8) as u8;
+        if is_legal_wall(board, row, col, orientation, scratch) {
+            out[n] = Move::Wall {
+                row,
+                col,
+                orientation,
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
+fn is_legal_wall(
+    board: &mut Board,
+    row: u8,
+    col: u8,
+    orientation: WallOrientation,
+    scratch: &mut BfsScratch,
+) -> bool {
     if wall_collides(board, row, col, orientation) {
         return false;
     }
-    // Matches scraped JS: if `canWallBlock` is false, `isWallBlocking` short-circuits to false
-    // (floating walls are legal). Only run path check when topology can matter.
     if !can_wall_block_topology(board, row, col, orientation) {
         return true;
     }
+    path_ok_after_wall(board, row, col, orientation, scratch)
+}
 
-    let mut trial = board.clone();
-    set_wall(&mut trial, row, col, orientation, true);
-    both_players_reach_goals(&trial)
+/// Trial wall in-place — set, BFS both goals, unset. No `Board::clone`.
+#[inline]
+fn path_ok_after_wall(
+    board: &mut Board,
+    row: u8,
+    col: u8,
+    orientation: WallOrientation,
+    scratch: &mut BfsScratch,
+) -> bool {
+    set_wall(board, row, col, orientation, true);
+    let ok = scratch.both_players_reach_goals(board);
+    set_wall(board, row, col, orientation, false);
+    ok
 }
 
 /// Matches scraped `collidesWithExistingWall`.
@@ -227,5 +335,27 @@ mod tests {
         let board = Board::new();
         let walls = generate_wall_moves(&board);
         assert!(walls.len() > 100);
+    }
+
+    #[test]
+    fn slice_matches_vec_at_startpos() {
+        let mut board = Board::new();
+        let mut scratch = BfsScratch::new();
+        let mut slice_buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let n = generate_legal_moves_slice(&mut board, &mut slice_buf, &mut scratch);
+        let vec_moves = generate_legal_moves(&board);
+        assert_eq!(n, vec_moves.len());
+        assert_eq!(&slice_buf[..n], vec_moves.as_slice());
+        assert!(n <= MAX_LEGAL_MOVES);
+    }
+
+    #[test]
+    fn wall_trial_leaves_board_unchanged() {
+        let mut board = Board::new();
+        let before = board.clone();
+        let mut scratch = BfsScratch::new();
+        let mut moves = Vec::new();
+        generate_wall_moves_into(&mut board, &mut moves, &mut scratch);
+        assert_eq!(board, before);
     }
 }

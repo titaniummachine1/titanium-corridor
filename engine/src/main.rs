@@ -3,7 +3,7 @@
 use std::env;
 use std::time::Instant;
 
-use titanium::{Board, generate_legal_moves, perft, perft_divide};
+use titanium::{Board, Engine, generate_legal_moves, perft_divide};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -16,6 +16,9 @@ fn main() {
         "perft" => run_perft(&args),
         "divide" => run_divide(&args),
         "bench" => run_bench(&args),
+        "perft-race" => run_perft_race(&args),
+        "perft-id" => run_perft_id(&args),
+        "thread-bench" => run_thread_bench(&args),
         "moves" => run_moves(),
         _ => print_usage(),
     }
@@ -23,25 +26,85 @@ fn main() {
 
 fn print_usage() {
     println!("Titanium Engine 0.1.0");
-    println!("  titanium perft <depth>     — node count from startpos");
-    println!("  titanium divide <depth>    — perft with move breakdown");
-    println!("  titanium bench <depth> <n> — time perft iterations");
-    println!("  titanium moves             — list legal moves at startpos");
+    println!("  titanium perft [depth] [--threads N]  — node count (default depth 3, threads 1)");
+    println!("  titanium divide <depth>                — perft with move breakdown");
+    println!("  titanium bench <depth> <n> [--threads N]");
+    println!("  titanium thread-bench [depth] [--threads N] — 1 vs N threads, same nodes");
+    println!("  titanium perft-race <sec>              — max depth within time budget");
+    println!("  titanium perft-id [depth]              — iterative deepening perft 0..depth");
+    println!("  titanium moves                         — list legal moves at startpos");
+}
+
+const DEFAULT_PERFT_DEPTH: u32 = 3;
+const DEFAULT_THREAD_BENCH_DEPTH: u32 = 4;
+
+struct CliArgs {
+    positional: Vec<String>,
+    threads: usize,
+}
+
+fn parse_cli(args: &[String]) -> CliArgs {
+    let mut threads = 1usize;
+    let mut positional = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--threads" {
+            threads = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+            i += 2;
+            continue;
+        }
+        positional.push(args[i].clone());
+        i += 1;
+    }
+    CliArgs {
+        positional,
+        threads,
+    }
+}
+
+fn default_parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(2)
+}
+
+fn load_board(cli: &CliArgs, depth_index: usize) -> (Board, u32) {
+    let depth: u32 = cli
+        .positional
+        .get(depth_index)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PERFT_DEPTH);
+    let mut board = Board::new();
+    for mv in cli.positional.iter().skip(depth_index + 1) {
+        board.apply_algebraic(mv);
+    }
+    (board, depth)
+}
+
+fn make_engine(threads: usize) -> Engine {
+    if threads <= 1 {
+        Engine::new()
+    } else {
+        Engine::with_threads(threads)
+    }
 }
 
 fn run_perft(args: &[String]) {
-    let depth: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let board = Board::new();
+    let cli = parse_cli(args);
+    let (board, depth) = load_board(&cli, 2);
+    let mut engine = make_engine(cli.threads);
     let start = Instant::now();
-    let nodes = perft(&board, depth);
+    let nodes = engine.perft(&board, depth);
     let elapsed = start.elapsed();
     println!("perft {} {}", depth, nodes);
+    println!("threads {}", cli.threads);
     println!("time {:.3}s", elapsed.as_secs_f64());
 }
 
 fn run_divide(args: &[String]) {
-    let depth: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let board = Board::new();
+    let cli = parse_cli(args);
+    let (board, depth) = load_board(&cli, 2);
     let (total, lines) = perft_divide(&board, depth);
     for (mv, nodes) in &lines {
         println!("{} {}", mv, nodes);
@@ -51,28 +114,111 @@ fn run_divide(args: &[String]) {
 }
 
 fn run_bench(args: &[String]) {
-    let depth: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let iterations: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let cli = parse_cli(args);
+    let depth: u32 = cli
+        .positional
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PERFT_DEPTH);
+    let iterations: u32 = cli.positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
     let board = Board::new();
+    let mut engine = make_engine(cli.threads);
 
-    perft(&board, depth);
+    engine.perft(&board, depth);
 
     let start = Instant::now();
     let mut nodes = 0u64;
     for _ in 0..iterations {
-        nodes = perft(&board, depth);
+        nodes = engine.perft(&board, depth);
     }
     let elapsed = start.elapsed();
     let total_nodes = nodes * iterations as u64;
     let nps = total_nodes as f64 / elapsed.as_secs_f64();
 
     println!(
-        "bench depth={} iters={} nodes={} time={:.3}s nps={:.0}",
+        "bench depth={} iters={} threads={} nodes={} time={:.3}s nps={:.0}",
         depth,
         iterations,
+        cli.threads,
         total_nodes,
         elapsed.as_secs_f64(),
         nps
+    );
+}
+
+fn run_perft_id(args: &[String]) {
+    let cli = parse_cli(args);
+    let max_depth: u32 = cli
+        .positional
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PERFT_DEPTH);
+    let mut board = Board::new();
+    let mut engine = make_engine(cli.threads);
+    let start = Instant::now();
+    let lines = engine.perft_iterative(&mut board, max_depth);
+    let elapsed = start.elapsed();
+
+    for (depth, nodes) in &lines {
+        println!("perft {} {}", depth, nodes);
+    }
+    println!("threads {}", cli.threads);
+    println!("perft-id total {:.3}s", elapsed.as_secs_f64());
+}
+
+fn run_thread_bench(args: &[String]) {
+    let cli = parse_cli(args);
+    let depth: u32 = cli
+        .positional
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_THREAD_BENCH_DEPTH);
+    let parallel = if cli.threads > 1 {
+        cli.threads
+    } else {
+        default_parallel_threads()
+    };
+    let board = Board::new();
+
+    let result = Engine::bench_threads(&board, depth, parallel);
+
+    println!("thread-bench depth={} nodes={}", result.depth, result.nodes);
+    println!("threads=1  time {:.3}s", result.threads_one_secs);
+    println!(
+        "threads={} time {:.3}s",
+        result.threads_n, result.threads_n_secs
+    );
+    println!("speedup {:.2}x", result.speedup());
+}
+
+fn run_perft_race(args: &[String]) {
+    let cli = parse_cli(args);
+    let budget: f64 = cli
+        .positional
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3.0);
+    let board = Board::new();
+    let mut engine = make_engine(cli.threads);
+    let mut best_depth = 0u32;
+    let mut best_nodes = 0u64;
+    let mut best_ms = 0.0f64;
+
+    for depth in 1..=8 {
+        let start = Instant::now();
+        let nodes = engine.perft(&board, depth);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        if ms > budget * 1000.0 {
+            break;
+        }
+        best_depth = depth;
+        best_nodes = nodes;
+        best_ms = ms;
+    }
+
+    println!(
+        "perft-race budget={:.1}s threads={} best_depth={} nodes={} time_ms={:.0}",
+        budget, cli.threads, best_depth, best_nodes, best_ms
     );
 }
 

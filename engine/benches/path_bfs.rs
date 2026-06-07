@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use titanium::{both_players_reach_goals, generate_legal_moves, perft, Board, Player};
+use titanium::{both_players_reach_goals, generate_legal_moves, perft_fast, Board, Player};
 
 fn bench_bfs_reach(c: &mut Criterion) {
     let board = Board::new();
@@ -23,9 +23,12 @@ fn bench_legal_moves(c: &mut Criterion) {
 }
 
 fn bench_perft(c: &mut Criterion) {
-    let board = Board::new();
-    c.bench_function("perft_depth2", |b| {
-        b.iter(|| black_box(perft(black_box(&board), 2)));
+    let mut board = Board::new();
+    c.bench_function("perft_fast_depth3", |b| {
+        b.iter(|| {
+            let nodes = perft_fast(black_box(&mut board), 3);
+            black_box(nodes)
+        });
     });
 }
 
