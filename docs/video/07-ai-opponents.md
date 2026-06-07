@@ -1,7 +1,7 @@
 # Episode 07 — First opponent: Gorisanson (local)
 
-- **branch:** `checkpoint/07-gorisanson-ui` _(after commit)_
-- **commit:** _(fill after commit)_
+- **branch:** `checkpoint/07-gorisanson-ui`
+- **commit:** `7c85a20`
 - **tag:** `checkpoint-07-gorisanson-ui`
 
 ## Hook

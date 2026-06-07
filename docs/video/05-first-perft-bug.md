@@ -1,7 +1,7 @@
 # Episode 05 — First perft bug: lateral wall check
 
-- **branch:** `checkpoint/05-perft-bugfix` *(after commit)*
-- **commit:** *(fill after commit)*
+- **branch:** `checkpoint/05-perft-bugfix`
+- **commit:** `6b9e00d`
 - **tag:** `checkpoint-05-perft-bugfix`
 
 ## Hook

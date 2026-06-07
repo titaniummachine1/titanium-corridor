@@ -44,7 +44,7 @@
       "episode": 5,
       "tag": "checkpoint-05-perft-bugfix",
       "branch": "checkpoint/05-perft-bugfix",
-      "commit": null,
+      "commit": "6b9e00d",
       "can_play": false,
       "notes": "Lateral can_step fix; perft d3 oracle"
     },
@@ -53,18 +53,18 @@
       "episode": 6,
       "tag": "checkpoint-06-threading",
       "branch": "checkpoint/06-threading",
-      "commit": null,
+      "commit": "098477c",
       "can_play": false,
       "notes": "Engine layout, thread-bench, root parallel perft"
     },
     {
       "id": "titanium-07",
       "episode": 7,
-      "tag": "checkpoint-07-alphabeta",
-      "branch": "checkpoint/07-alphabeta",
-      "commit": null,
+      "tag": "checkpoint-07-gorisanson-ui",
+      "branch": "checkpoint/07-gorisanson-ui",
+      "commit": "7c85a20",
       "can_play": true,
-      "notes": "First checkpoint eligible for Elo tournament"
+      "notes": "Gorisanson MCTS in browser + terminal head-to-head"
     }
   ],
   "external_opponents": [

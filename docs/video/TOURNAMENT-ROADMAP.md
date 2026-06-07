@@ -25,9 +25,10 @@ Same idea as chess engine testing (CEGT/STS style), but our stages are **our own
 | 02 Moves       | `checkpoint-02-legal-moves`                                 | `19864b8`  | No search | Same                                                      |
 | 03 Perft       | `checkpoint-03-perft`                                       | `5a4b0fc`  | No search | Same                                                      |
 | 04 Bench       | `checkpoint-04-bench`                                       | `90193b0`  | No search | Same                                                      |
-| 05 Bugfix      | `checkpoint-05-perft-bugfix` / `checkpoint/05-perft-bugfix` | _(TBD)_    | No search | Perft gate = **2_062_264** @ d3                           |
-| 06 Thread prep | `checkpoint-06-threading`                                   | _(TBD)_    | No search | `thread-bench` only                                       |
-| 07+ αβ search  | `checkpoint-07-alphabeta` …                                 | _(future)_ | **Yes**   | **First real Elo ladder**                                 |
+| 05 Bugfix      | `checkpoint-05-perft-bugfix` / `checkpoint/05-perft-bugfix` | `6b9e00d`  | No search | Perft gate = **2_062_264** @ d3                           |
+| 06 Thread prep | `checkpoint-06-threading`                                   | `098477c`  | No search | `thread-bench` only                                       |
+| 07 Gorisanson  | `checkpoint-07-gorisanson-ui` / `checkpoint/07-gorisanson-ui` | `7c85a20`  | MCTS UI   | Local opponent + `head_to_head.mjs`                       |
+| 08+ αβ search  | `checkpoint-08-alphabeta` …                                 | _(future)_ | **Yes**   | **First real Titanium Elo ladder**                        |
 | main           | `main`                                                      | moving     | Latest    | Always “current champ”                                    |
 
 **Rule:** No Elo between checkpoints until at least one has **`genmove`** (αβ or MCTS). Before that, compare with **perft**, **nps**, **thread-bench** — not playing strength.

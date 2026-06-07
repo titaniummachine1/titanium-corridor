@@ -1,7 +1,7 @@
 # Episode 06 — Threading prep (Titanium vs Titanium)
 
-- **branch:** `checkpoint/06-threading` _(after commit)_
-- **commit:** _(fill after commit)_
+- **branch:** `checkpoint/06-threading`
+- **commit:** `098477c`
 - **tag:** `checkpoint-06-threading`
 
 **Status:** architecture landed; Lazy SMP search = later episode. Tournament registry: [TOURNAMENT-ROADMAP.md](TOURNAMENT-ROADMAP.md).

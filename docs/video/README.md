@@ -9,9 +9,9 @@ After each checkpoint commit, update the `commit:` line with `git rev-parse --sh
 | 02      | `checkpoint/02-legal-moves`   | `19864b8`  | [02-legal-moves.md](02-legal-moves.md)         |
 | 03      | `checkpoint/03-perft`         | `5a4b0fc`  | [03-perft.md](03-perft.md)                     |
 | 04      | `checkpoint/04-bench`         | `90193b0`  | [04-bench.md](04-bench.md)                     |
-| 05      | `checkpoint/05-perft-bugfix`  | _(TBD)_    | [05-first-perft-bug.md](05-first-perft-bug.md) |
-| 06      | `checkpoint/06-threading`     | _(TBD)_    | [06-threading-prep.md](06-threading-prep.md)   |
-| 07      | `checkpoint/07-gorisanson-ui` | _(TBD)_    | [07-ai-opponents.md](07-ai-opponents.md)       |
+| 05      | `checkpoint/05-perft-bugfix`  | `6b9e00d`  | [05-first-perft-bug.md](05-first-perft-bug.md) |
+| 06      | `checkpoint/06-threading`     | `098477c`  | [06-threading-prep.md](06-threading-prep.md)   |
+| 07      | `checkpoint/07-gorisanson-ui` | `7c85a20`  | [07-ai-opponents.md](07-ai-opponents.md)       |
 | 08+     | `checkpoint/08-alphabeta` …   | _(future)_ | Titanium `genmove` — first Elo vs gorisanson   |
 
 **Perft debug:** `node benchmark/perft_diff.mjs 2` — divide diff vs JS oracle.
