@@ -8,10 +8,6 @@ const controller = new AppController();
 
 appRoot.innerHTML = `
   <div class="layout">
-    <header class="layout__header">
-      <span class="brand">Quoridor AI</span>
-      <span class="brand-note">Play · Human vs Ishtar/Ka</span>
-    </header>
     <aside class="layout__eval" id="eval-root"></aside>
     <main class="layout__board" id="board-root"></main>
     <aside class="layout__controls" id="controls-root"></aside>

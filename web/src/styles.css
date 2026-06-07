@@ -31,31 +31,11 @@ body {
   min-height: 100vh;
   gap: 10px;
   padding: 10px;
-  grid-template-areas:
-    'header header header'
-    'eval board controls';
+  grid-template-areas: 'eval board controls';
   grid-template-columns: 24px minmax(320px, 680px) 320px;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: 1fr;
   justify-content: center;
-  align-content: start;
-}
-
-.layout__header {
-  grid-area: header;
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 4px 8px;
-}
-
-.brand {
-  font-weight: 700;
-  font-size: 1.25rem;
-}
-
-.brand-note {
-  color: var(--muted);
-  font-size: 0.9rem;
+  align-content: center;
 }
 
 .layout__eval {
@@ -78,12 +58,12 @@ body {
 @media (max-width: 900px) {
   .layout {
     grid-template-areas:
-      'header'
       'eval'
       'board'
       'controls';
     grid-template-columns: 1fr;
-    grid-template-rows: auto 20px auto auto;
+    grid-template-rows: 20px auto auto;
+    align-content: start;
   }
 
   .layout__board {
@@ -154,11 +134,12 @@ body {
 .board {
   display: grid;
   grid-template-areas:
-    'top top top'
-    'rows grid walls'
-    'bottom bottom bottom';
-  grid-template-columns: 32px 1fr 42px;
-  grid-template-rows: 32px 1fr 32px;
+    '. row-coords .'
+    'col-coords grid wall-p2'
+    'col-coords grid wall-p1'
+    '. . turn-p1';
+  grid-template-columns: 28px 1fr 36px;
+  grid-template-rows: 28px 1fr 1fr 28px;
   background: var(--board-bg);
   border-radius: 12px;
   padding: 8px;
@@ -171,7 +152,7 @@ body {
 }
 
 .coord-row {
-  grid-area: rows;
+  grid-area: row-coords;
   display: flex;
   opacity: 0;
   transition: opacity 0.4s;
@@ -182,7 +163,15 @@ body {
 }
 
 .coord-col {
-  display: none;
+  grid-area: col-coords;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+
+.coord-col--visible {
+  opacity: 1;
 }
 
 .coord-label {
@@ -213,30 +202,27 @@ body {
 }
 
 .engine-state--p2 {
-  grid-area: top;
+  grid-area: wall-p2;
+  align-self: start;
 }
 
 .engine-state--p1 {
-  grid-area: bottom;
+  grid-area: turn-p1;
 }
 
 .wall-rack {
-  grid-area: walls;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  align-items: center;
-  padding: 4px 0;
-  gap: 8px;
-}
-
-.wall-rack--p2,
-.wall-rack--p1 {
-  flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 100%;
+}
+
+.wall-rack--p2 {
+  grid-area: wall-p2;
+  align-self: end;
+}
+
+.wall-rack--p1 {
+  grid-area: wall-p1;
 }
 
 .wall-rack-inner {
@@ -497,6 +483,18 @@ body {
   border-top: 1px solid var(--border);
   padding-top: 12px;
   font-size: 0.9rem;
+}
+
+.time-hint {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.status-line--muted strong {
+  font-weight: 500;
+  color: var(--muted);
 }
 
 .status-line {

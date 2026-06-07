@@ -1,31 +1,33 @@
 export function renderControls(container, state, controller) {
-  const { settings, aiThinking, timeLabels, playerOptions } = state;
+  const { settings, aiThinking, timePresets, playerOptionGroups, timeBudgetHint, searchInfoLine } =
+    state;
 
   container.innerHTML = `
     <section class="controls-card">
       <h1 class="app-title">Quoridor AI</h1>
-      <p class="app-subtitle">Reverse-engineered clone — rules local, engines remote</p>
+      <p class="app-subtitle">Play · Human vs Ishtar, Ka, or local MCTS</p>
 
       <div class="control-group">
         <label class="control-label">Player 1 (moves first)</label>
-        ${renderPlayerSelect('player1', settings.players[0], playerOptions)}
+        ${renderPlayerSelect('player1', settings.players[0], playerOptionGroups)}
       </div>
 
       <div class="control-group">
         <label class="control-label">Player 2</label>
-        ${renderPlayerSelect('player2', settings.players[1], playerOptions)}
+        ${renderPlayerSelect('player2', settings.players[1], playerOptionGroups)}
       </div>
 
       <div class="control-group">
         <label class="control-label">AI Time</label>
         <select class="control-select" data-setting="time">
-          ${timeLabels
+          ${timePresets
             .map(
-              (label, index) =>
-                `<option value="${index}" ${settings.timeToMove === index ? 'selected' : ''}>${label}</option>`,
+              (preset) =>
+                `<option value="${preset.id}" ${settings.timeToMove === preset.id ? 'selected' : ''}>${preset.label}</option>`,
             )
             .join('')}
         </select>
+        <p class="time-hint">${escapeHtml(timeBudgetHint)}</p>
       </div>
 
       <div class="button-row">
@@ -43,6 +45,7 @@ export function renderControls(container, state, controller) {
       <div class="status-panel">
         <div class="status-line"><span>Turn</span><strong>Player ${state.playerToMove}</strong></div>
         <div class="status-line"><span>Eval (P1)</span><strong>${Math.round((state.eval.p1 ?? 0.5) * 100)}%</strong></div>
+        ${searchInfoLine ? `<div class="status-line status-line--muted"><span>AI</span><strong>${escapeHtml(searchInfoLine)}</strong></div>` : ''}
         ${
           state.eval.pv?.length
             ? `<div class="pv-line">PV: ${state.eval.pv.map((move) => (move.coordinate ? formatMove(move) : '?')).join(' ')}</div>`
@@ -83,10 +86,22 @@ export function renderControls(container, state, controller) {
   });
 }
 
-function renderPlayerSelect(name, value, options) {
-  return `<select class="control-select" data-setting="${name}">
-    ${options.map((opt) => `<option value="${opt.value}" ${opt.value === value ? 'selected' : ''}>${opt.label}</option>`).join('')}
-  </select>`;
+function renderPlayerSelect(name, value, groups) {
+  const options = groups
+    .map(
+      (group) => `
+      <optgroup label="${escapeHtml(group.label)}">
+        ${group.options
+          .map(
+            (opt) =>
+              `<option value="${opt.value}" ${opt.value === value ? 'selected' : ''} ${opt.disabled ? 'disabled' : ''}>${escapeHtml(opt.label)}</option>`,
+          )
+          .join('')}
+      </optgroup>`,
+    )
+    .join('');
+
+  return `<select class="control-select" data-setting="${name}">${options}</select>`;
 }
 
 function formatMove(action) {
@@ -95,4 +110,11 @@ function formatMove(action) {
     return `${action.coordinate.column}${action.coordinate.row}${suffix}`;
   }
   return `${action.coordinate.column}${action.coordinate.row}`;
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
 }

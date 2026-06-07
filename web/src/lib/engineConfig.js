@@ -39,6 +39,9 @@ const TimeToMove = {
 /** Who controls each player slot. */
 const PlayerType = {
   Human: 'human',
+  GorisansonMCTS: 'gorisanson-mcts',
+  Titanium: 'titanium',
+  Pavlosdais: 'pavlosdais',
   IshtarV3: 'ishtar-v3-ai',
   IshtarPonder: 'ishtar-ponder',
   KaAI: 'ka-ai',

@@ -1,0 +1,336 @@
+/* Board layout — matches quoridor-ai.netlify.app scraped structure */
+
+.board-panel {
+  position: relative;
+  aspect-ratio: 1;
+  width: 100%;
+}
+
+.board {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  grid-template-areas:
+    '.                     .                     engine-state-p2'
+    'coordinate-labels-row board-grid            wall-marks-p2'
+    'coordinate-labels-row board-grid            wall-marks-p1'
+    '.                     coordinate-labels-col engine-state-p1';
+  grid-template-columns: 8fr 90fr 8fr;
+  grid-template-rows: 8fr 45fr 45fr 8fr;
+  border-radius: 4%;
+  background-color: #f0d9b5;
+  transition: transform 1.2s ease;
+}
+
+.board--rotate {
+  transform: rotate(180deg);
+}
+
+.board--rotate [data-cell-type='verticalWall'] {
+  transform: translateY(122%);
+}
+
+.board--rotate [data-cell-type='horizontalWall'] {
+  transform: translate(122%);
+}
+
+.board-grid {
+  grid-area: board-grid;
+  display: grid;
+  gap: 0;
+}
+
+.engine-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.engine-state--p1 {
+  grid-area: engine-state-p1;
+}
+
+.engine-state--p2 {
+  grid-area: engine-state-p2;
+}
+
+.wall-marks {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  align-items: center;
+  position: relative;
+  width: 100%;
+  height: 70%;
+}
+
+.wall-marks--p1 {
+  grid-area: wall-marks-p1;
+  align-self: end;
+}
+
+.wall-marks--p2 {
+  grid-area: wall-marks-p2;
+  align-self: start;
+}
+
+.wall-marks__slot {
+  height: 4%;
+  width: 65%;
+  border-radius: 3px;
+  z-index: 1100;
+  opacity: 0;
+  transition: opacity 0.5s ease;
+  box-shadow: 2px 3px 3px #0000004d;
+}
+
+.board--rotate .wall-marks__slot {
+  box-shadow: -2px -3px 3px #0000004d;
+}
+
+.wall-marks__slot--available {
+  opacity: 1;
+}
+
+.wall-marks__slot--player1.wall-marks__slot--available {
+  background-color: #8b5e34;
+}
+
+.wall-marks__slot--player2.wall-marks__slot--available {
+  background-color: #583101;
+}
+
+.wall-marks__count {
+  user-select: none;
+  color: #583101;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Roboto Mono', monospace;
+  font-weight: 700;
+  font-size: 1.6em;
+  opacity: 0;
+  transition: opacity 1s ease;
+}
+
+.wall-marks__count--visible {
+  opacity: 1;
+}
+
+.board--rotate .wall-marks__count {
+  transform: rotate(180deg);
+}
+
+.coord-labels {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  opacity: 0;
+  transition: opacity 1s ease;
+}
+
+.coord-labels--visible {
+  opacity: 1;
+}
+
+.coord-labels--row {
+  grid-area: coordinate-labels-row;
+  justify-content: space-around;
+}
+
+.coord-labels--col {
+  grid-area: coordinate-labels-col;
+  flex-direction: row;
+  justify-content: space-around;
+}
+
+.coord-labels__label {
+  user-select: none;
+  color: #583101;
+  display: flex;
+  flex: 9;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Roboto Mono', monospace;
+  font-weight: 700;
+  font-size: 1.3em;
+}
+
+.board--rotate .coord-labels__label {
+  transform: rotate(180deg);
+}
+
+.coord-labels__spacer {
+  flex: 2;
+}
+
+.board-cell__square {
+  height: 100%;
+  width: 100%;
+  background-color: #d4a276;
+  border-radius: 3px;
+  box-shadow: 1px 2px 2px #9c6644;
+}
+
+.board-cell__square--prev {
+  background-color: #deb795;
+}
+
+.board-cell__square--valid {
+  cursor: pointer;
+}
+
+.board-cell__pawn {
+  position: relative;
+  width: 92%;
+  height: 92%;
+  transform: translate(5%, 5%);
+  border-radius: 50%;
+  z-index: 2000;
+  box-shadow: 1px 2px 2px #9c6644;
+}
+
+.board-cell__pawn--player1 {
+  background-color: #ede0d4;
+}
+
+.board-cell__pawn--player2 {
+  background-color: #603808;
+}
+
+.board-cell__wall {
+  position: relative;
+  border-radius: 3px;
+  z-index: 2000;
+  opacity: 0;
+  width: 90%;
+  height: 90%;
+  box-sizing: border-box;
+  pointer-events: none;
+  left: 6%;
+  top: 6%;
+}
+
+.board-cell__wall--placed {
+  opacity: 1;
+}
+
+.board-cell--wall-valid {
+  cursor: pointer;
+}
+
+.board-cell__wall--valid {
+  pointer-events: auto;
+}
+
+[data-cell-type='horizontalWall'].board-cell--wall-valid:hover .board-cell__wall--valid,
+[data-cell-type='verticalWall'].board-cell--wall-valid:hover .board-cell__wall--valid {
+  background-color: #8b5e34;
+  opacity: 0.7;
+}
+
+.board-cell__wall--h {
+  left: 0;
+  width: 222%;
+}
+
+.board-cell__wall--v {
+  top: 0;
+  height: 222%;
+}
+
+.board-cell__wall--player1 {
+  background-color: #8b5e34;
+}
+
+.board-cell__wall--player2 {
+  background-color: #583101;
+}
+
+.turn-indicator {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+}
+
+.turn-dot {
+  width: 38%;
+  height: 38%;
+  border-radius: 50%;
+  animation: board-turn-pulse 3s ease-in-out infinite;
+}
+
+.turn-dot--player1 {
+  background-color: #8b5e34;
+  box-shadow: 0 0 4px 1px #8b5e3466;
+}
+
+.turn-dot--player2 {
+  background-color: #603808;
+  box-shadow: 0 0 4px 1px #6038084d;
+}
+
+.engine-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid #8b5e3444;
+  border-top-color: #8b5e34;
+  border-radius: 50%;
+  animation: board-spin 0.9s linear infinite;
+}
+
+.engine-spinner--error {
+  animation: none;
+  border: none;
+  color: #ff6b6b;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.winner-banner {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  color: white;
+  font-size: 1.5rem;
+  font-weight: 700;
+  border-radius: 12px;
+  z-index: 3000;
+}
+
+@keyframes board-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes board-turn-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scale(0.88);
+    opacity: 0.5;
+  }
+}
+
+@media (min-width: 500px) and (min-height: 500px) {
+  .board--rotate .board-cell__square {
+    box-shadow: -1px -2px 2px #9c6644;
+  }
+
+  .board--rotate .board-cell__pawn {
+    box-shadow: -1px -2px 2px #9c6644;
+  }
+}

@@ -1,11 +1,18 @@
 import { WallType, formatCoordinate, toAlgebraic } from '../lib/gameLogic.js';
+import './board.css';
 
-// Re-export column helper used by board grid
+const SQUARE_TRACK = '9fr';
+const WALL_TRACK = '2fr';
+
 function indexToColumnLocal(index) {
   return String.fromCharCode(index + 96);
 }
 
-function columnLabel(colIndex, numCols) {
+function buildGridTracks(count) {
+  return Array.from({ length: count }, (_, index) => (index % 2 === 0 ? SQUARE_TRACK : WALL_TRACK)).join(' ');
+}
+
+function columnLabel(colIndex) {
   return indexToColumnLocal(colIndex);
 }
 
@@ -36,130 +43,68 @@ export function renderBoard(container, state, controller) {
   }
 
   const lastKey = state.lastAction ? toAlgebraic(state.lastAction) : null;
+  const isHumanTurn = controller.session.isHumanTurn(settings.players);
+  const showCoords = settings.displayCoordinates;
+  const showWallCounts = settings.displayRemainingWalls;
+  const isRotated = settings.rotateBoard;
 
   container.innerHTML = '';
-  container.className = 'board-panel' + (settings.rotateBoard ? ' board-panel--rotated' : '');
+  container.className = 'board-panel';
 
   const boardShell = document.createElement('div');
-  boardShell.className = 'board';
+  boardShell.className = 'board' + (isRotated ? ' board--rotate' : '');
 
-  const topStatus = document.createElement('div');
-  topStatus.className = 'engine-state engine-state--p2';
-  topStatus.appendChild(renderTurnIndicator(2, playerToMove, settings.players[1], engineStatus, aiThinking));
+  const engineStateP1 = document.createElement('div');
+  engineStateP1.className = 'engine-state engine-state--p1';
+  engineStateP1.appendChild(
+    renderTurnIndicator(1, playerToMove, settings.players[0], engineStatus, aiThinking),
+  );
 
-  const bottomStatus = document.createElement('div');
-  bottomStatus.className = 'engine-state engine-state--p1';
-  bottomStatus.appendChild(renderTurnIndicator(1, playerToMove, settings.players[0], engineStatus, aiThinking));
+  const engineStateP2 = document.createElement('div');
+  engineStateP2.className = 'engine-state engine-state--p2';
+  engineStateP2.appendChild(
+    renderTurnIndicator(2, playerToMove, settings.players[1], engineStatus, aiThinking),
+  );
 
-  const rowLabels = document.createElement('div');
-  rowLabels.className = 'coord-row' + (settings.displayCoordinates ? ' coord-row--visible' : '');
-  for (let row = 0; row < numRows; row++) {
-    const label = document.createElement('span');
-    label.className = 'coord-label';
-    label.textContent = rowLabel(row, numRows);
-    rowLabels.appendChild(label);
-    if (row < numRows - 1) {
-      const spacer = document.createElement('span');
-      spacer.className = 'coord-spacer';
-      rowLabels.appendChild(spacer);
-    }
-  }
+  const coordLabelsRow = renderCoordinateLabels('row', numRows, showCoords, controller);
+  const coordLabelsCol = renderCoordinateLabels('col', numCols, showCoords, controller);
 
-  const wallsP2 = document.createElement('div');
-  wallsP2.className = 'wall-rack wall-rack--p2';
-  wallsP2.appendChild(renderWallRack(2, wallsRemaining[1], settings, controller));
-
-  const wallsP1 = document.createElement('div');
-  wallsP1.className = 'wall-rack wall-rack--p1';
-  wallsP1.appendChild(renderWallRack(1, wallsRemaining[0], settings, controller));
+  const wallMarksP1 = renderWallMarks(1, wallsRemaining[0], showWallCounts, controller);
+  const wallMarksP2 = renderWallMarks(2, wallsRemaining[1], showWallCounts, controller);
 
   const grid = document.createElement('div');
   grid.className = 'board-grid';
-  grid.style.gridTemplateColumns = `repeat(${numCols * 2 - 1}, 1fr)`;
-  grid.style.gridTemplateRows = `repeat(${numRows * 2 - 1}, 1fr)`;
+  grid.style.gridTemplateColumns = buildGridTracks(numCols * 2 - 1);
+  grid.style.gridTemplateRows = buildGridTracks(numRows * 2 - 1);
 
   for (let p = 0; p < numRows * 2 - 1; p++) {
     for (let h = 0; h < numCols * 2 - 1; h++) {
-      const row = numRows - Math.floor(p / 2);
-      const col = Math.floor(h / 2) + 1;
-      const isEvenRow = p % 2 === 0;
-      const isEvenCol = h % 2 === 0;
-
-      let cellType;
-      if (isEvenRow && isEvenCol) {
-        cellType = 'square';
-      } else if (isEvenRow) {
-        cellType = 'verticalWall';
-      } else if (isEvenCol) {
-        cellType = 'horizontalWall';
-      } else {
-        cellType = 'wallIntersection';
-      }
-
-      const cell = document.createElement('div');
-      cell.className = `cell cell--${cellType}`;
-      cell.dataset.cellType = cellType;
-
-      if (cellType === 'square') {
-        const coordinate = { row, column: indexToColumnLocal(col) };
-        const key = formatCoordinate(coordinate);
-        const pawnPlayer = playerPositions.findIndex(
-          (pos) => pos.row === coordinate.row && pos.column === coordinate.column,
-        );
-        const isValid = validKeys.has(key);
-        const isHumanTurn = controller.session.isHumanTurn(settings.players);
-        const isPrev = lastKey === key;
-
-        cell.classList.toggle('cell--valid', isValid && isHumanTurn && pawnPlayer < 0);
-        cell.classList.toggle('cell--prev', isPrev);
-
-        if (pawnPlayer >= 0) {
-          const pawn = document.createElement('div');
-          pawn.className = `pawn pawn--player${pawnPlayer + 1}`;
-          cell.appendChild(pawn);
-        }
-
-        if (isValid && isHumanTurn) {
-          cell.dataset.action = key;
-        }
-      }
-
-      if (cellType === 'horizontalWall' || cellType === 'verticalWall') {
-        const coordinate = {
-          row: row - 1,
-          column: indexToColumnLocal(col),
-        };
-        const wallType = cellType === 'horizontalWall' ? WallType.Horizontal : WallType.Vertical;
-        const key = toAlgebraic({ coordinate, wallType });
-        const owner = wallOwners.get(key);
-        const isValid = validKeys.has(key);
-        const isHumanTurn = controller.session.isHumanTurn(settings.players);
-        const isPrev = lastKey === key;
-
-        if (owner) {
-          const wall = document.createElement('div');
-          wall.className = `wall wall--placed wall--${wallType === WallType.Horizontal ? 'h' : 'v'} wall--player${owner}`;
-          cell.appendChild(wall);
-        } else if (isValid && isHumanTurn) {
-          cell.classList.add('cell--valid');
-          cell.dataset.action = key;
-          const ghost = document.createElement('div');
-          ghost.className = `wall wall--ghost wall--${wallType === WallType.Horizontal ? 'h' : 'v'}`;
-          cell.appendChild(ghost);
-        }
-
-        cell.classList.toggle('cell--prev', isPrev);
-      }
-
-      grid.appendChild(cell);
+      grid.appendChild(
+        renderBoardCell({
+          p,
+          h,
+          numRows,
+          numCols,
+          playerPositions,
+          validKeys,
+          wallOwners,
+          lastKey,
+          isHumanTurn,
+          playerToMove,
+        }),
+      );
     }
   }
 
-  const wallColumn = document.createElement('div');
-  wallColumn.className = 'wall-rack';
-  wallColumn.append(wallsP2, wallsP1);
-
-  boardShell.append(topStatus, rowLabels, grid, wallColumn, bottomStatus);
+  boardShell.append(
+    engineStateP1,
+    engineStateP2,
+    wallMarksP1,
+    wallMarksP2,
+    coordLabelsRow,
+    coordLabelsCol,
+    grid,
+  );
   container.appendChild(boardShell);
 
   if (winner) {
@@ -169,12 +114,17 @@ export function renderBoard(container, state, controller) {
     container.appendChild(banner);
   }
 
-  grid.addEventListener('click', (event) => {
-    const target = event.target.closest('[data-action]');
-    if (!target) {
+  boardShell.addEventListener('click', (event) => {
+    const target = event.target;
+    const actionNode = target.querySelector?.('[data-action]') || target.closest?.('[data-action]');
+    if (!actionNode) {
       return;
     }
-    const actionKey = target.dataset.action;
+    if (actionNode.dataset.isValid !== 'true') {
+      return;
+    }
+
+    const actionKey = actionNode.dataset.action;
     if (!actionKey) {
       return;
     }
@@ -192,28 +142,153 @@ export function renderBoard(container, state, controller) {
   });
 }
 
-function parseCoord(text) {
-  return { column: text[0], row: parseInt(text[1], 10) };
-}
+function renderBoardCell({
+  p,
+  h,
+  numRows,
+  numCols,
+  playerPositions,
+  validKeys,
+  wallOwners,
+  lastKey,
+  isHumanTurn,
+  playerToMove,
+}) {
+  const row = numRows - Math.floor(p / 2);
+  const col = Math.floor(h / 2) + 1;
+  const isEvenRow = p % 2 === 0;
+  const isEvenCol = h % 2 === 0;
 
-function renderWallRack(playerNum, remaining, settings, controller) {
-  const rack = document.createElement('div');
-  rack.className = 'wall-rack-inner';
-
-  const count = document.createElement('div');
-  count.className = 'walls-count' + (settings.displayRemainingWalls ? ' walls-count--visible' : '');
-  count.textContent = String(remaining);
-  rack.appendChild(count);
-
-  for (let index = 0; index < 10; index++) {
-    const slot = document.createElement('div');
-    slot.className = 'wall-slot' + (index < remaining ? ' wall-slot--available' : '');
-    slot.classList.add(`wall-slot--player${playerNum}`);
-    rack.appendChild(slot);
+  let cellType;
+  if (isEvenRow && isEvenCol) {
+    cellType = 'square';
+  } else if (isEvenRow) {
+    cellType = 'verticalWall';
+  } else if (isEvenCol) {
+    cellType = 'horizontalWall';
+  } else {
+    cellType = 'wallIntersection';
   }
 
-  rack.addEventListener('click', () => controller.toggleDisplayRemainingWalls?.());
-  return rack;
+  const cell = document.createElement('div');
+  cell.dataset.cellType = cellType;
+  cell.dataset.coordinate = formatCoordinate({ row, column: indexToColumnLocal(col) });
+
+  if (cellType === 'square') {
+    const coordinate = { row, column: indexToColumnLocal(col) };
+    const key = formatCoordinate(coordinate);
+    const pawnPlayer = playerPositions.findIndex(
+      (pos) => pos.row === coordinate.row && pos.column === coordinate.column,
+    );
+    const isValid = validKeys.has(key) && isHumanTurn && pawnPlayer < 0;
+    const isPrev = lastKey === key;
+
+    const square = document.createElement('div');
+    square.className = 'board-cell__square';
+    square.classList.toggle('board-cell__square--prev', isPrev);
+    square.classList.toggle('board-cell__square--valid', isValid);
+    square.dataset.action = key;
+    square.dataset.isValid = String(isValid);
+
+    if (pawnPlayer >= 0) {
+      const pawn = document.createElement('div');
+      pawn.className = `board-cell__pawn board-cell__pawn--player${pawnPlayer + 1}`;
+      square.appendChild(pawn);
+    }
+
+    cell.appendChild(square);
+    return cell;
+  }
+
+  if (cellType === 'horizontalWall' || cellType === 'verticalWall') {
+    const coordinate = {
+      row: row - 1,
+      column: indexToColumnLocal(col),
+    };
+    const wallType = cellType === 'horizontalWall' ? WallType.Horizontal : WallType.Vertical;
+    const key = toAlgebraic({ coordinate, wallType });
+    const owner = wallOwners.get(key);
+    const isValid = validKeys.has(key) && isHumanTurn;
+    const isPrev = lastKey === key;
+
+    const wall = document.createElement('div');
+    wall.className = 'board-cell__wall';
+    wall.classList.add(cellType === 'horizontalWall' ? 'board-cell__wall--h' : 'board-cell__wall--v');
+    wall.dataset.action = key;
+    wall.dataset.isValid = String(isValid);
+
+    if (owner) {
+      wall.classList.add('board-cell__wall--placed', `board-cell__wall--player${owner}`);
+    } else if (isValid) {
+      wall.classList.add('board-cell__wall--valid', `board-cell__wall--player${playerToMove}`);
+      cell.classList.add('board-cell--wall-valid');
+    }
+
+    if (isPrev) {
+      wall.style.zIndex = '1900';
+    }
+
+    cell.appendChild(wall);
+  }
+
+  return cell;
+}
+
+function renderCoordinateLabels(axis, count, visible, controller) {
+  const wrap = document.createElement('div');
+  wrap.className =
+    'coord-labels coord-labels--' +
+    (axis === 'row' ? 'row' : 'col') +
+    (visible ? ' coord-labels--visible' : '');
+  wrap.addEventListener('click', () => controller.toggleDisplayCoordinates?.());
+
+  for (let index = 0; index < count; index++) {
+    if (index > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'coord-labels__spacer';
+      wrap.appendChild(spacer);
+    }
+
+    const label = document.createElement('span');
+    label.className = 'coord-labels__label';
+    label.textContent = axis === 'row' ? rowLabel(index, count) : columnLabel(index + 1);
+    wrap.appendChild(label);
+  }
+
+  return wrap;
+}
+
+function renderWallMarks(playerNum, remaining, visible, controller) {
+  const wrap = document.createElement('div');
+  wrap.className = `wall-marks wall-marks--p${playerNum}`;
+  wrap.addEventListener('click', () => controller.toggleDisplayRemainingWalls?.());
+
+  const count = document.createElement('span');
+  count.className = 'wall-marks__count' + (visible ? ' wall-marks__count--visible' : '');
+  count.textContent = String(remaining);
+
+  const slots = [];
+  for (let index = 0; index < 10; index++) {
+    const slot = document.createElement('div');
+    const isAvailable = playerNum === 1 ? index < remaining : 10 - index <= remaining;
+    slot.className =
+      'wall-marks__slot' +
+      (isAvailable ? ' wall-marks__slot--available' : '') +
+      ` wall-marks__slot--player${playerNum}`;
+    slots.push(slot);
+  }
+
+  if (playerNum === 2) {
+    wrap.append(count, ...slots);
+  } else {
+    wrap.append(...slots, count);
+  }
+
+  return wrap;
+}
+
+function parseCoord(text) {
+  return { column: text[0], row: Number.parseInt(text[1], 10) };
 }
 
 function renderTurnIndicator(playerNum, playerToMove, playerType, engineStatus, aiThinking) {

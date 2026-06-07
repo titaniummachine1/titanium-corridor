@@ -1,19 +1,25 @@
 import { GameSession } from './gameSession.js';
 import { EngineClient } from '../lib/engineClient.js';
+import { GorisansonEngineClient } from '../lib/gorisansonEngine.js';
 import {
   PlayerType,
   TimeToMove,
   EngineStatus,
-  getEngineList,
 } from '../lib/engineConfig.js';
-
-const TIME_LABELS = ['Intuition', 'Short', 'Medium', 'Long'];
+import {
+  TIME_PRESETS,
+  getAllEngineConfigs,
+  getPlayerOptionGroups,
+  flattenPlayerOptions,
+  describeTimeBudget,
+  describeActiveSearchInfo,
+} from '../lib/playerRegistry.js';
 
 export class AppController {
   constructor() {
     this.session = new GameSession();
     this.engines = new Map();
-    this.engineConfigs = getEngineList();
+    this.engineConfigs = getAllEngineConfigs();
 
     this.settings = {
       players: [PlayerType.Human, PlayerType.IshtarV3],
@@ -24,11 +30,8 @@ export class AppController {
       displayEvalBar: true,
     };
 
-    this.engineStatus = {
-      [PlayerType.IshtarV3]: EngineStatus.Idle,
-      [PlayerType.KaAI]: EngineStatus.Idle,
-    };
-
+    this.engineStatus = {};
+    this.searchInfo = {};
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     this.aiThinking = false;
 
@@ -42,18 +45,28 @@ export class AppController {
       engineStatus: { ...this.engineStatus },
       eval: { ...this.eval },
       aiThinking: this.aiThinking,
-      timeLabels: TIME_LABELS,
-      playerOptions: [
-        { value: PlayerType.Human, label: 'Human' },
-        { value: PlayerType.IshtarV3, label: 'Ishtar' },
-        { value: PlayerType.KaAI, label: 'Ka' },
-      ],
+      timePresets: TIME_PRESETS,
+      playerOptionGroups: getPlayerOptionGroups(),
+      playerOptions: flattenPlayerOptions(getPlayerOptionGroups()),
+      timeBudgetHint: describeTimeBudget(
+        this.settings.players,
+        this.settings.timeToMove,
+        this.engineConfigs,
+      ),
+      searchInfoLine: describeActiveSearchInfo(
+        this.settings.players,
+        this.searchInfo,
+        this.engineConfigs,
+      ),
     };
   }
 
   onChange = null;
 
   setPlayer(playerNum, playerType) {
+    if (playerType === PlayerType.Titanium || playerType === PlayerType.Pavlosdais) {
+      return;
+    }
     this.settings.players[playerNum - 1] = playerType;
     this.onChange?.();
     this.maybeRequestAiMove();
@@ -126,6 +139,13 @@ export class AppController {
     this.onChange?.();
   }
 
+  createEngineClient(config) {
+    if (config.kind === 'local') {
+      return new GorisansonEngineClient(config);
+    }
+    return new EngineClient(config);
+  }
+
   getEngine(playerType) {
     if (playerType === PlayerType.Human) {
       return null;
@@ -133,12 +153,24 @@ export class AppController {
 
     if (!this.engines.has(playerType)) {
       const config = this.engineConfigs.find((entry) => entry.key === playerType);
-      const engine = new EngineClient(config);
+      if (!config || config.disabled) {
+        return null;
+      }
+
+      const engine = this.createEngineClient(config);
       engine.onStatus = (status) => {
+        const prev = this.engineStatus[playerType];
         this.engineStatus[playerType] = status;
-        this.onChange?.();
+        if (prev !== status) {
+          this.onChange?.();
+        }
       };
       engine.onInfo = (info) => {
+        this.searchInfo[playerType] = { ...this.searchInfo[playerType], ...info };
+        // Progress-only updates (local MCTS) must not re-render the board every tick.
+        if (info.progress !== undefined && info.p1 === undefined && !info.pv) {
+          return;
+        }
         if (info.p1 !== undefined) {
           this.eval.p1 = info.p1;
           this.eval.score = info.score ?? info.p1;
@@ -164,7 +196,7 @@ export class AppController {
         continue;
       }
       const engine = this.getEngine(playerType);
-      engine.makeMoves([action]);
+      engine?.makeMoves([action]);
     }
   }
 
@@ -181,6 +213,11 @@ export class AppController {
     }
 
     const engine = this.getEngine(playerType);
+    if (!engine) {
+      this.aiThinking = false;
+      return;
+    }
+
     this.aiThinking = true;
     this.onChange?.();
 
