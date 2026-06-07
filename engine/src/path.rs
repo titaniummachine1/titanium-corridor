@@ -111,6 +111,67 @@ impl BfsScratch {
         }
         None
     }
+
+    /// Fills `next_out[sq]` with the next square on the shortest path toward `player`'s
+    /// goal. `u8::MAX` means already on goal row or unreachable.
+    ///
+    /// Implemented as backward BFS from all goal-row cells so every square learns
+    /// its single-step advance toward the goal in one pass — O(81) total, not O(81)
+    /// per rollout step.
+    pub fn fill_next_toward_goal(
+        &mut self,
+        board: &Board,
+        player: Player,
+        next_out: &mut [u8; 81],
+    ) {
+        next_out.fill(u8::MAX);
+        let grow = crate::grid::goal_row(player);
+
+        self.visited = 0;
+        let mut head = 0usize;
+        let mut tail = 0usize;
+
+        // Seed: all goal-row cells.
+        for col in 0..9u8 {
+            let sq = square_index(grow, col);
+            let mask = 1u128 << sq;
+            if self.visited & mask == 0 {
+                self.visited |= mask;
+                self.queue[tail] = sq;
+                tail += 1;
+            }
+        }
+
+        while head < tail {
+            let sq = self.queue[head];
+            head += 1;
+            let (r, c) = unpack_square(sq);
+
+            // Visit neighbors that can step *toward* sq (i.e. from neighbor to (r,c)).
+            for (dr, dc) in NEIGHBORS {
+                let nr = r as i16 + dr as i16;
+                let nc = c as i16 + dc as i16;
+                if !(0..=8).contains(&nr) || !(0..=8).contains(&nc) {
+                    continue;
+                }
+                let nr = nr as u8;
+                let nc = nc as u8;
+                // The direction from (nr,nc) to (r,c) is (-dr,-dc).
+                if !can_step(board, nr, nc, -dr, -dc) {
+                    continue;
+                }
+                let nsq = square_index(nr, nc);
+                let mask = 1u128 << nsq;
+                if self.visited & mask != 0 {
+                    continue;
+                }
+                self.visited |= mask;
+                next_out[nsq as usize] = sq;
+                self.queue[tail] = nsq;
+                tail += 1;
+            }
+        }
+    }
 }
 
 /// Stack BFS with `u128` visited bitset — convenience for tests and one-off calls.
