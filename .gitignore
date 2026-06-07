@@ -1,0 +1,23 @@
+# Dependencies
+web/node_modules/
+web/dist/
+
+# Rust
+engine/target/
+
+# Vendor clones (reference only — re-fetch with scripts if needed)
+_vendor/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Env / secrets
+.env
+.env.*
+
+# Logs
+*.log

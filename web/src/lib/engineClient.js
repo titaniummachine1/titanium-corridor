@@ -1,0 +1,248 @@
+/**
+ * Browser WebSocket client for remote Ishtar/Ka engines.
+ * Reconstructed from scraped quoridor-ai.netlify.app bundle.
+ */
+
+import {
+  AUTH_TOKEN,
+  INFO_LINE_RE,
+  BESTMOVE_LINE_RE,
+  Notation,
+  buildPositionString,
+  parseInfoLine,
+} from './engineConfig.js';
+
+import {
+  Direction,
+  toAlgebraic,
+  parseAlgebraic,
+  transformCoordinate,
+  isWallAction,
+} from './gameLogic.js';
+
+function toEngineAlgebraic(action, notation) {
+  let normalized = action;
+  if (isWallAction(action) && notation === Notation.Glendenning) {
+    normalized = {
+      ...action,
+      coordinate: transformCoordinate(action.coordinate, [Direction.Up]),
+    };
+  }
+  return toAlgebraic(normalized);
+}
+
+function fromEngineAlgebraic(move, notation) {
+  const action = parseAlgebraic(move);
+  if (isWallAction(action) && notation === Notation.Glendenning) {
+    action.coordinate = transformCoordinate(action.coordinate, [Direction.Down]);
+  }
+  return action;
+}
+
+export class EngineClient {
+  constructor(engineConfig) {
+    this.config = engineConfig;
+    this.ws = null;
+    this.sendBuffer = [];
+    this.outstandingSearches = 0;
+    this.isPondering = false;
+    this.hasSynced = false;
+
+    this.onInfo = null;
+    this.onBestMove = null;
+    this.onStatus = null;
+    this.onError = null;
+  }
+
+  destroy() {
+    this.stop();
+    this.ws?.close();
+    this.ws = null;
+    this.sendBuffer = [];
+    this.outstandingSearches = 0;
+    this.hasSynced = false;
+    this.setStatus('idle');
+  }
+
+  resetConnection() {
+    this.destroy();
+  }
+
+  send(command) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(command);
+      return;
+    }
+    this.sendBuffer.push(command);
+    this.connect();
+  }
+
+  connect() {
+    if (this.ws) {
+      return;
+    }
+
+    this.setStatus('connecting');
+    const socket = new WebSocket(this.config.uri);
+    this.ws = socket;
+
+    socket.addEventListener('open', () => this.onOpen());
+    socket.addEventListener('message', (event) => this.onMessage(event.data));
+    socket.addEventListener('error', () => {
+      if (this.ws === socket) {
+        this.setStatus('error');
+        this.onError?.(new Error('WebSocket connection failed'));
+      }
+    });
+    socket.addEventListener('close', () => {
+      if (this.ws === socket) {
+        this.setStatus('error');
+        this.ws = null;
+      }
+    });
+  }
+
+  makeMoves(actions) {
+    const moves = actions.map((action) => toEngineAlgebraic(action, this.config.notation)).join(' ');
+    if (moves) {
+      this.send(`makemove ${moves}`);
+      this.hasSynced = true;
+    }
+    this.setStatus('idle');
+  }
+
+  setPosition(gameSnapshot) {
+    const position = buildPositionString(gameSnapshot, this.config.notation);
+    this.send(`setposition ${position}`);
+    this.hasSynced = true;
+  }
+
+  go(timeMode) {
+    const visits = this.config.visits?.[timeMode];
+    this.outstandingSearches++;
+
+    if (Number.isFinite(visits)) {
+      this.send(`setoption name visits value ${visits}`);
+    }
+
+    this.sendTimeToMoveSettings(timeMode);
+    this.send('go');
+    this.setStatus('searching');
+  }
+
+  requestMove({ timeMode, gameSnapshot, moveHistory, isFreshGame }) {
+    const runSearch = () => {
+      if (isFreshGame && moveHistory.length === 0) {
+        this.go(timeMode);
+        return;
+      }
+
+      if (moveHistory.length > 0) {
+        this.makeMoves(moveHistory);
+      } else if (gameSnapshot) {
+        this.setPosition(gameSnapshot);
+      }
+
+      this.go(timeMode);
+    };
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      runSearch();
+      return;
+    }
+
+    this.pendingSearch = runSearch;
+    this.connect();
+  }
+
+  stop() {
+    if (!this.isPondering) {
+      return;
+    }
+    this.send('stop');
+    this.isPondering = false;
+    this.setStatus('idle');
+  }
+
+  onOpen() {
+    this.ws.send(JSON.stringify({ token: AUTH_TOKEN, version: '0.0.0' }));
+    this.sendStaticSettings();
+
+    for (const command of this.sendBuffer) {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(command);
+      }
+    }
+    this.sendBuffer = [];
+    this.setStatus('idle');
+
+    if (this.pendingSearch) {
+      const runSearch = this.pendingSearch;
+      this.pendingSearch = null;
+      runSearch();
+    }
+  }
+
+  onMessage(rawMessage) {
+    if (/log Error/i.test(rawMessage) && !/log Error: WARNING:tensorflow/i.test(rawMessage)) {
+      this.setStatus('error');
+      this.onError?.(new Error(rawMessage));
+      return;
+    }
+
+    const infoMatch = INFO_LINE_RE.exec(rawMessage);
+    if (infoMatch) {
+      const info = parseInfoLine(infoMatch[1]);
+      if (info.pv && typeof info.pv === 'string') {
+        info.pv = info.pv.split(' ').map((move) => fromEngineAlgebraic(move, this.config.notation));
+      }
+      if (info.p1 !== undefined) {
+        info.winChance = info.p1;
+      }
+      this.onInfo?.(info);
+      return;
+    }
+
+    const bestMoveMatch = BESTMOVE_LINE_RE.exec(rawMessage);
+    if (!bestMoveMatch) {
+      return;
+    }
+
+    this.outstandingSearches = Math.max(0, this.outstandingSearches - 1);
+    this.setStatus('idle');
+
+    const moveText = bestMoveMatch[1].trim().split(/\s+/)[0];
+    if (!moveText) {
+      return;
+    }
+
+    const action = fromEngineAlgebraic(moveText, this.config.notation);
+    this.onBestMove?.(action, bestMoveMatch[1]);
+  }
+
+  sendStaticSettings() {
+    if (!this.config.settings) {
+      return;
+    }
+    for (const [name, value] of Object.entries(this.config.settings)) {
+      if (typeof value === 'string') {
+        this.send(`setoption name ${name} value ${value}`);
+      }
+    }
+  }
+
+  sendTimeToMoveSettings(timeMode) {
+    if (!this.config.settings) {
+      return;
+    }
+    for (const [name, value] of Object.entries(this.config.settings)) {
+      if (typeof value !== 'string') {
+        this.send(`setoption name ${name} value ${value[timeMode]}`);
+      }
+    }
+  }
+
+  setStatus(status) {
+    this.onStatus?.(status);
+  }
+}
