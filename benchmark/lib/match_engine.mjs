@@ -1,34 +1,50 @@
 /**
- * Head-to-head game loop — gorisanson MCTS today, more engines later.
+ * Head-to-head game loop — gorisanson MCTS, Titanium greedy, or mixed.
  */
 
+import { parseAlgebraic, toAlgebraic } from '../../web/src/lib/gameLogic.js';
+import { actionToGorisansonMove, gorisansonMoveToAction } from './gorisanson_bridge.mjs';
 import {
   applyGorisansonMove,
   chooseGorisansonMove,
-  cloneGorisansonGame,
   createGorisansonGame,
   winnerIndex,
 } from './gorisanson_ai.mjs';
 import { moveLabel } from './gorisanson_moves.mjs';
+import { chooseTitaniumMove } from './titanium_ai.mjs';
 
 const MAX_PLIES = 250;
 
+function chooseMove(game, algebraicHistory, playerConfig) {
+  if (playerConfig.id === 'gorisanson') {
+    return chooseGorisansonMove(game, playerConfig.simulations);
+  }
+  if (playerConfig.id === 'titanium') {
+    const algebraic = chooseTitaniumMove(algebraicHistory);
+    return actionToGorisansonMove(parseAlgebraic(algebraic));
+  }
+  throw new Error(`Unknown player id: ${playerConfig.id}`);
+}
+
 /**
- * @param {{ id: string, simulations: number }} playerA
- * @param {{ id: string, simulations: number }} playerB
+ * @param {{ id: string, simulations?: number }} playerA
+ * @param {{ id: string, simulations?: number }} playerB
  */
 export function playOneGame(playerA, playerB, { verbose = false } = {}) {
   let game = createGorisansonGame();
+  const algebraicHistory = [];
   let plies = 0;
 
   while (winnerIndex(game) === null && plies < MAX_PLIES) {
     const side = game.pawnOfTurn.index;
     const cfg = side === 0 ? playerA : playerB;
-    const move = chooseGorisansonMove(game, cfg.simulations);
+    const move = chooseMove(game, algebraicHistory, cfg);
     if (verbose) {
-      console.log(`  ply ${plies + 1} P${side + 1} (${cfg.id} ${cfg.simulations}): ${moveLabel(move)}`);
+      const sims = cfg.simulations != null ? ` ${cfg.simulations}` : '';
+      console.log(`  ply ${plies + 1} P${side + 1} (${cfg.id}${sims}): ${moveLabel(move)}`);
     }
     applyGorisansonMove(game, move);
+    algebraicHistory.push(toAlgebraic(gorisansonMoveToAction(move)));
     plies += 1;
   }
 
@@ -52,7 +68,9 @@ export function playMatch(playerA, playerB, games, options = {}) {
     const dark = swap ? playerA : playerB;
 
     if (options.verbose) {
-      console.log(`\nGame ${i + 1}/${games} — light=${light.id}(${light.simulations}) dark=${dark.id}(${dark.simulations})`);
+      const label = (p) =>
+        p.simulations != null ? `${p.id}(${p.simulations})` : p.id;
+      console.log(`\nGame ${i + 1}/${games} — light=${label(light)} dark=${label(dark)}`);
     }
 
     const outcome = playOneGame(light, dark, options);

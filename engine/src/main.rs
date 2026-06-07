@@ -3,7 +3,7 @@
 use std::env;
 use std::time::Instant;
 
-use titanium::{Board, Engine, generate_legal_moves, perft_divide};
+use titanium::{Board, Engine, WorkerContext, generate_legal_moves, genmove_algebraic, perft_divide};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -20,6 +20,7 @@ fn main() {
         "perft-id" => run_perft_id(&args),
         "thread-bench" => run_thread_bench(&args),
         "moves" => run_moves(),
+        "genmove" => run_genmove(&args),
         _ => print_usage(),
     }
 }
@@ -33,6 +34,7 @@ fn print_usage() {
     println!("  titanium perft-race <sec>              — max depth within time budget");
     println!("  titanium perft-id [depth]              — iterative deepening perft 0..depth");
     println!("  titanium moves                         — list legal moves at startpos");
+    println!("  titanium genmove [moves...]            — greedy one-ply best move (algebraic)");
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
@@ -228,5 +230,19 @@ fn run_moves() {
     println!("{} legal moves at startpos", moves.len());
     for mv in moves {
         println!("{}", titanium::format_move(mv));
+    }
+}
+
+fn run_genmove(args: &[String]) {
+    let cli = parse_cli(args);
+    let mut board = Board::new();
+    for mv in cli.positional.iter().skip(2) {
+        board.apply_algebraic(mv);
+    }
+
+    let mut scratch = WorkerContext::new().bfs;
+    match genmove_algebraic(&mut board, &mut scratch) {
+        Some(algebraic) => println!("bestmove {}", algebraic),
+        None => println!("bestmove (none)"),
     }
 }

@@ -7,6 +7,7 @@
 pub mod board;
 pub mod context;
 pub mod engine;
+pub mod greedy;
 pub mod grid;
 pub mod moves;
 pub mod path;
@@ -21,6 +22,7 @@ pub use moves::{
 pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
 pub use context::{EngineLimits, SharedState, ThreadBenchResult, WorkerContext};
 pub use engine::Engine;
+pub use greedy::{choose_greedy_move, genmove_algebraic};
 pub use perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_iterative,
     perft_naive, perft_parallel_root, PerftContext, PERFT3_STARTPOS,
