@@ -2,7 +2,7 @@
  * Browser WebSocket client for remote Ishtar/Ka engines.
  * Reconstructed from scraped quoridor-ai.netlify.app bundle (class mT).
  *
- * Sync model matches the original: incremental makemove after each human ply,
+ * Sync model matches the original: incremental makemove after every ply,
  * full replay only after reconnect/undo/new game; AI turns call go() only.
  */
 
@@ -11,6 +11,7 @@ import {
   INFO_LINE_RE,
   BESTMOVE_LINE_RE,
   Notation,
+  TimeToMove,
   buildPositionString,
   parseInfoLine,
 } from './engineConfig.js';
@@ -145,6 +146,9 @@ export class EngineClient {
   }
 
   go(timeMode) {
+    if (timeMode == null) {
+      timeMode = TimeToMove.Short;
+    }
     this.lastTimeMode = timeMode;
     const visits = this.config.visits?.[timeMode];
     this.outstandingSearches++;
@@ -257,12 +261,15 @@ export class EngineClient {
   }
 
   sendTimeToMoveSettings(timeMode) {
-    if (!this.config.settings) {
+    if (!this.config.settings || timeMode == null) {
       return;
     }
     for (const [name, value] of Object.entries(this.config.settings)) {
       if (typeof value !== 'string') {
-        this.send(`setoption name ${name} value ${value[timeMode]}`);
+        const optionValue = value[timeMode];
+        if (optionValue != null) {
+          this.send(`setoption name ${name} value ${optionValue}`);
+        }
       }
     }
   }

@@ -31,12 +31,48 @@ export const WALL_CLOCK_RANGE = {
   defaultSeconds: 3,
 };
 
+/** Exponential visit cap for local MCTS — slider is linear, stored value is log-spaced. */
 export const LOCAL_VISITS_RANGE = {
   min: 1_000,
-  max: 60_000,
-  step: 500,
-  default: 7_500,
+  max: 1_000_000_000,
+  default: 1_000_000_000,
+  sliderSteps: 1_000,
 };
+
+export function clampVisits(visits) {
+  const n = Number(visits);
+  if (!Number.isFinite(n)) {
+    return LOCAL_VISITS_RANGE.default;
+  }
+  return Math.min(LOCAL_VISITS_RANGE.max, Math.max(LOCAL_VISITS_RANGE.min, Math.round(n)));
+}
+
+/** Map slider position (0 … sliderSteps) → visit count. */
+export function visitsFromSliderPosition(position) {
+  const { min, max, sliderSteps } = LOCAL_VISITS_RANGE;
+  const t = Math.min(1, Math.max(0, Number(position) / sliderSteps));
+  if (t <= 0) {
+    return min;
+  }
+  if (t >= 1) {
+    return max;
+  }
+  return clampVisits(min * (max / min) ** t);
+}
+
+/** Map visit count → slider position for rendering. */
+export function sliderPositionFromVisits(visits) {
+  const { min, max, sliderSteps } = LOCAL_VISITS_RANGE;
+  const clamped = clampVisits(visits);
+  if (clamped <= min) {
+    return 0;
+  }
+  if (clamped >= max) {
+    return sliderSteps;
+  }
+  const t = Math.log(clamped / min) / Math.log(max / min);
+  return Math.round(t * sliderSteps);
+}
 
 export function getEngineConfig(playerType, engineConfigs) {
   return engineConfigs.find((entry) => entry.key === playerType);
@@ -50,9 +86,31 @@ export function isLocalEngine(playerType, engineConfigs) {
   return getEngineConfig(playerType, engineConfigs)?.kind === 'local';
 }
 
+export function isTitaniumEngine(playerType, engineConfigs) {
+  return getEngineConfig(playerType, engineConfigs)?.kind === 'titanium';
+}
+
+export function isLocalMctsEngine(playerType, engineConfigs) {
+  const kind = getEngineConfig(playerType, engineConfigs)?.kind;
+  return kind === 'local' || kind === 'titanium';
+}
+
+/** Higher UCT = more exploration — weaker play (mirrors strength tiers). */
+export function uctFromStrengthLevel(strengthLevel) {
+  const level = Math.min(4, Math.max(0, Number(strengthLevel ?? StrengthLevel.Alpha)));
+  return [0.55, 0.45, 0.35, 0.28, 0.2][level];
+}
+
 export function defaultPlayerAiSettings(playerType, engineConfigs) {
   if (playerType === PlayerType.Human) {
     return null;
+  }
+  if (isTitaniumEngine(playerType, engineConfigs)) {
+    return {
+      strengthLevel: StrengthLevel.Alpha,
+      wallClockSeconds: WALL_CLOCK_RANGE.defaultSeconds,
+      visitsBudget: LOCAL_VISITS_RANGE.default,
+    };
   }
   if (isLocalEngine(playerType, engineConfigs)) {
     return {
@@ -77,7 +135,24 @@ export function formatWallClock(seconds) {
 }
 
 export function formatVisits(n) {
-  return Number(n).toLocaleString();
+  const v = Number(n);
+  if (!Number.isFinite(v)) {
+    return '?';
+  }
+  if (v >= 1_000_000_000) {
+    return `${(v / 1_000_000_000).toFixed(1)}B`;
+  }
+  if (v >= 1_000_000) {
+    return `${(v / 1_000_000).toFixed(1)}M`;
+  }
+  if (v >= 10_000) {
+    return `${(v / 1_000).toFixed(1)}k`;
+  }
+  return Math.round(v).toLocaleString();
+}
+
+export function formatVisitsCap(n) {
+  return `≤${formatVisits(clampVisits(n))}`;
 }
 
 function strengthLevelLabel(level) {
@@ -97,10 +172,14 @@ export function describePlayerAiSettings(playerType, aiSettings, engineConfigs) 
     return '';
   }
 
-  if (isLocalEngine(playerType, engineConfigs)) {
+  if (isLocalMctsEngine(playerType, engineConfigs)) {
     const time = formatWallClock(aiSettings.wallClockSeconds ?? WALL_CLOCK_RANGE.defaultSeconds);
-    const visits = formatVisits(aiSettings.visitsBudget ?? LOCAL_VISITS_RANGE.default);
-    return `${config.name}: ${time} · ≤${visits} rollouts`;
+    const cap = formatVisitsCap(aiSettings.visitsBudget ?? LOCAL_VISITS_RANGE.default);
+    if (isTitaniumEngine(playerType, engineConfigs)) {
+      const strength = strengthLevelLabel(aiSettings.strengthLevel ?? StrengthLevel.Alpha);
+      return `${config.name}: ${strength} · ${time} · ${cap}`;
+    }
+    return `${config.name}: ${time} · ${cap}`;
   }
 
   if (isRemoteEngine(playerType, engineConfigs) && config.visits) {

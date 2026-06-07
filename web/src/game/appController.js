@@ -1,6 +1,6 @@
 import { GameSession } from './gameSession.js';
 import { EngineClient } from '../lib/engineClient.js';
-import { GorisansonEngineClient } from '../lib/gorisansonEngine.js';
+import { GorisansonEngineClient, TitaniumEngineClient } from '../lib/localMctsEngine.js';
 import { PlayerType, StrengthLevel, TimeToMove } from '../lib/engineConfig.js';
 import {
   STRENGTH_LEVEL_PRESETS,
@@ -14,13 +14,24 @@ import {
 import {
   WALL_CLOCK_RANGE,
   LOCAL_VISITS_RANGE,
+  clampVisits,
+  sliderPositionFromVisits,
   defaultPlayerAiSettings,
   describePlayerAiSettings,
   isLocalEngine,
+  isLocalMctsEngine,
   isRemoteEngine,
+  isTitaniumEngine,
 } from '../lib/timeControl.js';
 
 function isSavedSettingsValid(playerType, saved, engineConfigs) {
+  if (isTitaniumEngine(playerType, engineConfigs)) {
+    return (
+      saved.strengthLevel != null &&
+      saved.wallClockSeconds != null &&
+      saved.visitsBudget != null
+    );
+  }
   if (isLocalEngine(playerType, engineConfigs)) {
     return saved.wallClockSeconds != null && saved.visitsBudget != null;
   }
@@ -85,7 +96,7 @@ export class AppController {
   onChange = null;
 
   setPlayer(playerNum, playerType) {
-    if (playerType === PlayerType.Titanium || playerType === PlayerType.Pavlosdais) {
+    if (playerType === PlayerType.Pavlosdais) {
       return;
     }
     this.settings.players[playerNum - 1] = playerType;
@@ -146,13 +157,22 @@ export class AppController {
       playerType,
       isHuman: playerType === PlayerType.Human,
       isLocal: isLocalEngine(playerType, this.engineConfigs),
+      isTitanium: isTitaniumEngine(playerType, this.engineConfigs),
+      isLocalMcts: isLocalMctsEngine(playerType, this.engineConfigs),
       isRemote: isRemoteEngine(playerType, this.engineConfigs),
       strengthLevel: current?.strengthLevel ?? StrengthLevel.Alpha,
       timeToMove: current?.timeToMove ?? TimeToMove.Short,
       wallClockSeconds: current?.wallClockSeconds ?? WALL_CLOCK_RANGE.defaultSeconds,
-      visitsBudget: current?.visitsBudget ?? LOCAL_VISITS_RANGE.default,
+      visitsBudget: clampVisits(current?.visitsBudget ?? LOCAL_VISITS_RANGE.default),
+      visitsSliderPosition: sliderPositionFromVisits(
+        current?.visitsBudget ?? LOCAL_VISITS_RANGE.default,
+      ),
       wallclockRange: WALL_CLOCK_RANGE,
-      visitsRange: LOCAL_VISITS_RANGE,
+      visitsRange: {
+        min: 0,
+        max: LOCAL_VISITS_RANGE.sliderSteps,
+        step: 1,
+      },
       hint: describePlayerAiSettings(playerType, current, this.engineConfigs),
     };
   }
@@ -164,7 +184,7 @@ export class AppController {
   setPlayerStrengthLevel(playerNum, strengthLevel, { silent = false } = {}) {
     const index = playerNum - 1;
     const playerType = this.settings.players[index];
-    if (!isRemoteEngine(playerType, this.engineConfigs)) {
+    if (!isRemoteEngine(playerType, this.engineConfigs) && !isTitaniumEngine(playerType, this.engineConfigs)) {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
@@ -196,7 +216,7 @@ export class AppController {
   setPlayerWallClock(playerNum, seconds, { silent = false } = {}) {
     const index = playerNum - 1;
     const playerType = this.settings.players[index];
-    if (!isLocalEngine(playerType, this.engineConfigs)) {
+    if (!isLocalMctsEngine(playerType, this.engineConfigs)) {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
@@ -212,13 +232,13 @@ export class AppController {
   setPlayerVisitsBudget(playerNum, visits, { silent = false } = {}) {
     const index = playerNum - 1;
     const playerType = this.settings.players[index];
-    if (!isLocalEngine(playerType, this.engineConfigs)) {
+    if (!isLocalMctsEngine(playerType, this.engineConfigs)) {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
     this.rememberPlayerAiSettings(playerNum, {
       ...current,
-      visitsBudget: Number(visits),
+      visitsBudget: clampVisits(visits),
     });
     if (!silent) {
       this.onChange?.();
@@ -278,7 +298,7 @@ export class AppController {
       return;
     }
 
-    this.syncEnginesAfterHumanMove(action);
+    this.syncRemoteEnginesAfterMove(action);
     this.onChange?.();
     this.maybeRequestAiMove();
   }
@@ -290,6 +310,9 @@ export class AppController {
   createEngineClient(config) {
     if (config.kind === 'local') {
       return new GorisansonEngineClient(config);
+    }
+    if (config.kind === 'titanium') {
+      return new TitaniumEngineClient(config);
     }
     return new EngineClient(config);
   }
@@ -337,9 +360,14 @@ export class AppController {
     return this.engines.get(playerType);
   }
 
-  syncEnginesAfterHumanMove(action) {
+  /** Keep remote engines in sync after every ply (human or AI), matching scraped takeAction middleware. */
+  syncRemoteEnginesAfterMove(action) {
     for (const playerType of this.settings.players) {
-      if (playerType === PlayerType.Human || playerType === PlayerType.GorisansonMCTS) {
+      if (
+        playerType === PlayerType.Human ||
+        playerType === PlayerType.GorisansonMCTS ||
+        playerType === PlayerType.Titanium
+      ) {
         continue;
       }
       const engine = this.getEngine(playerType);
@@ -395,6 +423,7 @@ export class AppController {
         return;
       }
 
+      this.syncRemoteEnginesAfterMove(action);
       this.onChange?.();
       this.maybeRequestAiMove();
     };

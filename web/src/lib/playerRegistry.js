@@ -22,14 +22,14 @@ const GORISANSON_ENGINE = {
   uctConst: 0.2,
 };
 
+const TITANIUM_ENGINE = {
+  kind: 'titanium',
+  name: 'Titanium (MCTS)',
+  key: PlayerType.Titanium,
+  tooltip: 'Gorisanson-style MCTS — strength + time + rollout cap',
+};
+
 const PLACEHOLDER_ENGINES = [
-  {
-    kind: 'placeholder',
-    name: 'Titanium (Rust)',
-    key: PlayerType.Titanium,
-    tooltip: 'Our engine — αβ search coming in episode 07',
-    disabled: true,
-  },
   {
     kind: 'placeholder',
     name: 'pavlosdais (C αβ)',
@@ -44,7 +44,7 @@ export function getAllEngineConfigs() {
     ...entry,
     kind: 'remote',
   }));
-  return [GORISANSON_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
+  return [GORISANSON_ENGINE, TITANIUM_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
 }
 
 export function getPlayerOptionGroups() {
@@ -64,8 +64,9 @@ export function getPlayerOptionGroups() {
         },
         {
           value: PlayerType.Titanium,
-          label: 'Titanium (soon)',
-          disabled: true,
+          label: 'Titanium (MCTS)',
+          disabled: false,
+          tooltip: TITANIUM_ENGINE.tooltip,
         },
       ],
     },
@@ -108,9 +109,19 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
     return '';
   }
   const config = engineConfigs.find((entry) => entry.key === playerType);
-  if (config?.kind === 'local' && searchInfo.time != null) {
+  if ((config?.kind === 'local' || config?.kind === 'titanium') && searchInfo.time != null) {
     const sims = searchInfo.simulations?.toLocaleString() ?? '?';
-    return `Last think: ${formatWallClock(searchInfo.time / 1000)} · ${sims} sims`;
+    const limit =
+      searchInfo.stoppedBy === 'visits'
+        ? 'hit cap'
+        : searchInfo.stoppedBy === 'time'
+          ? 'time'
+          : '';
+    const suffix = limit ? ` (${limit})` : '';
+    return `Last think: ${formatWallClock(searchInfo.time / 1000)} · ${sims} sims${suffix}`;
+  }
+  if (config?.kind === 'titanium' && searchInfo.time != null) {
+    return `Last think: ${formatWallClock(searchInfo.time / 1000)}`;
   }
   if (config?.kind === 'remote') {
     const parts = [];

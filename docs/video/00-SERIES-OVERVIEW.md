@@ -22,6 +22,7 @@ Save this file. Record in any order; episodes are checkpointed in git.
 | 05  | [05-first-perft-bug.md](05-first-perft-bug.md)           | d8v lateral wall bug  |
 | 06  | [06-threading-prep.md](06-threading-prep.md)             | Titanium vs Titanium  |
 | 07  | [07-ai-opponents.md](07-ai-opponents.md)                 | Gorisanson local boss |
+| 08  | [08-greedy-ui-lab.md](08-greedy-ui-lab.md)               | Testing lab UI + greedy `genmove` |
 | —   | [00-HOW-THE-ENGINE-WORKS.md](00-HOW-THE-ENGINE-WORKS.md) | Narration script      |
 | —   | [BUG-DIARY.md](BUG-DIARY.md)                             | All plot twists       |
 | —   | [PERFT-BENCHMARKS.md](PERFT-BENCHMARKS.md)               | Depth timings         |

@@ -38,4 +38,4 @@ Outputs score + provisional Elo. Use for CI smoke and video "stronger preset win
 
 ## Next
 
-Episode 08: `titanium genmove` — beat gorisanson at same time budget → first real Elo ladder entry.
+Episode 08: [08-greedy-ui-lab.md](08-greedy-ui-lab.md) — per-player testing UI, scraped sliders, greedy `genmove`, Titanium vs Gorisanson bench.

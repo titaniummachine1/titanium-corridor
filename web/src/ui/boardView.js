@@ -1,4 +1,5 @@
 import { WallType, formatCoordinate, toAlgebraic } from '../lib/gameLogic.js';
+import { playerColorName } from '../lib/playerColors.js';
 import './board.css';
 
 const SQUARE_TRACK = '9fr';
@@ -110,7 +111,7 @@ export function renderBoard(container, state, controller) {
   if (winner) {
     const banner = document.createElement('div');
     banner.className = 'winner-banner';
-    banner.textContent = `Player ${winner} wins!`;
+    banner.textContent = `${playerColorName(winner)} wins!`;
     container.appendChild(banner);
   }
 

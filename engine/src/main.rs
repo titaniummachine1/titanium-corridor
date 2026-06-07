@@ -237,6 +237,9 @@ fn run_genmove(args: &[String]) {
     let cli = parse_cli(args);
     let mut board = Board::new();
     for mv in cli.positional.iter().skip(2) {
+        if mv.starts_with("--") {
+            break;
+        }
         board.apply_algebraic(mv);
     }
 

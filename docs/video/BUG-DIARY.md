@@ -96,6 +96,30 @@ perft_diff → only d8v and e8v subtrees differ
 
 ---
 
+## 7. Gorisanson infinite spinner (coordinate bridge)
+
+**Symptom:** Local MCTS never returns; board spinner runs forever.
+
+**Cause:** `gorisansonBridge.js` used `row + 1` instead of flipping rows. UI row 1 = bottom; Gorisanson row 0 = top. Invalid moves → `applyAction` fails → `maybeRequestAiMove` loops.
+
+**Fix:** `PAWN_ROWS - row` (9) for pawns, `WALL_ROWS - row` (8) for walls — same flip in `benchmark/lib/gorisanson_bridge.mjs`.
+
+**Lesson:** Two “standard” coordinate systems on one board — always test one known pawn move (e2 from start) through the full bridge.
+
+---
+
+## 8. Remote engine red `!` after second move
+
+**Symptom:** Ishtar/Ka show error state after human's second ply; WebSocket `log Error` or close.
+
+**Cause:** We sent `makemove` only after **human** plies. Scraped app sends every `takeAction` to all engines — including the AI's own `bestmove`. Server was one ply behind → illegal position on next human move.
+
+**Fix:** `syncRemoteEnginesAfterMove` after human moves **and** after remote AI `onBestMove`.
+
+**Lesson:** Cloud engines are state machines; mirror the scraped sync contract, don't assume `bestmove` updates server memory.
+
+---
+
 ## Oracle stack (for cross-platform debugging)
 
 1. **Primary:** scraped `web/src/lib/gameLogic.js` (netlify UI rules)

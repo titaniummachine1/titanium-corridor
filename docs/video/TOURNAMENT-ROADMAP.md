@@ -19,17 +19,18 @@ Same idea as chess engine testing (CEGT/STS style), but our stages are **our own
 
 ## What each stage can do today
 
-| Stage          | Tag / branch                                                | Commit     | Can play? | Tournament role                                           |
-| -------------- | ----------------------------------------------------------- | ---------- | --------- | --------------------------------------------------------- |
-| 01 BFS         | `checkpoint-01-path-bfs` / `checkpoint/01-path-bfs`         | `43a1b93`  | No search | Perft/oracle only — **skip** head-to-head until `genmove` |
-| 02 Moves       | `checkpoint-02-legal-moves`                                 | `19864b8`  | No search | Same                                                      |
-| 03 Perft       | `checkpoint-03-perft`                                       | `5a4b0fc`  | No search | Same                                                      |
-| 04 Bench       | `checkpoint-04-bench`                                       | `90193b0`  | No search | Same                                                      |
-| 05 Bugfix      | `checkpoint-05-perft-bugfix` / `checkpoint/05-perft-bugfix` | `6b9e00d`  | No search | Perft gate = **2_062_264** @ d3                           |
-| 06 Thread prep | `checkpoint-06-threading`                                   | `098477c`  | No search | `thread-bench` only                                       |
-| 07 Gorisanson  | `checkpoint-07-gorisanson-ui` / `checkpoint/07-gorisanson-ui` | `7c85a20`  | MCTS UI   | Local opponent + `head_to_head.mjs`                       |
-| 08+ αβ search  | `checkpoint-08-alphabeta` …                                 | _(future)_ | **Yes**   | **First real Titanium Elo ladder**                        |
-| main           | `main`                                                      | moving     | Latest    | Always “current champ”                                    |
+| Stage          | Tag / branch                                                  | Commit     | Can play? | Tournament role                                                   |
+| -------------- | ------------------------------------------------------------- | ---------- | --------- | ----------------------------------------------------------------- |
+| 01 BFS         | `checkpoint-01-path-bfs` / `checkpoint/01-path-bfs`           | `43a1b93`  | No search | Perft/oracle only — **skip** head-to-head until `genmove`         |
+| 02 Moves       | `checkpoint-02-legal-moves`                                   | `19864b8`  | No search | Same                                                              |
+| 03 Perft       | `checkpoint-03-perft`                                         | `5a4b0fc`  | No search | Same                                                              |
+| 04 Bench       | `checkpoint-04-bench`                                         | `90193b0`  | No search | Same                                                              |
+| 05 Bugfix      | `checkpoint-05-perft-bugfix` / `checkpoint/05-perft-bugfix`   | `6b9e00d`  | No search | Perft gate = **2_062_264** @ d3                                   |
+| 06 Thread prep | `checkpoint-06-threading`                                     | `098477c`  | No search | `thread-bench` only                                               |
+| 07 Gorisanson  | `checkpoint-07-gorisanson-ui` / `checkpoint/07-gorisanson-ui` | `7c85a20`  | MCTS UI   | Local opponent + `head_to_head.mjs`                               |
+| 08 Greedy UI   | `checkpoint-08-greedy-ui` / `checkpoint/08-greedy-ui`         | `10bcb23`  | Greedy    | `titanium genmove` + `titanium_vs_gorisanson.mjs` (baseline loss) |
+| 09+ αβ search  | `checkpoint-09-alphabeta` …                                   | _(future)_ | **Yes**   | **First competitive Titanium Elo ladder**                         |
+| main           | `main`                                                        | moving     | Latest    | Always “current champ”                                            |
 
 **Rule:** No Elo between checkpoints until at least one has **`genmove`** (αβ or MCTS). Before that, compare with **perft**, **nps**, **thread-bench** — not playing strength.
 
@@ -127,15 +128,17 @@ Hook line: _“Every commit is a fighter. Tags are its name. Elo is the scoreboa
 
 ## Registry (update at each checkpoint)
 
-| Ep  | Tag                          | Commit    | Branch                       | Play?   | Notes                 |
-| --- | ---------------------------- | --------- | ---------------------------- | ------- | --------------------- |
-| 01  | `checkpoint-01-path-bfs`     | `43a1b93` | `checkpoint/01-path-bfs`     | No      | BFS only              |
-| 02  | `checkpoint-02-legal-moves`  | `19864b8` | `checkpoint/02-legal-moves`  | No      | Move gen              |
-| 03  | `checkpoint-03-perft`        | `5a4b0fc` | `checkpoint/03-perft`        | No      | Divide                |
-| 04  | `checkpoint-04-bench`        | `90193b0` | `checkpoint/04-bench`        | No      | Criterion             |
-| 05  | `checkpoint-05-perft-bugfix` | _TBD_     | `checkpoint/05-perft-bugfix` | No      | d8v fix, d3=2_062_264 |
-| 06  | `checkpoint-06-threading`    | _TBD_     | `checkpoint/06-threading`    | No      | Engine + thread-bench |
-| 07  | `checkpoint-07-alphabeta`    | _future_  | `checkpoint/07-alphabeta`    | **Yes** | First Elo tournament  |
+| Ep  | Tag                           | Commit    | Branch                        | Play?   | Notes                 |
+| --- | ----------------------------- | --------- | ----------------------------- | ------- | --------------------- |
+| 01  | `checkpoint-01-path-bfs`      | `43a1b93` | `checkpoint/01-path-bfs`      | No      | BFS only              |
+| 02  | `checkpoint-02-legal-moves`   | `19864b8` | `checkpoint/02-legal-moves`   | No      | Move gen              |
+| 03  | `checkpoint-03-perft`         | `5a4b0fc` | `checkpoint/03-perft`         | No      | Divide                |
+| 04  | `checkpoint-04-bench`         | `90193b0` | `checkpoint/04-bench`         | No      | Criterion             |
+| 05  | `checkpoint-05-perft-bugfix`  | `6b9e00d` | `checkpoint/05-perft-bugfix`  | No      | d8v fix, d3=2_062_264 |
+| 06  | `checkpoint-06-threading`     | `098477c` | `checkpoint/06-threading`     | No      | Engine + thread-bench |
+| 07  | `checkpoint-07-gorisanson-ui` | `7c85a20` | `checkpoint/07-gorisanson-ui` | MCTS UI | Web + head_to_head    |
+| 08  | `checkpoint-08-greedy-ui`     | `10bcb23` | `checkpoint/08-greedy-ui`     | Greedy  | Testing lab UI        |
+| 09  | `checkpoint-09-alphabeta`     | _future_  | `checkpoint/09-alphabeta`     | **Yes** | First Elo tournament  |
 
 ---
 

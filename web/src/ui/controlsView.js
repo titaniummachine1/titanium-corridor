@@ -1,9 +1,11 @@
 import {
   STRENGTH_LEVEL_PRESETS,
   TIME_TO_MOVE_PRESETS,
-  formatVisits,
+  formatVisitsCap,
   formatWallClock,
+  visitsFromSliderPosition,
 } from '../lib/timeControl.js';
+import { playerColorLabel, playerColorName } from '../lib/playerColors.js';
 import { renderDiscreteSlider } from './discreteSlider.js';
 import { wireRangeSlider } from './sliderWire.js';
 import './scrapedSlider.css';
@@ -15,16 +17,16 @@ export function renderControls(container, state, controller) {
   container.innerHTML = `
     <section class="controls-card">
       <h1 class="app-title">Quoridor AI</h1>
-      <p class="app-subtitle">Play · Human vs Ishtar, Ka, or local MCTS</p>
+      <p class="app-subtitle">Play · Titanium, Gorisanson, Ishtar, or Ka</p>
 
       <div class="control-group">
-        <label class="control-label">Player 1 (moves first)</label>
+        <label class="control-label">${playerColorLabel(1)}</label>
         ${renderPlayerSelect('player1', settings.players[0], playerOptionGroups)}
         ${renderPlayerAiSettings(p1Ui, 1)}
       </div>
 
       <div class="control-group">
-        <label class="control-label">Player 2</label>
+        <label class="control-label">${playerColorName(2)}</label>
         ${renderPlayerSelect('player2', settings.players[1], playerOptionGroups)}
         ${renderPlayerAiSettings(p2Ui, 2)}
       </div>
@@ -42,8 +44,8 @@ export function renderControls(container, state, controller) {
       </div>
 
       <div class="status-panel">
-        <div class="status-line"><span>Turn</span><strong>Player ${state.playerToMove}</strong></div>
-        <div class="status-line"><span>Eval (P1)</span><strong>${Math.round((state.eval.p1 ?? 0.5) * 100)}%</strong></div>
+        <div class="status-line"><span>Turn</span><strong>${playerColorName(state.playerToMove)}</strong></div>
+        <div class="status-line"><span>Eval (White)</span><strong>${Math.round((state.eval.p1 ?? 0.5) * 100)}%</strong></div>
         ${searchInfoLine ? `<div class="status-line status-line--muted"><span>AI</span><strong>${escapeHtml(searchInfoLine)}</strong></div>` : ''}
         ${
           state.eval.pv?.length
@@ -119,10 +121,11 @@ function wirePlayerAiSettings(container, controller, playerNum) {
     container,
     `[data-setting="visits-${playerNum}"]`,
     (value) => {
-      controller.setPlayerVisitsBudget(playerNum, value, { silent: true });
+      const visits = visitsFromSliderPosition(value);
+      controller.setPlayerVisitsBudget(playerNum, visits, { silent: true });
       const label = container.querySelector(`[data-visits-label="${playerNum}"]`);
       if (label) {
-        label.textContent = formatVisits(Number(value));
+        label.textContent = formatVisitsCap(visits);
       }
     },
     refresh,
@@ -134,11 +137,22 @@ function renderPlayerAiSettings(ui, playerNum) {
     return '';
   }
 
-  if (ui.isLocal) {
+  if (ui.isLocalMcts) {
     const { min: tMin, max: tMax, step: tStep } = ui.wallclockRange;
     const { min: vMin, max: vMax, step: vStep } = ui.visitsRange;
     return `
       <div class="player-ai-settings">
+        ${
+          ui.isTitanium
+            ? renderDiscreteSlider({
+                label: 'AI Strength',
+                settingName: 'strength-level',
+                playerNum,
+                value: ui.strengthLevel,
+                presets: STRENGTH_LEVEL_PRESETS,
+              })
+            : ''
+        }
         <label class="control-label control-label--sub">Time per move</label>
         <div class="time-slider-row">
           <input
@@ -152,7 +166,7 @@ function renderPlayerAiSettings(ui, playerNum) {
           />
           <output class="time-slider-value" data-wallclock-label="${playerNum}">${formatWallClock(ui.wallClockSeconds)}</output>
         </div>
-        <label class="control-label control-label--sub">Visit budget</label>
+        <label class="control-label control-label--sub">Rollout cap</label>
         <div class="time-slider-row">
           <input
             type="range"
@@ -161,9 +175,9 @@ function renderPlayerAiSettings(ui, playerNum) {
             min="${vMin}"
             max="${vMax}"
             step="${vStep}"
-            value="${ui.visitsBudget}"
+            value="${ui.visitsSliderPosition}"
           />
-          <output class="time-slider-value" data-visits-label="${playerNum}">${formatVisits(ui.visitsBudget)}</output>
+          <output class="time-slider-value" data-visits-label="${playerNum}">${formatVisitsCap(ui.visitsBudget)}</output>
         </div>
         <p class="time-hint">${escapeHtml(ui.hint)}</p>
       </div>`;

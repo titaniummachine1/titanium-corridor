@@ -12,7 +12,8 @@ After each checkpoint commit, update the `commit:` line with `git rev-parse --sh
 | 05      | `checkpoint/05-perft-bugfix`  | `6b9e00d`  | [05-first-perft-bug.md](05-first-perft-bug.md) |
 | 06      | `checkpoint/06-threading`     | `098477c`  | [06-threading-prep.md](06-threading-prep.md)   |
 | 07      | `checkpoint/07-gorisanson-ui` | `7c85a20`  | [07-ai-opponents.md](07-ai-opponents.md)       |
-| 08+     | `checkpoint/08-alphabeta` …   | _(future)_ | Titanium `genmove` — first Elo vs gorisanson   |
+| 08      | `checkpoint/08-greedy-ui`       | `10bcb23`  | [08-greedy-ui-lab.md](08-greedy-ui-lab.md)     |
+| 09+     | `checkpoint/09-alphabeta` …     | _(future)_ | αβ search — beat gorisanson at same time budget |
 
 **Perft debug:** `node benchmark/perft_diff.mjs 2` — divide diff vs JS oracle.
 
