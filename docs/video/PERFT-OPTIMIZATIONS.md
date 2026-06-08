@@ -70,6 +70,38 @@ Chronological discoveries while making perft **correct, light, and fast** before
 
 ---
 
+## Layer 4 — Bitwise flood fill + centered u128 layout
+
+| Change                                                 | Why                                                                              |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `DirMasks` (N/S/E/W `u128`) built once per wall trial  | Replace per-edge `can_step` in BFS loop                                          |
+| Flood expand via shifts (`>>11`, `<<11`, `<<1`, `>>1`) | Word-parallel frontier (Ishtar/Canta style)                                      |
+| **Centered 11×11 stride** in `u128` (`grid.rs`)        | 9×9 playable + **side buffer columns** — east/west shifts never wrap across rows |
+| Ishtar component reuse                                 | If P2 pawn ∈ P1 flood mask, skip second full flood                               |
+| Known-path wall skip                                   | If a wall misses one current path for each player, both paths survive            |
+| `pack_flood_mask` at API boundary                      | Internal flood bits → compact 81-bit game mask for search                        |
+
+**Layout:** playable `(row, col)` → bit `(row+1)*11 + (col+1)`. Max bit index **108** (fits in `u128` with headroom).
+
+**Oracles (startpos, release, 1 thread):**
+
+| Depth | Nodes             | Time (this machine)   |
+| ----- | ----------------- | --------------------- |
+| 1     | 131               | —                     |
+| 2     | 16,677            | —                     |
+| 3     | **2,062,264**     | **~0.06s**            |
+| 4     | **247,569,030**   | **~3.1s**             |
+| 5     | 28,837,934,502    | ~18s (Ishtar ref)     |
+| 6     | 3,257,436,276,501 | ~691 min (Ishtar ref) |
+
+Depth 4 matches Ishtar/Canta oracle. Regression: `PERFT4_STARTPOS` test (`cargo test --release perft_depth4 -- --ignored`).
+
+**Discovery #E:** Wall-legality BFS dominated perft time. Queue BFS at stride-9 risked **row wrap** on `<<1`/`>>1`; centered stride-11 lets hardware shifts stay dumb — no per-expand boundary paranoia.
+
+**Before → after (depth 4, same machine):** ~6–9s → **~3.1s** (~2×) with correct node count.
+
+---
+
 ## What we deliberately did NOT do (yet)
 
 | Idea                                      | Why wait                                                      |
@@ -91,7 +123,7 @@ perft_fast_ctx
   │    ├─ pawn moves (≤8)
   │    └─ wall moves: iterate empty bitboard slots
   │         ├─ collision / topology (cheap)
-  │         └─ in-place wall trial + BfsScratch BFS
+  │         └─ in-place wall trial + bitwise flood (centered u128)
   └─ for each move: make_move → recurse → unmake_move
 ```
 

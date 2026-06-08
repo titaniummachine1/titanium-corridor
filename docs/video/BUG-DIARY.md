@@ -132,6 +132,54 @@ perft_diff → only d8v and e8v subtrees differ
 
 ---
 
+## 10. `test_replay_legality` — external replay used pre-fix rules
+
+**Symptom:** `test_replay::test_replay_legality` failed. Move 24 `g1v` was deemed illegal.
+
+**Cause:** The hardcoded replay came from a game played before the horizontal boundary fix (commit `9e4cbf5`, `js_col == 8`). Under the corrected rules, `g1v` at move 24 blocks a goal path and is correctly rejected.
+
+**Fix:** Marked old test `#[ignore]`. Added `g1v_correctly_rejected_after_replay_prefix` which asserts the wall is **not** in the legal move list.
+
+**Lesson:** External replays can silently embed pre-fix illegal moves. Always isolate the specific move before marking a test wrong.
+
+---
+
+## 11. `expand_frontier_no_row_wrap_east_west` — wrong assertion
+
+**Symptom:** Test asserted flood from `(0,0)` didn't reach `(1,0)` — but of course it does (south step is legal).
+
+**Cause:** Test intent was to verify that an east shift from `(0,8)` (board east edge) doesn't bleed into `(1,0)`. Assertion was testing the wrong thing.
+
+**Fix:** Refactored test to explicitly place a pawn at `(0,8)`, shift east, verify the resulting bit is in the padding column and `flood_sq_from_bit` returns `None` for it.
+
+**Lesson:** "No row wrap" tests must isolate the specific edge square, not test reachability from a corner.
+
+---
+
+## 12. `flood_bit_index` — `const fn` disallows `u32::from(u8)`
+
+**Symptom:** Compile error: `cannot call conditionally-const associated function <u32 as From<u8>>::from`.
+
+**Cause:** `From::from` is not stabilised as `const fn` in Rust stable. `u32::from(row)` inside a `const fn` is rejected.
+
+**Fix:** `row as u32` and `col as u32` casts — explicit type casts are allowed in `const fn`.
+
+**Lesson:** In `const fn` contexts, use `as` casts, not trait-based conversions.
+
+---
+
+## 13. Known-path wall skip — eager cache caused regression
+
+**Symptom:** After adding `WallPathCache`, perft 4 jumped from ~3.0s to ~4.27s.
+
+**Cause:** `WallPathCache::new` was called for every wall candidate because the topology check returned `true` for many floaters. Building both shortest paths (two BFS passes) per position wiped out the BFS-skip savings.
+
+**Fix:** Made `WallPathCache` lazy via `Option<WallPathCache>` with `get_or_insert_with`. Now it is built at most once per position and only when `can_wall_block_topology` has already returned `true` for at least one wall. All subsequent topology-true walls reuse the same cache.
+
+**Lesson:** "Build once per position, not per candidate" only works if initialisation is deferred until the first candidate actually needs it.
+
+---
+
 ## Oracle stack (for cross-platform debugging)
 
 1. **Primary:** scraped `web/src/lib/gameLogic.js` (netlify UI rules)

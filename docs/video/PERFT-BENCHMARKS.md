@@ -9,8 +9,9 @@
 | 0     |             1 | sanity                           |
 | 1     |           131 | fast smoke                       |
 | 2     |        16,677 | quick divide drills              |
-| **3** | **2_062_264** | **CI / competition cross-check** |
-| 4     |   247,569,072 | stress test only (not CI)        |
+| **3** | **2,062,264** | **CI / competition cross-check** |
+| **4** | **247,569,030** | stress test — locked oracle (`PERFT4_STARTPOS`) |
+| 5     | 28,837,934,502 | Ishtar/Canta reference only (~18s) |
 
 ## Commands (default = depth 3)
 
@@ -28,24 +29,26 @@ node benchmark/perft_diff.mjs           # divide diff when something breaks
 
 ## Titanium perft stack (fundamentals)
 
-| Layer         | What                                                         |
-| ------------- | ------------------------------------------------------------ |
-| Tree walk     | `make_move` / `unmake_move` (no clone per node)              |
-| Hash          | Zobrist incremental                                          |
-| TT            | Clustered buckets (4 slots), `(hash, depth) → nodes`         |
-| Move gen      | `generate_legal_moves_slice` → stack `[Move; 140]`           |
-| Wall legality | In-place wall trial + empty-slot bitboard iteration          |
-| BFS           | `BfsScratch` pool in `PerftContext` (reused queue + visited) |
-| Build         | `lto = fat`, `codegen-units = 1`                             |
+| Layer           | What                                                                          |
+| --------------- | ----------------------------------------------------------------------------- |
+| Tree walk       | `make_move` / `unmake_move` (no clone per node)                               |
+| Hash            | Zobrist incremental                                                            |
+| TT              | Clustered buckets (4 slots), `(hash, depth) → nodes`                          |
+| Move gen        | `generate_legal_moves_slice` → stack `[Move; 140]`                            |
+| Wall legality   | Collision → topology → **known-path skip** → in-place flood trial             |
+| Flood fill      | `DirMasks` (N/S/E/W u128) + bitwise shifts on centered 11-wide layout        |
+| Component reuse | Ishtar trick: if P2 pawn ∈ P1 flood component, skip P2 flood                  |
+| Build           | `lto = fat`, `codegen-units = 1`                                               |
 
 Full discovery log: `PERFT-OPTIMIZATIONS.md`.
 
 ## Release timings (this machine, startpos)
 
-| Depth | Time       | nps (approx) |
-| ----- | ---------- | ------------ |
-| 3     | **~0.10s** | ~20M         |
-| 4     | **~6s**    | ~41M         |
+| Depth | Time       | nps (approx) | Notes                      |
+| ----- | ---------- | ------------ | -------------------------- |
+| 3     | **~0.06s** | ~34M         | After Layer 4 flood fill   |
+| 4     | **~3.1s**  | ~80M         | After Layer 4 flood fill   |
+| 5     | ~18s       | —            | Ishtar reference only      |
 
 Run `cargo run --release -- bench 3 20` for a stable nps average.
 

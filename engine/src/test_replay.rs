@@ -34,6 +34,33 @@ fn parse_algebraic(move_str: &str) -> Option<Move> {
 }
 
 #[test]
+fn g1v_correctly_rejected_after_replay_prefix() {
+    // Move 24 from an external replay — g1v blocks a goal path under correct rules.
+    let prefix = [
+        "e2", "e8", "e3", "e7", "e4", "e6", "d1h", "d6h", "f4", "f6h", "f5", "e5", "d5", "c5v",
+        "d4", "c3v", "d3", "e4", "c1v", "f4", "f1h", "h1v", "h2h", "g3v",
+    ];
+    let mut board = Board::new();
+    let mut bfs = BfsScratch::new();
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; crate::moves::MAX_LEGAL_MOVES];
+
+    for move_str in prefix {
+        let mv = parse_algebraic(move_str).unwrap();
+        let n = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs);
+        assert!(buf[..n].contains(&mv), "{move_str} must be legal in prefix");
+        let _ = board.make_move(mv);
+    }
+
+    let g1v = parse_algebraic("g1v").unwrap();
+    let n = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs);
+    assert!(
+        !buf[..n].contains(&g1v),
+        "g1v must be rejected — it blocks a goal path"
+    );
+}
+
+#[test]
+#[ignore = "external replay used pre-boundary-fix rules at move 24 (g1v)"]
 fn test_replay_legality() {
     let moves = [
         "e2", "e8", "e3", "e7", "e4", "e6", "d1h", "d6h", "f4", "f6h", "f5", "e5", "d5", "c5v",

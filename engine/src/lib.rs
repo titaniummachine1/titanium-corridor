@@ -25,7 +25,10 @@ pub use board::{Board, Column, Move, Player, Row, Undo, WallOrientation};
 pub use moves::{
     generate_legal_moves, generate_legal_moves_into, generate_legal_moves_slice, MAX_LEGAL_MOVES,
 };
-pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
+pub use path::{
+    attention_weight_cm, both_players_reach_goals, can_reach_goal, shortest_distance,
+    ConsensusAttention, BfsScratch,
+};
 pub use context::{EngineLimits, SharedState, ThreadBenchResult, WorkerContext};
 pub use engine::Engine;
 pub use genmove::{genmove_algebraic, GenmoveConfig, GenmoveEngine, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT};
@@ -34,6 +37,6 @@ pub use mcts::{search_mcts, MctsConfig, MctsReport};
 pub use search::{search_best_move, SearchConfig, SearchReport, DEFAULT_MAX_NODES, DEFAULT_TIME_MS};
 pub use perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_iterative,
-    perft_naive, perft_parallel_root, PerftContext, PERFT3_STARTPOS,
+    perft_naive, perft_parallel_root, PerftContext, PERFT3_STARTPOS, PERFT4_STARTPOS,
 };
 pub use tt::TranspositionTable;

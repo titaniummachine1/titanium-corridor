@@ -5,6 +5,9 @@
 /// Startpos perft(3) — agreed by scraped JS, gorisanson, and Titanium.
 pub const PERFT3_STARTPOS: u64 = 2_062_264;
 
+/// Startpos perft(4) — Ishtar / Canta oracle (2025).
+pub const PERFT4_STARTPOS: u64 = 247_569_030;
+
 use crate::board::{Board, Move};
 use crate::context::{SharedState, WorkerContext};
 use crate::moves::{generate_legal_moves_into, generate_legal_moves_slice, MAX_LEGAL_MOVES};
@@ -224,5 +227,14 @@ mod tests {
         let mut engine = Engine::new();
         let lines = engine.perft_iterative(&mut board, 3);
         assert_eq!(lines.last().map(|x| x.1), Some(PERFT3_STARTPOS));
+    }
+
+    /// Full-tree regression — run with `cargo test --release perft_depth4 -- --ignored`.
+    #[test]
+    #[ignore = "slow in debug; run: cargo test --release perft_depth4 -- --ignored"]
+    fn perft_depth4_matches_oracle() {
+        let board = Board::new();
+        let mut fast_board = board.clone();
+        assert_eq!(perft_fast(&mut fast_board, 4), PERFT4_STARTPOS);
     }
 }

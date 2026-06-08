@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::board::{Board, Move, Player, WallOrientation};
 use crate::grid::{is_goal, square_index, unpack_square, wall_touch_squares};
 use crate::moves::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::path::{ConsensusAttention, BfsScratch};
 use crate::perft::format_move;
 
 const MATE: i32 = 20_000;
@@ -15,6 +15,8 @@ const DIST_PENALTY: u8 = 255;
 const MAX_EVAL: i32 = 255;
 /// Wasted turn: opponent gets to improve on reply.
 const TEMPO_PENALTY: i32 = -1;
+const CAT_HOT_CM: u16 = 180;
+const CAT_COLD_CM: u16 = 80;
 
 const LMR_MIN_DEPTH: u32 = 2;
 // Full-depth moves before LMR kicks in — 4 protects the critical 4th move
@@ -512,6 +514,23 @@ fn collect_moves(
     n
 }
 
+fn cat_score_for_move(mv: Move, cat: &ConsensusAttention) -> i32 {
+    match mv {
+        Move::Pawn { row, col } => i32::from(cat[square_index(row, col) as usize]),
+        Move::Wall {
+            row,
+            col,
+            orientation,
+        } => {
+            let mut max_cm = 0u16;
+            for (r, c) in wall_touch_squares(row, col, orientation) {
+                max_cm = max_cm.max(cat[square_index(r, c) as usize]);
+            }
+            i32::from(max_cm)
+        }
+    }
+}
+
 fn move_order_score(
     board: &mut Board,
     mv: Move,
@@ -519,6 +538,7 @@ fn move_order_score(
     our_dist: u8,
     opp_dist: u8,
     bfs: &mut BfsScratch,
+    cat: &ConsensusAttention,
 ) -> i32 {
     if tt_best == Some(mv) {
         return 10_000;
@@ -527,7 +547,7 @@ fn move_order_score(
     if gain > 0 {
         1000 + gain * 100
     } else {
-        TEMPO_PENALTY
+        cat_score_for_move(mv, cat) + TEMPO_PENALTY
     }
 }
 
@@ -540,9 +560,10 @@ fn order_moves(
     our_dist: u8,
     opp_dist: u8,
     bfs: &mut BfsScratch,
+    cat: &ConsensusAttention,
 ) {
     for i in 0..n {
-        scores[i] = move_order_score(board, moves[i], tt_best, our_dist, opp_dist, bfs);
+        scores[i] = move_order_score(board, moves[i], tt_best, our_dist, opp_dist, bfs, cat);
     }
     let mut order: [usize; MAX_LEGAL_MOVES] = core::array::from_fn(|i| i);
     order[..n].sort_unstable_by(|&a, &b| scores[b].cmp(&scores[a]));
@@ -595,6 +616,7 @@ fn quiescence(
         .shortest_distance(board, board.side().opposite())
         .unwrap_or(DIST_PENALTY);
 
+    let cat = state.bfs.build_consensus_attention(board);
     let mut scores = [0i32; MAX_LEGAL_MOVES];
     order_moves(
         board,
@@ -605,6 +627,7 @@ fn quiescence(
         our_dist,
         opp_dist,
         state.bfs,
+        &cat,
     );
 
     for i in 0..n {
@@ -771,6 +794,7 @@ fn negamax(
     let opp_dist_pre = path_distance(board.side().opposite(), &opp_path, opp_path_len);
     let our_dist_pre = state.bfs.shortest_distance(board, board.side()).unwrap_or(DIST_PENALTY);
 
+    let cat = state.bfs.build_consensus_attention(board);
     let mut scores = [0i32; MAX_LEGAL_MOVES];
     order_moves(
         board,
@@ -781,6 +805,7 @@ fn negamax(
         our_dist_pre,
         opp_dist_pre,
         state.bfs,
+        &cat,
     );
 
     // ── Forcing extension ─────────────────────────────────────────────────
@@ -829,9 +854,11 @@ fn negamax(
         //   (a) Shortens our BFS distance to goal (pawn), or
         //   (b) Disturbs the opponent's shortest path (wall).
         // Tactical moves are NEVER reduced or pruned.
+        let cat_cm = cat_score_for_move(mv, &cat);
         let is_tactical = if moves_searched == 0
             || depth < LMR_MIN_DEPTH
             || moves_searched < LMR_AFTER_MOVE
+            || cat_cm >= i32::from(CAT_HOT_CM)
         {
             // We treat early moves as tactical by definition (no reduction either way).
             true
@@ -865,6 +892,8 @@ fn negamax(
             let extra = if matches!(mv, Move::Wall { .. })
                 && !wall_intersects_path(mv, &opp_path, opp_path_len)
             {
+                1u32
+            } else if cat_cm < i32::from(CAT_COLD_CM) {
                 1u32
             } else {
                 0u32

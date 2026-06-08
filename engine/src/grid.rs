@@ -75,6 +75,79 @@ pub fn unpack_square(sq: u8) -> (u8, u8) {
     (sq / 9, sq % 9)
 }
 
+// ── Centered u128 flood layout (11×11 stride, 9×9 playable) ─────────────────
+//
+// Playable square (r,c) maps to bit `(r + ROW_PAD) * STRIDE + (c + COL_PAD)`.
+// Buffer columns absorb east/west shifts so `<< 1` / `>> 1` never wrap rows.
+
+/// Columns per row in the flood bitboard (9 playable + 1 buffer each side).
+pub const FLOOD_STRIDE: u32 = 11;
+pub const FLOOD_COL_PAD: u32 = 1;
+pub const FLOOD_ROW_PAD: u32 = 1;
+
+#[inline]
+pub const fn flood_bit_index(row: u8, col: u8) -> u32 {
+    (row as u32 + FLOOD_ROW_PAD) * FLOOD_STRIDE + col as u32 + FLOOD_COL_PAD
+}
+
+#[inline]
+pub fn flood_bit_sq(sq: u8) -> u128 {
+    let (r, c) = unpack_square(sq);
+    1u128 << flood_bit_index(r, c)
+}
+
+#[inline]
+pub fn flood_sq_from_bit(bit: u32) -> Option<u8> {
+    if bit >= 128 {
+        return None;
+    }
+    let row = bit / FLOOD_STRIDE;
+    let col = bit % FLOOD_STRIDE;
+    if row < FLOOD_ROW_PAD || row > FLOOD_ROW_PAD + 8 {
+        return None;
+    }
+    if col < FLOOD_COL_PAD || col > FLOOD_COL_PAD + 8 {
+        return None;
+    }
+    Some(square_index(
+        (row - FLOOD_ROW_PAD) as u8,
+        (col - FLOOD_COL_PAD) as u8,
+    ))
+}
+
+const fn flood_playable_mask() -> u128 {
+    let mut mask = 0u128;
+    let mut row = 0u8;
+    while row < 9 {
+        let mut col = 0u8;
+        while col < 9 {
+            let bit = flood_bit_index(row, col);
+            mask |= 1u128 << bit;
+            col += 1;
+        }
+        row += 1;
+    }
+    mask
+}
+
+/// All 81 playable pawn squares in centered flood-bit layout.
+pub const FLOOD_PLAYABLE: u128 = flood_playable_mask();
+
+/// Pack centered flood bits → compact game-square mask (sq 0..80).
+#[inline]
+pub fn pack_flood_mask(bits: u128) -> u128 {
+    let mut out = 0u128;
+    let mut b = bits & FLOOD_PLAYABLE;
+    while b != 0 {
+        let fb = b.trailing_zeros();
+        if let Some(sq) = flood_sq_from_bit(fb) {
+            out |= 1u128 << sq;
+        }
+        b &= b - 1;
+    }
+    out
+}
+
 /// Pawn squares adjacent to a wall segment (internal wall coords).
 #[inline]
 pub fn wall_touch_squares(row: u8, col: u8, orientation: WallOrientation) -> [(u8, u8); 4] {
@@ -122,6 +195,24 @@ pub fn has_wall(board: &Board, row: u8, col: u8, orientation: WallOrientation) -
 mod tests {
     use super::*;
     use crate::board::{Board, WallOrientation};
+
+    #[test]
+    fn flood_layout_centered_with_side_buffers() {
+        assert_eq!(FLOOD_PLAYABLE.count_ones(), 81);
+        assert!(flood_bit_index(8, 8) < 128);
+        // (0,0) and (0,8) share a row in flood layout — east shift stays on row 0.
+        let left = flood_bit_index(0, 0);
+        let right = flood_bit_index(0, 8);
+        assert_eq!(right - left, 8);
+        // Buffer column west of (0,0).
+        assert_eq!(flood_sq_from_bit(left - 1), None);
+        // Buffer column east of (0,8).
+        assert_eq!(flood_sq_from_bit(right + 1), None);
+        for sq in 0u8..81 {
+            let packed = pack_flood_mask(flood_bit_sq(sq));
+            assert_eq!(packed, 1u128 << sq);
+        }
+    }
 
     #[test]
     fn vertical_d8v_blocks_black_left_from_e9() {

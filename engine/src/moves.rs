@@ -1,7 +1,7 @@
 //! Legal move generation — pawn jumps + wall placements with path validation.
 
-use crate::board::{Board, Move, WallOrientation};
-use crate::grid::{can_step, has_wall, set_wall};
+use crate::board::{Board, Move, Player, WallOrientation};
+use crate::grid::{can_step, goal_row, has_wall, set_wall, square_index, unpack_square};
 use crate::path::BfsScratch;
 
 const DIRS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
@@ -126,6 +126,7 @@ fn generate_wall_moves_slice(
     out: &mut [Move],
     scratch: &mut BfsScratch,
 ) -> usize {
+    let mut path_cache = None;
     let mut n = 0usize;
     n += collect_wall_orientation(
         board,
@@ -133,6 +134,7 @@ fn generate_wall_moves_slice(
         WallOrientation::Horizontal,
         &mut out[n..],
         scratch,
+        &mut path_cache,
     );
     n += collect_wall_orientation(
         board,
@@ -140,6 +142,7 @@ fn generate_wall_moves_slice(
         WallOrientation::Vertical,
         &mut out[n..],
         scratch,
+        &mut path_cache,
     );
     n
 }
@@ -151,6 +154,7 @@ fn collect_wall_orientation(
     orientation: WallOrientation,
     out: &mut [Move],
     scratch: &mut BfsScratch,
+    path_cache: &mut Option<WallPathCache>,
 ) -> usize {
     let mut n = 0usize;
     while free != 0 {
@@ -158,7 +162,7 @@ fn collect_wall_orientation(
         free &= free - 1;
         let row = (bit / 8) as u8;
         let col = (bit % 8) as u8;
-        if is_legal_wall(board, row, col, orientation, scratch) {
+        if is_legal_wall(board, row, col, orientation, scratch, path_cache) {
             out[n] = Move::Wall {
                 row,
                 col,
@@ -176,6 +180,7 @@ fn is_legal_wall(
     col: u8,
     orientation: WallOrientation,
     scratch: &mut BfsScratch,
+    path_cache: &mut Option<WallPathCache>,
 ) -> bool {
     if wall_collides(board, row, col, orientation) {
         return false;
@@ -183,7 +188,123 @@ fn is_legal_wall(
     if !can_wall_block_topology(board, row, col, orientation) {
         return true;
     }
+    let paths = path_cache.get_or_insert_with(|| WallPathCache::new(board, scratch));
+    if !paths.wall_intersects_either_path(row, col, orientation) {
+        return true;
+    }
     path_ok_after_wall(board, row, col, orientation, scratch)
+}
+
+struct WallPathCache {
+    p1: [u8; 81],
+    p2: [u8; 81],
+    p1_len: usize,
+    p2_len: usize,
+}
+
+impl WallPathCache {
+    fn new(board: &Board, scratch: &mut BfsScratch) -> Self {
+        let mut p1 = [u8::MAX; 81];
+        let mut p2 = [u8::MAX; 81];
+        let p1_len = shortest_path(board, Player::One, scratch, &mut p1);
+        let p2_len = shortest_path(board, Player::Two, scratch, &mut p2);
+        Self {
+            p1,
+            p2,
+            p1_len,
+            p2_len,
+        }
+    }
+
+    #[inline]
+    fn wall_intersects_either_path(
+        &self,
+        row: u8,
+        col: u8,
+        orientation: WallOrientation,
+    ) -> bool {
+        wall_intersects_path(row, col, orientation, &self.p1, self.p1_len)
+            || wall_intersects_path(row, col, orientation, &self.p2, self.p2_len)
+    }
+}
+
+fn shortest_path(
+    board: &Board,
+    player: Player,
+    scratch: &mut BfsScratch,
+    path_out: &mut [u8; 81],
+) -> usize {
+    let mut next_out = [u8::MAX; 81];
+    scratch.fill_next_toward_goal(board, player, &mut next_out);
+
+    let (pr, pc) = board.pawn(player);
+    let mut current = square_index(pr, pc);
+    let mut len = 0usize;
+    while len < path_out.len() {
+        path_out[len] = current;
+        len += 1;
+
+        let (row, _) = unpack_square(current);
+        if row == goal_row(player) {
+            break;
+        }
+
+        let next = next_out[current as usize];
+        if next == u8::MAX {
+            break;
+        }
+        current = next;
+    }
+    len
+}
+
+#[inline]
+fn wall_intersects_path(
+    row: u8,
+    col: u8,
+    orientation: WallOrientation,
+    path: &[u8; 81],
+    len: usize,
+) -> bool {
+    if len <= 1 {
+        return false;
+    }
+    for i in 0..(len - 1) {
+        if wall_blocks_path_step(row, col, orientation, path[i], path[i + 1]) {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn wall_blocks_path_step(
+    row: u8,
+    col: u8,
+    orientation: WallOrientation,
+    sq1: u8,
+    sq2: u8,
+) -> bool {
+    let (r1, c1) = unpack_square(sq1);
+    let (r2, c2) = unpack_square(sq2);
+    match orientation {
+        WallOrientation::Horizontal => {
+            if c1 == c2 && r1.abs_diff(r2) == 1 {
+                let min_r = r1.min(r2);
+                min_r == row && (c1 == col || c1 == col + 1)
+            } else {
+                false
+            }
+        }
+        WallOrientation::Vertical => {
+            if r1 == r2 && c1.abs_diff(c2) == 1 {
+                let min_c = c1.min(c2);
+                min_c == col && (r1 == row || r1 == row + 1)
+            } else {
+                false
+            }
+        }
+    }
 }
 
 /// Trial wall in-place — set, BFS both goals, unset. No `Board::clone`.
