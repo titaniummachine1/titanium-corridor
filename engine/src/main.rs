@@ -1,9 +1,13 @@
-//! Titanium Engine CLI — perft / divide / bench entry points.
+//! Titanium Engine CLI — perft / divide / bench / genmove entry points.
 
 use std::env;
 use std::time::Instant;
 
-use titanium::{Board, Engine, WorkerContext, generate_legal_moves, genmove_algebraic, perft_divide};
+use titanium::{
+    Board, Engine, GenmoveConfig, GenmoveEngine, MctsConfig, SearchConfig, generate_legal_moves,
+    genmove_algebraic, perft_divide, DEFAULT_MAX_NODES, DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS,
+    MCTS_DEFAULT_UCT,
+};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -34,7 +38,9 @@ fn print_usage() {
     println!("  titanium perft-race <sec>              — max depth within time budget");
     println!("  titanium perft-id [depth]              — iterative deepening perft 0..depth");
     println!("  titanium moves                         — list legal moves at startpos");
-    println!("  titanium genmove [moves...]            — greedy one-ply best move (algebraic)");
+    println!("  titanium genmove [moves...] [--engine mcts|minimax|greedy]");
+    println!("              [--time SEC] [--sims N] [--uct F] [--nodes N] [--log]");
+    println!("              — default: Gorisanson-style MCTS in Rust");
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
@@ -233,18 +239,88 @@ fn run_moves() {
     }
 }
 
-fn run_genmove(args: &[String]) {
-    let cli = parse_cli(args);
-    let mut board = Board::new();
-    for mv in cli.positional.iter().skip(2) {
-        if mv.starts_with("--") {
-            break;
+fn parse_genmove_config(args: &[String]) -> (GenmoveConfig, Vec<String>) {
+    let log = std::env::var("TITANIUM_LOG").is_ok();
+    let mut config = GenmoveConfig {
+        engine: GenmoveEngine::Mcts,
+        mcts: MctsConfig {
+            time_ms: DEFAULT_TIME_MS,
+            max_simulations: MCTS_DEFAULT_MAX_SIMULATIONS,
+            uct: MCTS_DEFAULT_UCT,
+            log,
+        },
+        minimax: SearchConfig {
+            time_ms: DEFAULT_TIME_MS,
+            max_nodes: DEFAULT_MAX_NODES,
+            log,
+        },
+    };
+    let mut moves = Vec::new();
+
+    let mut i = 2usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--engine" {
+            if let Some(name) = args.get(i + 1) {
+                config.engine = match name.as_str() {
+                    "minimax" | "ab" => GenmoveEngine::Minimax,
+                    "greedy" => GenmoveEngine::Greedy,
+                    _ => GenmoveEngine::Mcts,
+                };
+                i += 2;
+                continue;
+            }
+        } else if arg == "--time" {
+            if let Some(sec) = args.get(i + 1).and_then(|s| s.parse::<f64>().ok()) {
+                let ms = (sec * 1000.0) as u64;
+                config.mcts.time_ms = ms;
+                config.minimax.time_ms = ms;
+                i += 2;
+                continue;
+            }
+        } else if arg == "--sims" {
+            if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                config.mcts.max_simulations = n;
+                i += 2;
+                continue;
+            }
+        } else if arg == "--uct" {
+            if let Some(u) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                config.mcts.uct = u;
+                i += 2;
+                continue;
+            }
+        } else if arg == "--nodes" {
+            if let Some(n) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                config.minimax.max_nodes = n;
+                i += 2;
+                continue;
+            }
+        } else if arg == "--log" {
+            config.mcts.log = true;
+            config.minimax.log = true;
+            i += 1;
+            continue;
+        } else if arg.starts_with("--") {
+            i += 1;
+            continue;
+        } else {
+            moves.push(arg.clone());
         }
-        board.apply_algebraic(mv);
+        i += 1;
     }
 
-    let mut scratch = WorkerContext::new().bfs;
-    match genmove_algebraic(&mut board, &mut scratch) {
+    (config, moves)
+}
+
+fn run_genmove(args: &[String]) {
+    let (config, moves) = parse_genmove_config(args);
+    let mut board = Board::new();
+    for mv in moves {
+        board.apply_algebraic(&mv);
+    }
+
+    match genmove_algebraic(&mut board, config) {
         Some(algebraic) => println!("bestmove {}", algebraic),
         None => println!("bestmove (none)"),
     }

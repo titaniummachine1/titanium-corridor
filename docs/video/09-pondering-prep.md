@@ -69,6 +69,22 @@ Status line: `pondering` (already in `EngineStatus` enum).
 
 ---
 
+## MCTS early exit (shipped in worker)
+
+[gorisanson.github.io](https://gorisanson.github.io/quoridor-ai/) uses **fixed rollout count** (2.5k–60k) — no wall clock — so moves finish when rollouts complete. Endgame feels faster because each rollout is shorter and openings skip search.
+
+Our worker adds early stop so we do **not** burn the full time budget when:
+
+| `stoppedBy`           | Meaning                                         |
+| --------------------- | ----------------------------------------------- |
+| `race`                | No walls left — BFS shortest path (skip MCTS)   |
+| `trivial` / `opening` | One legal move or opening forward step — 0 sims |
+| `converged`           | Root child dominates visits + win rate          |
+| `visits`              | Rollout cap hit                                 |
+| `time`                | Wall clock hit                                  |
+
+---
+
 ## Related
 
 - [08-greedy-ui-lab.md](08-greedy-ui-lab.md) — testing lab UI

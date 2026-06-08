@@ -4,8 +4,8 @@
  */
 
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import { gorisansonMoveToAction } from './gorisanson_bridge.mjs';
+import { toAlgebraic } from '../../web/src/lib/gameLogic.js';
 
 const require = createRequire(import.meta.url);
 const g = require('./load_gorisanson.cjs');
@@ -19,16 +19,9 @@ export function cloneGorisansonGame(game) {
   return g.Game.clone(game);
 }
 
+/** Official algebraic (e2, d3h) — matches web UI and Ka wire format. */
 export function moveLabel(move) {
-  const [pawn, horiz, vert] = move;
-  if (pawn) {
-    const col = String.fromCharCode(97 + pawn[1]);
-    return `${col}${pawn[0] + 1}`;
-  }
-  const [row, col] = horiz ?? vert;
-  const c = String.fromCharCode(97 + col);
-  const suffix = horiz ? 'h' : 'v';
-  return `${c}${row + 1}${suffix}`;
+  return toAlgebraic(gorisansonMoveToAction(move));
 }
 
 /** All legal moves (pawn + walls), not MCTS probable-wall subset. */

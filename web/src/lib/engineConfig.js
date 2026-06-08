@@ -41,6 +41,7 @@ const PlayerType = {
   Human: 'human',
   GorisansonMCTS: 'gorisanson-mcts',
   Titanium: 'titanium',
+  TitaniumMinimax: 'titanium-minimax',
   Pavlosdais: 'pavlosdais',
   IshtarV3: 'ishtar-v3-ai',
   IshtarPonder: 'ishtar-ponder',

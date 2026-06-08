@@ -7,7 +7,10 @@
 pub mod board;
 pub mod context;
 pub mod engine;
+pub mod genmove;
 pub mod greedy;
+pub mod mcts;
+pub mod search;
 pub mod grid;
 pub mod moves;
 pub mod path;
@@ -22,7 +25,10 @@ pub use moves::{
 pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
 pub use context::{EngineLimits, SharedState, ThreadBenchResult, WorkerContext};
 pub use engine::Engine;
-pub use greedy::{choose_greedy_move, genmove_algebraic};
+pub use genmove::{genmove_algebraic, GenmoveConfig, GenmoveEngine, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT};
+pub use greedy::choose_greedy_move;
+pub use mcts::{search_mcts, MctsConfig, MctsReport};
+pub use search::{search_best_move, SearchConfig, SearchReport, DEFAULT_MAX_NODES, DEFAULT_TIME_MS};
 pub use perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_iterative,
     perft_naive, perft_parallel_root, PerftContext, PERFT3_STARTPOS,

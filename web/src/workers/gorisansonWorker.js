@@ -1,10 +1,70 @@
 /**
- * Gorisanson MCTS in a Web Worker — keeps UI responsive.
- * Stops on wall clock or rollout cap (whichever first) and returns best move in tree.
+ * Gorisanson MCTS in a Web Worker — vanilla vendor logic only (read-only ai.js).
  */
 
 import gameJs from '../../../_vendor/quoridor-mcts/src/js/game.js?raw';
 import aiJs from '../../../_vendor/quoridor-mcts/src/js/ai.js?raw';
+
+const PAWN_ROWS = 9;
+const WALL_ROWS = 8;
+
+function parseAlgebraic(move) {
+  const coordinate = {
+    column: move[0],
+    row: Number.parseInt(move[1], 10),
+  };
+  if (move.length > 2) {
+    return {
+      coordinate,
+      wallType: move[2] === 'h' ? 'h' : 'v',
+    };
+  }
+  return { coordinate };
+}
+
+function toAlgebraic(action) {
+  const base = `${action.coordinate.column}${action.coordinate.row}`;
+  return action.wallType ? `${base}${action.wallType}` : base;
+}
+
+function actionToGorisansonMove(action) {
+  const col = action.coordinate.column.charCodeAt(0) - 97;
+  if (action.wallType === 'h') {
+    const row = WALL_ROWS - action.coordinate.row;
+    return [null, [row, col], null];
+  }
+  if (action.wallType === 'v') {
+    const row = WALL_ROWS - action.coordinate.row;
+    return [null, null, [row, col]];
+  }
+  const row = PAWN_ROWS - action.coordinate.row;
+  return [[row, col], null, null];
+}
+
+function gorisansonMoveToAction(move) {
+  const [pawn, horiz, vert] = move;
+  if (pawn) {
+    const [row, col] = pawn;
+    return {
+      coordinate: { column: String.fromCharCode(97 + col), row: PAWN_ROWS - row },
+    };
+  }
+  if (horiz) {
+    const [row, col] = horiz;
+    return {
+      coordinate: { column: String.fromCharCode(97 + col), row: WALL_ROWS - row },
+      wallType: 'h',
+    };
+  }
+  if (vert) {
+    const [row, col] = vert;
+    return {
+      coordinate: { column: String.fromCharCode(97 + col), row: WALL_ROWS - row },
+      wallType: 'v',
+    };
+  }
+  throw new Error('Invalid move tuple from gorisanson engine');
+}
 
 const bootstrap = new Function(
   'postMessage',
@@ -107,10 +167,10 @@ const { Game, AI, searchForTime } = bootstrap(
 );
 
 self.onmessage = (event) => {
-  const { gorisansonMoves, simulations, timeMs, maxSimulations, uctConst } = event.data;
+  const { algebraicMoves = [], simulations, timeMs, maxSimulations, uctConst } = event.data;
   const game = new Game(true);
-  for (const move of gorisansonMoves) {
-    game.doMove(move, true);
+  for (const move of algebraicMoves) {
+    game.doMove(actionToGorisansonMove(parseAlgebraic(move)), true);
   }
 
   if (game.winner !== null) {
@@ -124,6 +184,7 @@ self.onmessage = (event) => {
       self.postMessage({
         type: 'bestmove',
         move: result.move,
+        algebraicMove: toAlgebraic(gorisansonMoveToAction(result.move)),
         simulations: result.simulations,
         stoppedBy: result.stoppedBy,
         timeMs,
@@ -136,5 +197,10 @@ self.onmessage = (event) => {
 
   const ai = new AI(simulations, uctConst, false, true);
   const move = ai.chooseNextMove(game);
-  self.postMessage({ type: 'bestmove', move, simulations });
+  self.postMessage({
+    type: 'bestmove',
+    move,
+    algebraicMove: toAlgebraic(gorisansonMoveToAction(move)),
+    simulations,
+  });
 };

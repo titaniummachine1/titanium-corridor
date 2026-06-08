@@ -1,18 +1,80 @@
 /**
- * Gorisanson MCTS in a Web Worker — shared by Gorisanson + Titanium slots.
+ * Gorisanson MCTS in a Web Worker. Titanium uses titaniumRustClient.js (Rust).
  */
 
 import GorisansonWorker from '../workers/gorisansonWorker.js?worker';
-import { actionToGorisansonMove, gorisansonMoveToAction } from './gorisansonBridge.js';
+import { parseAlgebraic, toAlgebraic } from './gameLogic.js';
 import { LOCAL_VISITS_RANGE, clampVisits, uctFromStrengthLevel } from './timeControl.js';
 
 export class LocalMctsEngineClient {
-  constructor(engineConfig, { resolveUct } = {}) {
+  constructor(engineConfig, { resolveUct, WorkerClass = GorisansonWorker } = {}) {
     this.config = engineConfig;
+    this.WorkerClass = WorkerClass;
     this.resolveUct = resolveUct ?? (() => engineConfig.uctConst ?? 0.2);
     this.worker = null;
-    this.gorisansonMoves = [];
+    this.algebraicMoves = [];
     this.isPondering = false;
+    this.pendingRequest = null;
+  }
+
+  ensureWorker() {
+    if (this.worker) {
+      return;
+    }
+
+    this.worker = new this.WorkerClass();
+
+    this.worker.onmessage = (event) => {
+      const data = event.data;
+      const pending = this.pendingRequest;
+      if (!pending) {
+        return;
+      }
+
+      if (data.type === 'progress' || data.type === 'depth') {
+        pending.onProgress?.(data);
+        return;
+      }
+      if (data.type === 'error') {
+        this.pendingRequest = null;
+        this.setStatus('error');
+        pending.onError?.(new Error(data.message ?? 'Worker error'));
+        return;
+      }
+      if (data.type === 'bestmove') {
+        const elapsed = performance.now() - pending.started;
+        this.pendingRequest = null;
+        this.setStatus('idle');
+        pending.onInfo?.({
+          time: elapsed,
+          simulations: data.simulations,
+          stoppedBy: data.stoppedBy,
+          searchDepth: data.searchDepth,
+          depthLog: data.depthLog,
+          nodes: data.nodes,
+          rootScore: data.rootScore,
+          whiteDist: data.whiteDist,
+          blackDist: data.blackDist,
+          lmrReSearches: data.lmrReSearches,
+          aspirationFails: data.aspirationFails,
+          profileName: data.profileName,
+          progress: 1,
+        });
+        if (!data.algebraicMove) {
+          pending.onError?.(new Error('Worker returned no algebraic move'));
+          return;
+        }
+        const action = parseAlgebraic(data.algebraicMove);
+        this.algebraicMoves.push(data.algebraicMove);
+        pending.onBestMove?.(action);
+      }
+    };
+
+    this.worker.onerror = (err) => {
+      this.pendingRequest = null;
+      this.setStatus('error');
+      this.onError?.(err);
+    };
   }
 
   /**
@@ -36,27 +98,27 @@ export class LocalMctsEngineClient {
   destroy() {
     this.worker?.terminate();
     this.worker = null;
-    this.gorisansonMoves = [];
+    this.algebraicMoves = [];
     this.setStatus('idle');
   }
 
   resetConnection() {
     this.destroy();
-    this.gorisansonMoves = [];
+    this.algebraicMoves = [];
   }
 
   makeMoves(actions) {
     for (const action of actions) {
-      this.gorisansonMoves.push(actionToGorisansonMove(action));
+      this.algebraicMoves.push(toAlgebraic(action));
     }
     this.setStatus('idle');
   }
 
   requestMove({ aiSettings, moveHistory, isFreshGame }) {
     if (isFreshGame) {
-      this.gorisansonMoves = [];
+      this.algebraicMoves = [];
     } else if (moveHistory?.length) {
-      this.gorisansonMoves = moveHistory.map(actionToGorisansonMove);
+      this.algebraicMoves = moveHistory.map(toAlgebraic);
     }
 
     const timeMs = Math.round((aiSettings?.wallClockSeconds ?? 3) * 1000);
@@ -65,46 +127,38 @@ export class LocalMctsEngineClient {
 
     this.setStatus('searching');
     const started = performance.now();
+    this.ensureWorker();
 
-    this.worker?.terminate();
-    this.worker = new GorisansonWorker();
-
-    this.worker.onmessage = (event) => {
-      const data = event.data;
-      if (data.type === 'progress') {
-        return;
-      }
-      if (data.type === 'error') {
-        this.setStatus('error');
-        this.onError?.(new Error(data.message));
-        return;
-      }
-      if (data.type === 'bestmove') {
-        const elapsed = performance.now() - started;
+    this.pendingRequest = {
+      started,
+      onProgress: (data) => {
+        if (data.type === 'depth') {
+          this.onInfo?.({
+            thinking: true,
+            searchDepth: data.depth,
+            nodes: data.nodes,
+            depthLog: [{ depth: data.depth, score: data.score, nodes: data.nodes }],
+          });
+          return;
+        }
         this.onInfo?.({
-          time: elapsed,
+          thinking: true,
+          progress: data.value,
           simulations: data.simulations,
-          stoppedBy: data.stoppedBy,
-          progress: 1,
         });
-        this.setStatus('idle');
-        const action = gorisansonMoveToAction(data.move);
-        this.gorisansonMoves.push(data.move);
-        this.onBestMove?.(action);
-      }
+      },
+      onInfo: (info) => this.onInfo?.(info),
+      onBestMove: (action) => this.onBestMove?.(action),
+      onError: (err) => this.onError?.(err),
     };
 
-    this.worker.onerror = (err) => {
-      this.setStatus('error');
-      this.onError?.(err);
-    };
-
-    this.worker.postMessage({
-      gorisansonMoves: this.gorisansonMoves,
+    const payload = {
+      algebraicMoves: this.algebraicMoves,
       timeMs,
       maxSimulations,
       uctConst,
-    });
+    };
+    this.worker.postMessage(payload);
   }
 
   setStatus(status) {
@@ -120,10 +174,4 @@ export class GorisansonEngineClient extends LocalMctsEngineClient {
   }
 }
 
-export class TitaniumEngineClient extends LocalMctsEngineClient {
-  constructor(engineConfig) {
-    super(engineConfig, {
-      resolveUct: (aiSettings) => uctFromStrengthLevel(aiSettings?.strengthLevel),
-    });
-  }
-}
+export { TitaniumEngineClient } from './titaniumRustClient.js';

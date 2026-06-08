@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use crate::board::{Board, Move, Player, WallOrientation};
+use crate::grid::{is_goal, square_index, unpack_square};
 use crate::moves::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::path::BfsScratch;
 use crate::perft::format_move;
@@ -13,10 +14,15 @@ const MAX_PLY: u32 = 64;
 const DIST_PENALTY: u8 = 255;
 const MAX_EVAL: i32 = 500;
 
-const LMR_MIN_DEPTH: u32 = 3;
+const LMR_MIN_DEPTH: u32 = 2;
+// Full-depth moves before LMR kicks in — 4 protects the critical 4th move
+// (e.g. the best reply wall when opp has 3 pawn options).
 const LMR_AFTER_MOVE: usize = 4;
 const ASPIRATION_DELTA: i32 = 20;
 const MAX_QDEPTH: u32 = 10;
+// Futility margin per depth ply (centipawns equivalent in our eval units).
+// At depth 1 we allow 25 slack, at depth 2 we allow 50 — beyond that no futility.
+const FUTILITY_MARGIN: [i32; 3] = [0, 25, 50];
 const SEARCH_TT_BITS: usize = 20;
 const SEARCH_TT_SIZE: usize = 1 << SEARCH_TT_BITS;
 const SEARCH_TT_MASK: usize = SEARCH_TT_SIZE - 1;
@@ -130,6 +136,9 @@ struct SearchState<'a> {
     log: bool,
     pv_move: Move,
     search_depth: u32,
+    /// Stockfish-style LMR table: lmr_table[depth][moves_searched] = plies to reduce.
+    /// Formula: floor(0.75 + ln(depth) * ln(moves_searched) / 2.0)
+    lmr_table: [[u32; 64]; 64],
 }
 
 impl SearchState<'_> {
@@ -141,6 +150,27 @@ impl SearchState<'_> {
         self.nodes += 1;
         self.nodes % 4096 == 0 && self.should_stop()
     }
+}
+
+/// Precompute LMR reduction table.
+/// Formula: floor(0.5 + ln(depth) * ln(moves_searched) / 2.25)
+/// Lower base (0.5) and higher divisor (2.25) → gentler reductions that
+/// still grow with depth and move count, but protect early moves better.
+/// The cap of depth/2 ensures we never burn more than half our remaining budget.
+/// At depth 12, move 5  → 1 ply reduced.
+/// At depth 12, move 15 → 3 plies reduced.
+/// At depth 12, move 40 → 4 plies reduced.
+fn build_lmr_table() -> [[u32; 64]; 64] {
+    let mut table = [[0u32; 64]; 64];
+    for depth in 1usize..64 {
+        for mv_count in 1usize..64 {
+            let r = 0.5 + (depth as f64).ln() * (mv_count as f64).ln() / 2.25;
+            // Cap at depth/2 — never reduce by more than half the remaining budget.
+            let cap = (depth / 2) as u32;
+            table[depth][mv_count] = (r.max(0.0) as u32).min(cap);
+        }
+    }
+    table
 }
 
 fn is_mate_score(score: i32) -> bool {
@@ -237,14 +267,7 @@ fn unpack_move(packed: u32) -> Option<Move> {
     }
 }
 
-fn distances(board: &Board, bfs: &mut BfsScratch) -> (u8, u8) {
-    let stm = board.side();
-    let opp = stm.opposite();
-    (
-        bfs.shortest_distance(board, stm).unwrap_or(DIST_PENALTY),
-        bfs.shortest_distance(board, opp).unwrap_or(DIST_PENALTY),
-    )
-}
+
 
 /// Path distance + wall stock — bounded so horizon leaves cannot look like mate.
 fn eval_stm(board: &Board, stm: Player, bfs: &mut BfsScratch) -> i32 {
@@ -262,9 +285,84 @@ fn terminal_score(ply: u32) -> i32 {
     -MATE + ply as i32
 }
 
-fn pawn_is_forward(stm: Player, from_row: u8, to_row: u8) -> bool {
-    let goal = if stm == Player::One { 8 } else { 0 };
-    to_row.abs_diff(goal) <= from_row.abs_diff(goal)
+
+fn wall_blocks_path_step(mv: Move, sq1: u8, sq2: u8) -> bool {
+    let Move::Wall {
+        row,
+        col,
+        orientation,
+    } = mv
+    else {
+        return false;
+    };
+    let (r1, c1) = unpack_square(sq1);
+    let (r2, c2) = unpack_square(sq2);
+    match orientation {
+        WallOrientation::Horizontal => {
+            if c1 == c2 && r1.abs_diff(r2) == 1 {
+                let min_r = r1.min(r2);
+                min_r == row && (c1 == col || c1 == col + 1)
+            } else {
+                false
+            }
+        }
+        WallOrientation::Vertical => {
+            if r1 == r2 && c1.abs_diff(c2) == 1 {
+                let min_c = c1.min(c2);
+                min_c == col && (r1 == row || r1 == row + 1)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn wall_intersects_path(mv: Move, path: &[u8], len: usize) -> bool {
+    if len <= 1 {
+        return false;
+    }
+    for i in 0..(len - 1) {
+        if wall_blocks_path_step(mv, path[i], path[i + 1]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn get_shortest_path(
+    board: &Board,
+    player: Player,
+    bfs: &mut BfsScratch,
+    path_out: &mut [u8; 81],
+) -> usize {
+    let mut next_out = [u8::MAX; 81];
+    bfs.fill_next_toward_goal(board, player, &mut next_out);
+
+    let (pr, pc) = board.pawn(player);
+    let mut current = square_index(pr, pc);
+    let mut len = 0;
+    while current != u8::MAX {
+        path_out[len] = current;
+        len += 1;
+        if len >= 81 {
+            break;
+        }
+        current = next_out[current as usize];
+    }
+    len
+}
+
+fn path_distance(player: Player, path: &[u8], len: usize) -> u8 {
+    if len == 0 {
+        return DIST_PENALTY;
+    }
+    let last_sq = path[len - 1];
+    let (r, _) = unpack_square(last_sq);
+    if is_goal(player, r) {
+        (len - 1) as u8
+    } else {
+        DIST_PENALTY
+    }
 }
 
 fn wall_disturbs_path(board: &mut Board, mv: Move, opp_dist: u8, bfs: &mut BfsScratch) -> bool {
@@ -278,17 +376,24 @@ fn wall_disturbs_path(board: &mut Board, mv: Move, opp_dist: u8, bfs: &mut BfsSc
     new_opp > opp_dist
 }
 
+/// A pawn move is tactical if it actually shortens our BFS distance to the goal.
+/// This is stricter than row-progress: a sideways detour can be "forward" by row
+/// but not reduce the path length at all.
+/// We avoid a full BFS by using the pre-computed `our_dist` and checking that the
+/// new square is strictly closer to the goal row than the current position.
+/// For final-rank moves (dist == 1), any pawn move to the goal row is always tactical.
 fn is_tactical_pawn(board: &Board, mv: Move, our_dist: u8) -> bool {
     let Move::Pawn { row, .. } = mv else {
         return false;
     };
     let stm = board.side();
-    let from_row = board.pawn(stm).0;
-    if !pawn_is_forward(stm, from_row, row) {
-        return false;
-    }
-    let goal = if stm == Player::One { 8 } else { 0 };
-    row.abs_diff(goal) <= our_dist
+    let goal = if stm == Player::One { 8u8 } else { 0u8 };
+    // Distance from destination square to goal row.
+    let dest_dist_to_goal = row.abs_diff(goal);
+    // Tactical: the new square is strictly closer to the goal than our current distance.
+    // our_dist is pawn-steps; dest_dist_to_goal is row-distance (lower bound on pawn-steps).
+    // This correctly handles both straight advances and jump-overs.
+    dest_dist_to_goal < our_dist
 }
 
 fn is_tactical_move(
@@ -296,12 +401,26 @@ fn is_tactical_move(
     mv: Move,
     our_dist: u8,
     opp_dist: u8,
+    opp_path: &[u8],
+    opp_path_len: usize,
     bfs: &mut BfsScratch,
 ) -> bool {
     match mv {
         Move::Pawn { .. } => is_tactical_pawn(board, mv, our_dist),
-        Move::Wall { .. } => wall_disturbs_path(board, mv, opp_dist, bfs),
+        Move::Wall { .. } => {
+            if wall_intersects_path(mv, opp_path, opp_path_len) {
+                wall_disturbs_path(board, mv, opp_dist, bfs)
+            } else {
+                false
+            }
+        }
     }
+}
+
+fn wall_proximity_score(mv: Move, opp_goal: u8) -> i32 {
+    let Move::Wall { row, .. } = mv else { return 0 };
+    // Higher = closer to opponent's goal = more likely to block them.
+    80i32 - i32::from(row.abs_diff(opp_goal))
 }
 
 fn collect_moves(
@@ -309,7 +428,11 @@ fn collect_moves(
     buf: &mut [Move],
     bfs: &mut BfsScratch,
     tactical_only: bool,
-    prune_quiet_walls: bool,
+    // Maximum number of quiet (non-path-disturbing) walls to include.
+    // 0 = same as old prune_quiet_walls=true but depth-scaled.
+    // usize::MAX = include all quiet walls (too slow at root).
+    max_quiet_walls: usize,
+    allow_walls: bool,
 ) -> usize {
     let mut scratch = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
     let full = generate_legal_moves_slice(board, &mut scratch, bfs);
@@ -317,24 +440,88 @@ fn collect_moves(
         return 0;
     }
 
-    let (our_dist, opp_dist) = distances(board, bfs);
-    let racing = our_dist <= opp_dist;
+    let mut opp_path = [0u8; 81];
+    let mut opp_path_len = 0;
+    let mut opp_dist = DIST_PENALTY;
+    if allow_walls {
+        opp_path_len = get_shortest_path(board, board.side().opposite(), bfs, &mut opp_path);
+        opp_dist = path_distance(board.side().opposite(), &opp_path, opp_path_len);
+    }
+    let our_dist = bfs.shortest_distance(board, board.side()).unwrap_or(DIST_PENALTY);
+
+    let stm = board.side();
+    let opp_goal: u8 = if stm.opposite() == Player::One { 8 } else { 0 };
     let mut n = 0usize;
 
+    // First pass: all pawns + path-disturbing walls.
     for i in 0..full {
         let mv = scratch[i];
-        if tactical_only && !is_tactical_move(board, mv, our_dist, opp_dist, bfs) {
-            continue;
+        match mv {
+            Move::Pawn { .. } => {
+                if tactical_only && !is_tactical_pawn(board, mv, our_dist) {
+                    continue;
+                }
+                buf[n] = mv;
+                n += 1;
+            }
+            Move::Wall { .. } => {
+                if !allow_walls {
+                    continue;
+                }
+                let disturbs = if wall_intersects_path(mv, &opp_path, opp_path_len) {
+                    wall_disturbs_path(board, mv, opp_dist, bfs)
+                } else {
+                    false
+                };
+                if tactical_only && !disturbs {
+                    continue;
+                }
+                if disturbs {
+                    buf[n] = mv;
+                    n += 1;
+                }
+            }
         }
-        if prune_quiet_walls
-            && racing
-            && matches!(mv, Move::Wall { .. })
-            && !wall_disturbs_path(board, mv, opp_dist, bfs)
-        {
-            continue;
+    }
+
+    // Second pass: top quiet walls by proximity to opponent goal, up to cap.
+    if allow_walls && !tactical_only && max_quiet_walls > 0 {
+        // Collect quiet wall candidates with their proximity score.
+        let mut quiet: [(i32, Move); MAX_LEGAL_MOVES] =
+            [(0, Move::Pawn { row: 0, col: 0 }); MAX_LEGAL_MOVES];
+        let mut q_count = 0usize;
+        for i in 0..full {
+            let mv = scratch[i];
+            if !matches!(mv, Move::Wall { .. }) {
+                continue;
+            }
+            // Skip walls already added as path-disturbing.
+            let blocks_path = wall_intersects_path(mv, &opp_path, opp_path_len);
+            let disturbs = if blocks_path {
+                wall_disturbs_path(board, mv, opp_dist, bfs)
+            } else {
+                false
+            };
+            if disturbs {
+                continue;
+            }
+            let score = wall_proximity_score(mv, opp_goal);
+            quiet[q_count] = (score, mv);
+            q_count += 1;
         }
-        buf[n] = mv;
-        n += 1;
+        // Partial sort: extract top max_quiet_walls by score (selection sort, cheap for small cap).
+        let take = max_quiet_walls.min(q_count);
+        for slot in 0..take {
+            let mut best_idx = slot;
+            for j in (slot + 1)..q_count {
+                if quiet[j].0 > quiet[best_idx].0 {
+                    best_idx = j;
+                }
+            }
+            quiet.swap(slot, best_idx);
+            buf[n] = quiet[slot].1;
+            n += 1;
+        }
     }
 
     if n == 0 && !tactical_only {
@@ -356,6 +543,9 @@ fn move_order_score(
     board: &Board,
     mv: Move,
     tt_best: Option<Move>,
+    opp_path: &[u8],
+    opp_path_len: usize,
+    _opp_dist: u8,
     bfs: &mut BfsScratch,
 ) -> i32 {
     if tt_best == Some(mv) {
@@ -372,9 +562,20 @@ fn move_order_score(
         }
         Move::Wall { row, .. } => {
             let opp_goal = if stm.opposite() == Player::One { 8 } else { 0 };
+            // row_bonus: 0..80 (highest near opponent goal)
             let row_bonus = 80i32 - i32::from(row.abs_diff(opp_goal)) * 8;
             let stock = i32::from(board.walls_remaining[stm as usize]);
-            200 + row_bonus + stock
+
+            // Non-mutating fast check for path intersection
+            let disturbs = wall_intersects_path(mv, opp_path, opp_path_len);
+
+            if disturbs {
+                // Tactical blocking wall: high priority
+                600 + row_bonus + stock
+            } else {
+                // Quiet wall: low priority
+                200 + row_bonus + stock
+            }
         }
     }
 }
@@ -385,10 +586,13 @@ fn order_moves(
     n: usize,
     tt_best: Option<Move>,
     scores: &mut [i32; MAX_LEGAL_MOVES],
+    opp_path: &[u8],
+    opp_path_len: usize,
+    opp_dist: u8,
     bfs: &mut BfsScratch,
 ) {
     for i in 0..n {
-        scores[i] = move_order_score(board, moves[i], tt_best, bfs);
+        scores[i] = move_order_score(board, moves[i], tt_best, opp_path, opp_path_len, opp_dist, bfs);
     }
     let mut order: [usize; MAX_LEGAL_MOVES] = core::array::from_fn(|i| i);
     order[..n].sort_unstable_by(|&a, &b| scores[b].cmp(&scores[a]));
@@ -427,13 +631,23 @@ fn quiescence(
     }
 
     let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-    let n = collect_moves(board, &mut buf, state.bfs, true, false);
+    let n = collect_moves(board, &mut buf, state.bfs, true, 0, false);
     if n == 0 {
         return alpha;
     }
 
     let mut scores = [0i32; MAX_LEGAL_MOVES];
-    order_moves(board, &mut buf, n, None, &mut scores, state.bfs);
+    order_moves(
+        board,
+        &mut buf,
+        n,
+        None,
+        &mut scores,
+        &[],
+        0,
+        DIST_PENALTY,
+        state.bfs,
+    );
 
     for i in 0..n {
         let mv = buf[i];
@@ -458,6 +672,24 @@ fn quiescence(
     clamp_unproven_mate(alpha, qdepth, stand)
 }
 
+fn make_null_move(board: &mut Board) -> u64 {
+    let old_hash = board.hash;
+    crate::zobrist::xor_side(&mut board.hash);
+    board.side_to_move = board.side_to_move.opposite();
+    if board.side_to_move == Player::One {
+        board.move_number += 1;
+    }
+    old_hash
+}
+
+fn unmake_null_move(board: &mut Board, old_hash: u64) {
+    if board.side_to_move == Player::One {
+        board.move_number -= 1;
+    }
+    board.side_to_move = board.side_to_move.opposite();
+    board.hash = old_hash;
+}
+
 fn search_child(
     state: &mut SearchState<'_>,
     board: &mut Board,
@@ -470,13 +702,26 @@ fn search_child(
     let fallback = eval_stm(board, board.side().opposite(), state.bfs);
     score = clamp_unproven_mate(score, depth, fallback);
 
-    if let Some(d) = mate_distance(score) {
-        if d > depth && depth + 1 <= MAX_PLY {
-            state.mate_extensions += 1;
-            score = -negamax(state, board, depth + 1, -beta, -alpha, ply + 1);
-            score = clamp_unproven_mate(score, depth + 1, fallback);
+    // Mate extension: if the child returns a mate claim that the remaining depth
+    // cannot prove, keep extending (up to 3 extra plies) until either the claim
+    // is proven or we run out of budget.  This ensures forcing wins are never
+    // truncated at the horizon.
+    let mut extra = 0u32;
+    while extra < 3 {
+        let Some(d) = mate_distance(score) else { break };
+        let proven_depth = depth + extra;
+        if d <= proven_depth {
+            break; // mate is already covered by the depth we searched
         }
+        if proven_depth + 1 > MAX_PLY {
+            break;
+        }
+        state.mate_extensions += 1;
+        extra += 1;
+        score = -negamax(state, board, proven_depth + 1, -beta, -alpha, ply + 1);
+        score = clamp_unproven_mate(score, proven_depth + 1, fallback);
     }
+
     score
 }
 
@@ -525,45 +770,169 @@ fn negamax(
         return quiescence(state, board, alpha, beta, ply, MAX_QDEPTH);
     }
 
-    let prune_walls = depth <= 4;
+    // ── Static eval (shared by NMP and futility) ────────────────────────────
+    let static_eval = eval_stm(board, board.side(), state.bfs);
+
+    // Null Move Pruning (NMP)
+    // Use R=3 at depth ≥ 5 for deeper cuts; R=2 otherwise.
+    if depth >= 3 {
+        if static_eval >= beta {
+            let r = if depth >= 5 { 3u32 } else { 2u32 };
+            let reduced_depth = depth.saturating_sub(1 + r);
+            let old_hash = make_null_move(board);
+            let score = -negamax(state, board, reduced_depth, -beta, -beta + 1, ply + 1);
+            unmake_null_move(board, old_hash);
+            if score >= beta {
+                return beta;
+            }
+        }
+    }
+
+    // Futility pruning at depth 1–2: if we are well below alpha even with a
+    // generous margin, skip all non-tactical moves — they cannot raise alpha.
+    // Only at non-root nodes (ply > 0) to never prune root choices.
+    let futility_depth = depth as usize;
+    let apply_futility = ply > 0
+        && futility_depth <= 2
+        && !is_mate_score(static_eval)
+        && !is_mate_score(alpha);
+
+    // Quiet-wall cap: root keeps 3/6/10; sub-nodes are very tight to control
+    // branching factor. Path-disturbing walls are NEVER capped (added separately).
+    // Target effective branching factor ~7-8 to reach depth 12 in 10 seconds.
+    let quiet_wall_cap = if ply == 0 {
+        match depth {
+            0..=2 => 3usize,
+            3..=4 => 6usize,
+            _     => 10usize,
+        }
+    } else {
+        // Sub-nodes: keep very lean — only 1 strategic quiet wall at high depth.
+        // Path-blocking walls are already captured in the tactical pass.
+        match depth {
+            0..=2 => 0usize,
+            3..=4 => 1usize,
+            _     => 2usize,
+        }
+    };
     let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-    let n = collect_moves(board, &mut buf, state.bfs, false, prune_walls);
+    let n = collect_moves(board, &mut buf, state.bfs, false, quiet_wall_cap, true);
     if n == 0 {
         return eval_stm(board, board.side(), state.bfs);
     }
 
-    let mut scores = [0i32; MAX_LEGAL_MOVES];
-    order_moves(board, &mut buf, n, tt_best, &mut scores, state.bfs);
+    let mut opp_path = [0u8; 81];
+    let opp_path_len = get_shortest_path(board, board.side().opposite(), state.bfs, &mut opp_path);
+    let opp_dist_pre = path_distance(board.side().opposite(), &opp_path, opp_path_len);
+    let our_dist_pre = state.bfs.shortest_distance(board, board.side()).unwrap_or(DIST_PENALTY);
 
-    let mut best_score = eval_stm(board, board.side(), state.bfs);
+    let mut scores = [0i32; MAX_LEGAL_MOVES];
+    order_moves(
+        board,
+        &mut buf,
+        n,
+        tt_best,
+        &mut scores,
+        &opp_path,
+        opp_path_len,
+        opp_dist_pre,
+        state.bfs,
+    );
+
+    // ── Forcing extension ─────────────────────────────────────────────────
+    // Extend the search by 1 ply at nodes where the position is near-forcing:
+    //   (a) The current side has ≤ 1 legal pawn move — walls have hemmed them
+    //       in so severely that the line is essentially forced.
+    //   (b) Either player's shortest path is ≤ 2 steps — the race to the goal
+    //       is imminent and we must see the outcome clearly.
+    // Apply only at non-root interior nodes (ply > 0, depth > 1) to avoid
+    // blowing up the tree at the root or at leaves.
+    // One node can contribute at most 1 ply of extension (no stacking).
+    let forcing_extension: u32 = if ply > 0 && depth > 1 {
+        let pawn_count = buf[..n]
+            .iter()
+            .filter(|m| matches!(m, Move::Pawn { .. }))
+            .count();
+        let near_goal = our_dist_pre <= 2 || opp_dist_pre <= 2;
+        if pawn_count <= 1 || near_goal {
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let mut best_score = -MATE;
     let mut best_mv = buf[0];
     let mut best_packed = pack_move(best_mv);
     let mut moves_searched = 0usize;
     let original_alpha = alpha;
 
-    // Distances needed for tactical classification inside the loop.
-    let (our_dist_pre, opp_dist_pre) = distances(board, state.bfs);
-
     for i in 0..n {
         let mv = buf[i];
 
-        // LMR: only reduce quiet (non-tactical) late moves.
-        // Tactical moves — forward-progress pawns and path-disturbing walls —
-        // must be searched at full depth; they are the key game-deciding moves.
-        let is_quiet = depth >= LMR_MIN_DEPTH
-            && moves_searched >= LMR_AFTER_MOVE
-            && i > 0
-            && !is_tactical_move(board, mv, our_dist_pre, opp_dist_pre, state.bfs);
-
-        let reduction = if is_quiet {
-            let r = 1u32 + (moves_searched / 8) as u32;
-            r.min(depth.saturating_sub(1))
+        // ── Tactical classification ───────────────────────────────────────────
+        // Compute this once per move — used by both futility and LMR.
+        // A move is tactical if it:
+        //   (a) Shortens our BFS distance to goal (pawn), or
+        //   (b) Disturbs the opponent's shortest path (wall).
+        // Tactical moves are NEVER reduced or pruned.
+        let is_tactical = if moves_searched == 0
+            || depth < LMR_MIN_DEPTH
+            || moves_searched < LMR_AFTER_MOVE
+        {
+            // We treat early moves as tactical by definition (no reduction either way).
+            true
         } else {
+            is_tactical_move(
+                board,
+                mv,
+                our_dist_pre,
+                opp_dist_pre,
+                &opp_path,
+                opp_path_len,
+                state.bfs,
+            )
+        };
+
+        // ── Futility pruning ──────────────────────────────────────────────────
+        // At depth 1-2, if the static eval is already so far below alpha that
+        // even a large margin cannot recover, skip quiet moves entirely.
+        if apply_futility && !is_tactical {
+            let margin = FUTILITY_MARGIN[futility_depth];
+            if static_eval + margin <= alpha {
+                moves_searched += 1;
+                continue;
+            }
+        }
+
+        // ── LMR reduction ─────────────────────────────────────────────────────
+        // Formula: floor(0.5 + ln(depth) * ln(moves_searched) / 2.25)
+        // Cap: depth/2 — never burn more than half the remaining budget.
+        // Quiet walls (no path intersection at all) get +1 extra reduction ply
+        // because a wall that touches no path is very unlikely to change the eval.
+        let reduction = if is_tactical {
             0u32
+        } else {
+            let d = (depth as usize).min(63);
+            let m = moves_searched.min(63);
+            let base_r = state.lmr_table[d][m];
+            // Extra reduction for pure quiet walls (not intersecting opp path at all).
+            let extra = if matches!(mv, Move::Wall { .. })
+                && !wall_intersects_path(mv, &opp_path, opp_path_len)
+            {
+                1u32
+            } else {
+                0u32
+            };
+            (base_r + extra).min(depth.saturating_sub(1))
         };
 
         let undo = board.make_move(mv);
-        let child_depth = depth - 1;
+        // child_depth: one ply below current, plus any forcing extension so that
+        // near-forced positions are searched one ply deeper throughout the subtree.
+        let child_depth = (depth - 1) + forcing_extension;
         let score = if moves_searched == 0 {
             search_child(state, board, child_depth, alpha, beta, ply)
         } else {
@@ -758,6 +1127,7 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         log: config.log,
         pv_move: buf[0],
         search_depth: 0,
+        lmr_table: build_lmr_table(),
     };
 
     let root_side = board.side();

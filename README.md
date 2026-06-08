@@ -12,7 +12,7 @@ Repo: [github.com/titaniummachine1/titanium-quoridor](https://github.com/titaniu
 | `web/`       | Playable UI (scraped from [quoridor-ai.netlify.app](https://quoridor-ai.netlify.app)) |
 | `scraped/`   | Deobfuscated extracts + raw bundle archive                                            |
 | `extracted/` | Protocol docs + WebSocket client                                                      |
-| `benchmark/` | Head-to-head tests (planned)                                                          |
+| `benchmark/` | Rust Titanium vs Gorisanson / self / Ka / Ishtar                                      |
 
 ## Quick start — web UI
 
@@ -36,11 +36,14 @@ cargo run --release -- bench 2 20
 cargo bench
 ```
 
-Cross-check move generation (depth 3 = correctness gate):
+Benchmarks (build `engine` release binary first):
 
 ```bash
-node benchmark/compare_moves.mjs
-node benchmark/perft_triple.mjs       # scraped JS + gorisanson + Rust
+cd engine && cargo build --release && cd ..
+node benchmark/titanium_vs_gorisanson.mjs --games 1
+node benchmark/titanium_vs_titanium.mjs 1
+node benchmark/titanium_vs_ka.mjs --games 1
+node benchmark/titanium_vs_ishtar.mjs --games 1
 ```
 
 ## Engine roadmap

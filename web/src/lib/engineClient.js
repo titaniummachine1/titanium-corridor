@@ -246,6 +246,9 @@ export class EngineClient {
       }
       if (info.p1 !== undefined) {
         info.winChance = info.p1;
+      } else if (info.score !== undefined) {
+        info.winChance = info.score;
+        info.p1 = info.score;
       }
       this.onInfo?.(info);
       return;

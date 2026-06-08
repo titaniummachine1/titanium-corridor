@@ -31,7 +31,9 @@ export function renderBoard(container, state, controller) {
     playerToMove,
     settings,
     engineStatus,
+    engineErrors,
     aiThinking,
+    uiMode,
   } = state;
 
   const numRows = board.numRows();
@@ -44,7 +46,7 @@ export function renderBoard(container, state, controller) {
   }
 
   const lastKey = state.lastAction ? toAlgebraic(state.lastAction) : null;
-  const isHumanTurn = controller.session.isHumanTurn(settings.players);
+  const isHumanTurn = uiMode !== 'replay' && controller.session.isHumanTurn(settings.players);
   const showCoords = settings.displayCoordinates;
   const showWallCounts = settings.displayRemainingWalls;
   const isRotated = settings.rotateBoard;
@@ -58,13 +60,13 @@ export function renderBoard(container, state, controller) {
   const engineStateP1 = document.createElement('div');
   engineStateP1.className = 'engine-state engine-state--p1';
   engineStateP1.appendChild(
-    renderTurnIndicator(1, playerToMove, settings.players[0], engineStatus, aiThinking),
+    renderTurnIndicator(1, playerToMove, settings.players[0], engineStatus, engineErrors, aiThinking, winner),
   );
 
   const engineStateP2 = document.createElement('div');
   engineStateP2.className = 'engine-state engine-state--p2';
   engineStateP2.appendChild(
-    renderTurnIndicator(2, playerToMove, settings.players[1], engineStatus, aiThinking),
+    renderTurnIndicator(2, playerToMove, settings.players[1], engineStatus, engineErrors, aiThinking, winner),
   );
 
   const coordLabelsRow = renderCoordinateLabels('row', numRows, showCoords, controller);
@@ -292,11 +294,11 @@ function parseCoord(text) {
   return { column: text[0], row: Number.parseInt(text[1], 10) };
 }
 
-function renderTurnIndicator(playerNum, playerToMove, playerType, engineStatus, aiThinking) {
+function renderTurnIndicator(playerNum, playerToMove, playerType, engineStatus, engineErrors, aiThinking, winner) {
   const wrap = document.createElement('div');
   wrap.className = 'turn-indicator';
 
-  if (playerToMove !== playerNum) {
+  if (winner || playerToMove !== playerNum) {
     return wrap;
   }
 
@@ -314,7 +316,9 @@ function renderTurnIndicator(playerNum, playerToMove, playerType, engineStatus, 
   if (status === 'error') {
     spinner.classList.add('engine-spinner--error');
     spinner.textContent = '!';
-    spinner.title = 'Engine error — try New game or pick another opponent';
+    spinner.title = engineErrors?.[playerType]
+      ? `Engine error: ${engineErrors[playerType]}`
+      : 'Engine error — try New game or pick another opponent';
   } else if (status === 'pondering') {
     spinner.title = 'Pondering on opponent time...';
   } else if (aiThinking || status === 'searching') {

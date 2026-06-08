@@ -14,7 +14,7 @@ const aiJs = fs.readFileSync(
 // game.js uses top-level classes in strict mode — Function() exposes them via return.
 const factory = new Function(
   'console',
-  `${gameJs}\n${aiJs}\nreturn { Game, Board, Pawn, PawnPosition, AI };`,
+  `${gameJs}\n${aiJs}\nreturn { Game, Board, Pawn, PawnPosition, AI, MonteCarloTreeSearch };`,
 );
 
 module.exports = factory(console);

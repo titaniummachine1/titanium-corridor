@@ -120,6 +120,18 @@ perft_diff → only d8v and e8v subtrees differ
 
 ---
 
+## 9. Endgame sideways moves with 0 walls left
+
+**Symptom:** After wall stock hits 0, MCTS sometimes steps sideways or backward despite a clear race to the goal — throws wins or delays losses.
+
+**Cause:** Gorisanson MCTS still picks among pawn children by visit count; rollouts use heuristics that are not pure shortest-path when branching is low.
+
+**Fix (v2):** No hard “walls = 0 → BFS skip.” `gorisanson_search_core.mjs` estimates branching each move from pawn moves + `ourWalls × openSlots × totalWallsLeft` (no wall enumeration). When `b^d` fits ~800k nodes at depth ≥ 8, switch to iterative minimax (BFS distance eval: `opp_dist - our_dist`). Otherwise MCTS.
+
+**Lesson:** Branching is mostly wall inventory and board space left — count that, don’t enumerate. Minimax when the proxy says the tree is small enough.
+
+---
+
 ## Oracle stack (for cross-platform debugging)
 
 1. **Primary:** scraped `web/src/lib/gameLogic.js` (netlify UI rules)

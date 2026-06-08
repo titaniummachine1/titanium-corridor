@@ -72,28 +72,44 @@ impl MctsTree {
         }
     }
 
-    fn uct_score(&self, node: usize, parent_visits: u64) -> f64 {
+    fn uct_score(&self, node: usize, parent_ln_visits: f64) -> f64 {
         let n = &self.nodes[node];
         if n.visits == 0 {
             return f64::INFINITY;
         }
         let exploit = n.wins / n.visits as f64;
-        let explore = (self.uct * (parent_visits as f64).ln() / n.visits as f64).sqrt();
+        let explore = (self.uct * parent_ln_visits / n.visits as f64).sqrt();
         exploit + explore
     }
 
     fn best_child_uct(&self, node: usize) -> usize {
-        let parent_visits = self.nodes[node].visits.max(1);
+        let parent_ln_visits = (self.nodes[node].visits.max(1) as f64).ln();
         let mut best = self.nodes[node].children[0];
-        let mut best_score = self.uct_score(best, parent_visits);
+        let mut best_score = self.uct_score(best, parent_ln_visits);
         for &child in &self.nodes[node].children[1..] {
-            let score = self.uct_score(child, parent_visits);
+            let score = self.uct_score(child, parent_ln_visits);
             if score > best_score {
                 best_score = score;
                 best = child;
             }
         }
         best
+    }
+
+    fn random_unvisited_child(&self, node: usize, rng: &mut impl Rng) -> Option<usize> {
+        let mut seen = 0usize;
+        let mut picked = None;
+        for &child in &self.nodes[node].children {
+            if self.nodes[child].visits != 0 {
+                continue;
+            }
+            seen += 1;
+            // Reservoir sample 1 item uniformly without extra allocations/passes.
+            if rng.gen_range(0..seen) == 0 {
+                picked = Some(child);
+            }
+        }
+        picked
     }
 
     fn best_child_sims(&self, node: usize) -> usize {
@@ -226,7 +242,7 @@ fn expansion_moves_fixed(board: &mut Board, buf: &mut [Move], bfs: &mut BfsScrat
 }
 
 fn try_opening_move(board: &mut Board, bfs: &mut BfsScratch) -> Option<Move> {
-    if board.move_number > 2 {
+    if board.move_number >= 2 {
         return None;
     }
     let stm = board.side();
@@ -253,56 +269,68 @@ fn try_opening_move(board: &mut Board, bfs: &mut BfsScratch) -> Option<Move> {
 /// Gorisanson-style rollout: caches the full BFS next-step array per player and
 /// only recomputes when a wall is placed (invalidating paths). Pawn moves just
 /// index into the cached array — O(1) per step instead of O(BFS) per step.
-fn rollout(board: &mut Board, bfs: &mut BfsScratch, rng: &mut impl Rng) -> Player {
-    // Pre-compute next-step arrays for both players.
-    let mut next_p1 = [u8::MAX; 81];
-    let mut next_p2 = [u8::MAX; 81];
+fn rollout_in_place(
+    board: &mut Board,
+    bfs: &mut BfsScratch,
+    rng: &mut impl Rng,
+    rollout_undo: &mut Vec<crate::board::Undo>,
+    next_p1: &mut [u8; 81],
+    next_p2: &mut [u8; 81],
+    legal: &mut [Move; MAX_LEGAL_MOVES],
+) -> Player {
+    rollout_undo.clear();
     let mut p1_valid = false;
     let mut p2_valid = false;
 
     let mut steps = 0u32;
-    while board.is_terminal().is_none() && steps < 200 {
+    let winner = loop {
+        if let Some(w) = board.is_terminal() {
+            break w;
+        }
+        if steps >= 200 {
+            break board.side().opposite();
+        }
         steps += 1;
         let stm = board.side();
 
         // Refresh cached paths when stale.
         if !p1_valid {
-            bfs.fill_next_toward_goal(board, Player::One, &mut next_p1);
+            bfs.fill_next_toward_goal(board, Player::One, next_p1);
             p1_valid = true;
         }
         if !p2_valid {
-            bfs.fill_next_toward_goal(board, Player::Two, &mut next_p2);
+            bfs.fill_next_toward_goal(board, Player::Two, next_p2);
             p2_valid = true;
         }
 
-        let next_arr = if stm == Player::One { &next_p1 } else { &next_p2 };
+        let next_arr = if stm == Player::One { &*next_p1 } else { &*next_p2 };
         let (pr, pc) = board.pawn(stm);
         let sq = crate::grid::square_index(pr, pc);
         let next_sq = next_arr[sq as usize];
 
-        if rng.gen::<f64>() < 0.7 && next_sq != u8::MAX {
+        if rng.gen_range(0..10) < 8 && next_sq != u8::MAX {
             // Advance one step along shortest path — no BFS needed.
             let (nr, nc) = crate::grid::unpack_square(next_sq);
             let mv = Move::Pawn { row: nr, col: nc };
-            let _ = board.make_move(mv);
+            rollout_undo.push(board.make_move(mv));
             // Pawn move doesn't invalidate wall-based paths.
         } else {
-            // With 30% probability pick a random legal move (may be a wall).
-            let mut legal = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-            let n = generate_legal_moves_slice(board, &mut legal, bfs);
+            // With 20% probability pick a random legal move (may be a wall).
+            let n = generate_legal_moves_slice(board, legal, bfs);
             if n == 0 {
-                break;
+                break board.side().opposite();
             }
             let mv = legal[rng.gen_range(0..n)];
-            let _ = board.make_move(mv);
+            rollout_undo.push(board.make_move(mv));
             // Invalidate both caches if a wall was placed.
             if matches!(mv, Move::Wall { .. }) {
                 p1_valid = false;
                 p2_valid = false;
             }
         }
-    }
-    board.is_terminal().unwrap_or(board.side().opposite())
+    };
+    undo_all(board, rollout_undo);
+    winner
 }
 
 fn undo_all(board: &mut Board, undo: &mut Vec<crate::board::Undo>) {
@@ -371,10 +399,21 @@ pub fn search_mcts(board: &mut Board, config: MctsConfig) -> Option<MctsReport> 
     let batch = 32usize;
     // Reuse undo-path buffer across all simulations — no heap alloc per sim.
     let mut undo_path: Vec<crate::board::Undo> = Vec::with_capacity(64);
+    // Reuse rollout undo buffer too; avoids clone per simulation.
+    let mut rollout_undo: Vec<crate::board::Undo> = Vec::with_capacity(64);
+    // Reuse rollout scratch buffers across simulations.
+    let mut rollout_next_p1 = [u8::MAX; 81];
+    let mut rollout_next_p2 = [u8::MAX; 81];
+    let mut rollout_legal = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    // Reuse expansion move buffer.
+    let mut expansion_buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
 
     while sims < config.max_simulations && Instant::now() < deadline {
-        for _ in 0..batch {
-            if sims >= config.max_simulations || Instant::now() >= deadline {
+        for i in 0..batch {
+            if sims >= config.max_simulations {
+                break;
+            }
+            if (i & 7) == 0 && Instant::now() >= deadline {
                 break;
             }
 
@@ -389,14 +428,13 @@ pub fn search_mcts(board: &mut Board, config: MctsConfig) -> Option<MctsReport> 
                 }
 
                 if tree.nodes[node].children.is_empty() {
-                    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-                    let n = expansion_moves_fixed(board, &mut buf, &mut bfs);
+                    let n = expansion_moves_fixed(board, &mut expansion_buf, &mut bfs);
                     if n == 0 {
                         tree.nodes[node].terminal = true;
                         break;
                     }
                     for i in 0..n {
-                        tree.add_child(node, buf[i]);
+                        tree.add_child(node, expansion_buf[i]);
                     }
                     let child = tree.nodes[node].children[rng.gen_range(0..n)];
                     let mv = tree.nodes[child].mv;
@@ -407,22 +445,7 @@ pub fn search_mcts(board: &mut Board, config: MctsConfig) -> Option<MctsReport> 
                     break;
                 }
 
-                // Count unvisited children without allocating a Vec.
-                let unvisited_count = tree.nodes[node]
-                    .children
-                    .iter()
-                    .filter(|&&c| tree.nodes[c].visits == 0)
-                    .count();
-                if unvisited_count > 0 {
-                    // Pick the k-th unvisited child in one extra pass.
-                    let k = rng.gen_range(0..unvisited_count);
-                    let child = tree.nodes[node]
-                        .children
-                        .iter()
-                        .copied()
-                        .filter(|&c| tree.nodes[c].visits == 0)
-                        .nth(k)
-                        .unwrap();
+                if let Some(child) = tree.random_unvisited_child(node, &mut rng) {
                     let mv = tree.nodes[child].mv;
                     let mover = board.side();
                     undo_path.push(board.make_move(mv));
@@ -442,8 +465,15 @@ pub fn search_mcts(board: &mut Board, config: MctsConfig) -> Option<MctsReport> 
             let winner = if let Some(w) = board.is_terminal() {
                 w
             } else {
-                let mut sim = board.clone();
-                rollout(&mut sim, &mut bfs, &mut rng)
+                rollout_in_place(
+                    board,
+                    &mut bfs,
+                    &mut rng,
+                    &mut rollout_undo,
+                    &mut rollout_next_p1,
+                    &mut rollout_next_p2,
+                    &mut rollout_legal,
+                )
             };
 
             tree.backprop(node, winner, leaf_mover);

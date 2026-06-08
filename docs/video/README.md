@@ -14,7 +14,7 @@ After each checkpoint commit, update the `commit:` line with `git rev-parse --sh
 | 07      | `checkpoint/07-gorisanson-ui` | `7c85a20`  | [07-ai-opponents.md](07-ai-opponents.md)                                          |
 | 08      | `checkpoint/08-greedy-ui`     | `10bcb23`  | [08-greedy-ui-lab.md](08-greedy-ui-lab.md)                                        |
 | 09      | _(future)_                    | —          | [09-pondering-prep.md](09-pondering-prep.md) — Stockfish-style ponder (prep only) |
-| 10+     | `checkpoint-10-alphabeta` …   | _(future)_ | αβ search — beat gorisanson at same time budget                                   |
+| 10      | `checkpoint/10-hybrid-search`   | _(pending)_ | [10-hybrid-search.md](10-hybrid-search.md) — MCTS↔minimax, LMR, Ka bench, terminal UI |
 
 **Perft debug:** `node benchmark/perft_diff.mjs 2` — divide diff vs JS oracle.
 

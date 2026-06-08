@@ -1,15 +1,17 @@
 /**
- * Gorisanson MCTS — play API for terminal benchmarks.
+ * Gorisanson MCTS — read-only vendor play API for benchmarks.
+ * Think budget: wall-clock + sim cap (whichever hits first).
  */
 
 import { createRequire } from 'node:module';
+import { BENCH_MAX_SIMULATIONS, BENCH_TIME_MS } from './bench_limits.mjs';
 
 const require = createRequire(import.meta.url);
 const g = require('./load_gorisanson.cjs');
 
 export const GORISANSON_UCT = 0.2;
 
-/** Time preset → MCTS rollouts (matches gorisanson view.js levels). */
+/** Legacy presets — benchmarks use BENCH_* limits instead. */
 export const GORISANSON_TIME_SIMS = {
   intuition: 2_500,
   short: 7_500,
@@ -25,9 +27,125 @@ export function cloneGorisansonGame(game) {
   return g.Game.clone(game);
 }
 
-export function chooseGorisansonMove(game, simulations = GORISANSON_TIME_SIMS.short) {
-  const ai = new g.AI(simulations, GORISANSON_UCT, false, false);
-  return ai.chooseNextMove(game);
+function chooseOpeningPawnMove(game) {
+  if (game.turn >= 2) {
+    return null;
+  }
+  const nextPosition = g.AI.chooseShortestPathNextPawnPosition(game);
+  const pawnMoveTuple = nextPosition.getDisplacementPawnMoveTupleFrom(game.pawnOfTurn.position);
+  if (pawnMoveTuple[1] === 0) {
+    return [[nextPosition.row, nextPosition.col], null, null];
+  }
+  return null;
+}
+
+function fallbackMove(game) {
+  const nextPosition = g.AI.chooseShortestPathNextPawnPosition(game);
+  const pawnMoveTuple = nextPosition.getDisplacementPawnMoveTupleFrom(game.pawnOfTurn.position);
+  if (pawnMoveTuple[1] === 0) {
+    return [[nextPosition.row, nextPosition.col], null, null];
+  }
+  const valids = game.getArrOfValidNextPositionTuples();
+  if (valids.length > 0) {
+    return [[valids[0][0], valids[0][1]], null, null];
+  }
+  const walls = game.getArrOfProbableValidNoBlockNextHorizontalWallPositions();
+  if (walls.length > 0) {
+    return [null, walls[0], null];
+  }
+  const verts = game.getArrOfProbableValidNoBlockNextVerticalWallPositions();
+  if (verts.length > 0) {
+    return [null, null, verts[0]];
+  }
+  return null;
+}
+
+function pickBestMoveFromTree(mcts, game) {
+  if (mcts.root.children.length > 0) {
+    const best = mcts.selectBestMove();
+    if (best?.move) {
+      return best.move;
+    }
+  }
+  return fallbackMove(game);
+}
+
+/**
+ * @param {object} game
+ * @param {{ timeMs?: number, maxSimulations?: number, uct?: number, onProgress?: (p: { simulations: number, elapsedMs: number }) => void }} [budget]
+ */
+export function chooseGorisansonMoveWithMeta(game, budget = {}) {
+  const timeMs = budget.timeMs ?? BENCH_TIME_MS;
+  const maxSimulations = budget.maxSimulations ?? BENCH_MAX_SIMULATIONS;
+  const uct = budget.uct ?? GORISANSON_UCT;
+  const started = performance.now();
+
+  const opening = chooseOpeningPawnMove(game);
+  if (opening) {
+    return {
+      move: opening,
+      meta: {
+        stoppedBy: 'opening',
+        simulations: 0,
+        elapsedMs: performance.now() - started,
+      },
+    };
+  }
+
+  const prevLog = console.log;
+  console.log = () => { };
+  try {
+    const mcts = new g.MonteCarloTreeSearch(game, uct);
+    const deadline = started + timeMs;
+    const batchSize = 50;
+    let simulations = 0;
+    let lastProgressMs = -1;
+
+    while (performance.now() < deadline && simulations < maxSimulations) {
+      const remainingMs = deadline - performance.now();
+      const remainingSims = maxSimulations - simulations;
+      const batch = Math.min(remainingMs < 250 ? 1 : batchSize, remainingSims);
+      if (batch <= 0) {
+        break;
+      }
+      mcts.search(batch);
+      simulations += batch;
+
+      if (typeof budget.onProgress === 'function') {
+        const elapsedMs = Math.max(0, Math.round(performance.now() - started));
+        if (lastProgressMs < 0 || elapsedMs - lastProgressMs >= 800) {
+          budget.onProgress({ simulations, elapsedMs });
+          lastProgressMs = elapsedMs;
+        }
+      }
+    }
+
+    const stoppedBy = simulations >= maxSimulations ? 'visits' : 'time';
+    const move = pickBestMoveFromTree(mcts, game);
+    if (!move) {
+      throw new Error('gorisanson: no legal move');
+    }
+
+    return {
+      move,
+      meta: {
+        stoppedBy,
+        simulations,
+        elapsedMs: performance.now() - started,
+      },
+    };
+  } finally {
+    console.log = prevLog;
+  }
+}
+
+/** @deprecated use chooseGorisansonMoveWithMeta — returns move tuple only */
+export function chooseGorisansonMove(game, budget = {}) {
+  const resolved =
+    typeof budget === 'number'
+      ? { maxSimulations: budget, timeMs: BENCH_TIME_MS }
+      : budget;
+  return chooseGorisansonMoveWithMeta(game, resolved).move;
 }
 
 export function applyGorisansonMove(game, move) {

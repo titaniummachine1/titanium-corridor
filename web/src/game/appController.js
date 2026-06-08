@@ -1,4 +1,6 @@
 import { GameSession } from './gameSession.js';
+import { naiveDistanceEval } from '../lib/gameLogic.js';
+import { decodeReplayCode, encodeReplayFromActions } from '../lib/replayCode.js';
 import { EngineClient } from '../lib/engineClient.js';
 import { GorisansonEngineClient, TitaniumEngineClient } from '../lib/localMctsEngine.js';
 import { PlayerType, StrengthLevel, TimeToMove } from '../lib/engineConfig.js';
@@ -59,22 +61,40 @@ export class AppController {
       displayCoordinates: true,
       displayRemainingWalls: true,
       displayEvalBar: true,
+      uiMode: 'play',
     };
 
+    this.replay = null;
+
     this.engineStatus = {};
+    this.engineErrors = {};
     this.searchInfo = {};
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     this.aiThinking = false;
+    this.liveSearch = null;
+    this.thinkingPlayerType = null;
+    this._moveRequestSeq = 0;
 
     this.session.subscribe(() => this.onSessionChange());
   }
 
   getState() {
+    const snapshot = this.session.getSnapshot();
+    const distanceEval = naiveDistanceEval(this.session.board);
+
     return {
-      ...this.session.getSnapshot(),
+      ...snapshot,
       settings: { ...this.settings },
       engineStatus: { ...this.engineStatus },
-      eval: { ...this.eval },
+      engineErrors: { ...this.engineErrors },
+      eval: {
+        p1: distanceEval.p1,
+        margin: distanceEval.margin,
+        whiteDist: distanceEval.whiteDist,
+        blackDist: distanceEval.blackDist,
+        pv: this.eval.pv ?? [],
+      },
+      liveSearch: this.liveSearch,
       aiThinking: this.aiThinking,
       strengthLevelPresets: STRENGTH_LEVEL_PRESETS,
       timeToMovePresets: TIME_TO_MOVE_PRESETS,
@@ -91,10 +111,28 @@ export class AppController {
         this.searchInfo,
         this.engineConfigs,
       ),
+      uiMode: this.settings.uiMode,
+      replay: this.replay
+        ? {
+          index: this.replay.index,
+          total: this.replay.actions.length,
+          code: this.replay.code,
+          meta: this.replay.meta,
+        }
+        : null,
+      playReplayCode:
+        this.session.winner && this.settings.uiMode === 'play'
+          ? encodeReplayFromActions(this.session.actions, {
+            winner: this.session.winner === 1 ? 'white' : 'black',
+            plies: this.session.actions.length,
+          })
+          : null,
     };
   }
 
   onChange = null;
+  onLiveUpdate = null;
+  _liveUpdateLastMs = 0;
 
   setPlayer(playerNum, playerType) {
     if (playerType === PlayerType.Pavlosdais) {
@@ -267,7 +305,12 @@ export class AppController {
   }
 
   newGame() {
+    this._moveRequestSeq += 1;
     this.aiThinking = false;
+    this.liveSearch = null;
+    this.engineErrors = {};
+    this.replay = null;
+    this.settings.uiMode = 'play';
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     for (const engine of this.engines.values()) {
       engine.resetConnection();
@@ -277,10 +320,71 @@ export class AppController {
     this.maybeRequestAiMove();
   }
 
+  setUiMode(mode) {
+    this.settings.uiMode = mode;
+    this.onChange?.();
+  }
+
+  loadReplay(code) {
+    this._moveRequestSeq += 1;
+    const trimmed = code.trim();
+    const { actions, meta, algebraic } = decodeReplayCode(trimmed);
+    this.replay = {
+      actions,
+      algebraic,
+      index: actions.length,
+      code: trimmed.startsWith('tq1') ? trimmed : encodeReplayFromActions(actions, meta),
+      meta,
+    };
+    this.settings.uiMode = 'replay';
+    this.aiThinking = false;
+    this.liveSearch = null;
+    this.engineErrors = {};
+    for (const engine of this.engines.values()) {
+      engine.resetConnection();
+    }
+    this.applyReplayIndex();
+    this.onChange?.();
+  }
+
+  applyReplayIndex() {
+    if (!this.replay) {
+      return;
+    }
+    const slice = this.replay.actions.slice(0, this.replay.index);
+    this.session.rebuildFromActions(slice);
+  }
+
+  setReplayIndex(index) {
+    if (!this.replay) {
+      return;
+    }
+    this.replay.index = Math.max(0, Math.min(index, this.replay.actions.length));
+    this.applyReplayIndex();
+    this.onChange?.();
+  }
+
+  replayStep(delta) {
+    if (!this.replay) {
+      return;
+    }
+    this.setReplayIndex(this.replay.index + delta);
+  }
+
+  exportReplayCode() {
+    if (!this.replay) {
+      return encodeReplayFromActions(this.session.actions);
+    }
+    return this.replay.code;
+  }
+
   undo() {
     if (this.aiThinking) {
       return;
     }
+    this._moveRequestSeq += 1;
+    this.liveSearch = null;
+    this.engineErrors = {};
     this.session.undo();
     for (const engine of this.engines.values()) {
       engine.resetConnection();
@@ -290,7 +394,7 @@ export class AppController {
   }
 
   tryAction(action) {
-    if (this.aiThinking || !this.session.isHumanTurn(this.settings.players)) {
+    if (this.replay || this.aiThinking || !this.session.isHumanTurn(this.settings.players)) {
       return;
     }
 
@@ -340,20 +444,50 @@ export class AppController {
       };
       engine.onInfo = (info) => {
         this.searchInfo[playerType] = { ...this.searchInfo[playerType], ...info };
-        if (info.progress !== undefined && info.p1 === undefined && !info.pv) {
+        if (info.thinking) {
+          this.liveSearch = {
+            playerLabel: this.engineLabel(playerType),
+            simulations: info.simulations,
+            nodes: info.nodes,
+            progress: info.progress,
+            mode: info.mode ?? info.stoppedBy ?? 'mcts',
+            searchDepth: info.searchDepth,
+            depthLog: info.depthLog,
+            rootWinRate: info.rootWinRate,
+            whiteDist: info.whiteDist,
+            blackDist: info.blackDist,
+          };
+          const now = performance.now();
+          if (now - this._liveUpdateLastMs >= 250) {
+            this._liveUpdateLastMs = now;
+            (this.onLiveUpdate ?? this.onChange)?.();
+          }
           return;
         }
-        if (info.p1 !== undefined) {
-          this.eval.p1 = info.p1;
-          this.eval.score = info.score ?? info.p1;
+        if (info.progress !== undefined && info.p1 === undefined && !info.pv && !info.stoppedBy) {
+          return;
         }
         if (info.pv) {
           this.eval.pv = info.pv;
+        }
+        if (info.stoppedBy) {
+          this.liveSearch = {
+            playerLabel: this.engineLabel(playerType),
+            mode: info.stoppedBy,
+            searchDepth: info.searchDepth,
+            simulations: info.simulations,
+            nodes: info.nodes,
+            depthLog: info.depthLog,
+            rootWinRate: info.rootWinRate,
+            whiteDist: info.whiteDist,
+            blackDist: info.blackDist,
+          };
         }
         this.onChange?.();
       };
       engine.onError = () => {
         this.aiThinking = false;
+        this.engineErrors[playerType] = 'Engine error';
         this.onChange?.();
       };
       this.engines.set(playerType, engine);
@@ -367,8 +501,8 @@ export class AppController {
     for (const playerType of this.settings.players) {
       if (
         playerType === PlayerType.Human ||
-        playerType === PlayerType.GorisansonMCTS ||
-        playerType === PlayerType.Titanium
+        isLocalEngine(playerType, this.engineConfigs) ||
+        isTitaniumEngine(playerType, this.engineConfigs)
       ) {
         continue;
       }
@@ -416,9 +550,19 @@ export class AppController {
     }
   }
 
+  engineLabel(playerType) {
+    const config = this.engineConfigs.find((entry) => entry.key === playerType);
+    return config?.name ?? playerType;
+  }
+
   maybeRequestAiMove() {
+    if (this.replay) {
+      this.aiThinking = false;
+      return;
+    }
     if (this.session.winner) {
       this.aiThinking = false;
+      this.liveSearch = null;
       return;
     }
 
@@ -436,21 +580,73 @@ export class AppController {
       return;
     }
 
+    const requestSnapshot = this.session.getSnapshot();
+    const requestSeq = ++this._moveRequestSeq;
+    const requestPly = requestSnapshot.actions.length;
+    const requestPlayerToMove = requestSnapshot.playerToMove;
+
     this.aiThinking = true;
+    this.thinkingPlayerType = playerType;
+    this.liveSearch = { playerLabel: this.engineLabel(playerType), mode: 'searching' };
     this.onChange?.();
 
     engine.onBestMove = (action) => {
+      const current = this.session.getSnapshot();
+      const currentPlayerType = this.session.getCurrentPlayerType(this.settings.players);
+      const stale =
+        requestSeq !== this._moveRequestSeq ||
+        current.actions.length !== requestPly ||
+        current.playerToMove !== requestPlayerToMove ||
+        currentPlayerType !== playerType;
+      if (stale) {
+        console.warn('Ignoring stale engine move response', {
+          playerType,
+          requestSeq,
+          currentSeq: this._moveRequestSeq,
+          requestPly,
+          currentPly: current.actions.length,
+          requestPlayerToMove,
+          currentPlayerToMove: current.playerToMove,
+          currentPlayerType,
+          suggested: this.session.actionToLabel(action),
+        });
+        return;
+      }
+
       this.aiThinking = false;
+      this.thinkingPlayerType = null;
       if (this.session.winner) {
         return;
       }
 
       const applied = this.session.applyAction(action);
       if (!applied) {
+        const snapshot = this.session.getSnapshot();
+        const suggested = this.session.actionToLabel(action);
+        const legal = snapshot.validActions.map((mv) => this.session.actionToLabel(mv));
+        console.error('Engine produced illegal move', {
+          playerType,
+          suggested,
+          ply: snapshot.actions.length + 1,
+          playerToMove: snapshot.playerToMove,
+          playerPositions: snapshot.playerPositions,
+          wallsRemaining: snapshot.wallsRemaining,
+          legalCount: legal.length,
+          legalSample: legal.slice(0, 60),
+        });
+        this.searchInfo[playerType] = {
+          ...(this.searchInfo[playerType] ?? {}),
+          illegalMove: suggested,
+          illegalMovePly: snapshot.actions.length + 1,
+          legalMovesCount: legal.length,
+        };
+        this.engineErrors[playerType] = `Illegal move ${suggested} on ply ${snapshot.actions.length + 1}`;
         this.engineStatus[playerType] = 'error';
         this.onChange?.();
         return;
       }
+
+      this.engineErrors[playerType] = null;
 
       this.syncRemoteEnginesAfterMove(action);
       this.onChange?.();
@@ -458,7 +654,18 @@ export class AppController {
       this.maybePonderInactiveEngines();
     };
 
-    const playerIndex = this.session.getSnapshot().playerToMove - 1;
+    engine.onError = (err) => {
+      if (requestSeq !== this._moveRequestSeq) {
+        return;
+      }
+      this.aiThinking = false;
+      this.thinkingPlayerType = null;
+      this.engineErrors[playerType] = err?.message ?? String(err ?? 'Engine error');
+      this.engineStatus[playerType] = 'error';
+      this.onChange?.();
+    };
+
+    const playerIndex = requestPlayerToMove - 1;
     let aiSettings = this.settings.playerAiSettings[playerIndex];
     if (!aiSettings) {
       aiSettings = defaultPlayerAiSettings(playerType, this.engineConfigs);

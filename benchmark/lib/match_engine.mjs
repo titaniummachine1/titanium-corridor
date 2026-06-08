@@ -40,7 +40,17 @@ function formatSimsCap(n) {
   return `${n} cap`;
 }
 
-function chooseMove(game, algebraicHistory, playerConfig, ply, options) {
+function formatSims(n) {
+  if (n >= 1_000_000) {
+    return `${(n / 1_000_000).toFixed(1)}M`;
+  }
+  if (n >= 1000) {
+    return `${(n / 1000).toFixed(1)}k`;
+  }
+  return String(n);
+}
+
+async function chooseMove(game, algebraicHistory, playerConfig, ply, options) {
   const logMoves = options.logMoves !== false && !options.quiet;
   const budget = resolveThinkBudget(options, playerConfig);
   const label = engineLabel(playerConfig, budget);
@@ -50,10 +60,23 @@ function chooseMove(game, algebraicHistory, playerConfig, ply, options) {
   }
 
   if (playerConfig.id === GORISANSON_ID) {
+    let lastProgressMs = -1;
     const { move, meta } = chooseGorisansonMoveWithMeta(game, {
       timeMs: budget.timeMs,
       maxSimulations: budget.maxSimulations,
       uct: playerConfig.uct,
+      onProgress: logMoves
+        ? (progress) => {
+          const elapsedMs = progress.elapsedMs ?? 0;
+          if (lastProgressMs >= 0 && elapsedMs - lastProgressMs < 900) {
+            return;
+          }
+          lastProgressMs = elapsedMs;
+          termLine(
+            `      ply ${ply} progress ${playerConfig.id}: ${formatSims(progress.simulations ?? 0)} sims · ${(elapsedMs / 1000).toFixed(1)}s`,
+          );
+        }
+        : undefined,
     });
     return { move, meta, elapsedMs: meta.elapsedMs };
   }
@@ -62,12 +85,25 @@ function chooseMove(game, algebraicHistory, playerConfig, ply, options) {
     assertRustTitaniumId(playerConfig.id);
     const log = options.logSearch !== false;
     const started = performance.now();
-    const { move: algebraic, meta } = chooseTitaniumMove(algebraicHistory, {
+    let lastProgressMs = -1;
+    const { move: algebraic, meta } = await chooseTitaniumMove(algebraicHistory, {
       log,
       ply,
       timeSec: budget.timeSec,
       maxSims: budget.maxSimulations,
       uct: playerConfig.uct,
+      onProgress: logMoves
+        ? (progress) => {
+          const elapsedMs = progress.elapsedMs ?? 0;
+          if (lastProgressMs >= 0 && elapsedMs - lastProgressMs < 900) {
+            return;
+          }
+          lastProgressMs = elapsedMs;
+          termLine(
+            `      ply ${ply} progress ${playerConfig.id}: ${formatSims(progress.simulations ?? 0)} sims · ${(elapsedMs / 1000).toFixed(1)}s`,
+          );
+        }
+        : undefined,
     });
     const elapsedMs = performance.now() - started;
     return {
@@ -80,7 +116,7 @@ function chooseMove(game, algebraicHistory, playerConfig, ply, options) {
   throw new Error(`Unknown player id: ${playerConfig.id}`);
 }
 
-export function playOneGame(playerA, playerB, options = {}) {
+export async function playOneGame(playerA, playerB, options = {}) {
   let game = createGorisansonGame();
   const algebraicHistory = [];
   let plies = 0;
@@ -98,7 +134,7 @@ export function playOneGame(playerA, playerB, options = {}) {
     const cfg = side === 0 ? playerA : playerB;
     const ply = plies + 1;
 
-    const { move, meta } = chooseMove(game, algebraicHistory, cfg, ply, options);
+    const { move, meta } = await chooseMove(game, algebraicHistory, cfg, ply, options);
 
     if (stats.byEngine[cfg.id]) {
       stats.byEngine[cfg.id].plies += 1;
@@ -109,6 +145,15 @@ export function playOneGame(playerA, playerB, options = {}) {
     applyGorisansonMove(game, move);
     algebraicHistory.push(toAlgebraic(gorisansonMoveToAction(move)));
     plies += 1;
+
+    if (typeof options.onPly === 'function') {
+      options.onPly({
+        ply,
+        whiteId: playerA.id,
+        blackId: playerB.id,
+        algebraicHistory: [...algebraicHistory],
+      });
+    }
 
     if (logMoves) {
       printPlyCompact({
@@ -148,7 +193,7 @@ export function playOneGame(playerA, playerB, options = {}) {
   };
 }
 
-export function playMatch(playerA, playerB, games, options = {}) {
+export async function playMatch(playerA, playerB, games, options = {}) {
   let scoreA = 0;
   let scoreB = 0;
   let draws = 0;
@@ -169,7 +214,11 @@ export function playMatch(playerA, playerB, games, options = {}) {
       );
     }
 
-    const outcome = playOneGame(light, dark, options);
+    if (typeof options.onGameStart === 'function') {
+      options.onGameStart({ gameIndex: i + 1, totalGames: games, whiteId: light.id, blackId: dark.id });
+    }
+
+    const outcome = await playOneGame(light, dark, options);
     results.push(outcome);
 
     if (logMoves) {

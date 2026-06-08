@@ -24,9 +24,18 @@ const GORISANSON_ENGINE = {
 
 const TITANIUM_ENGINE = {
   kind: 'titanium',
-  name: 'Titanium (MCTS)',
+  name: 'Titanium (MCTS, Rust)',
   key: PlayerType.Titanium,
-  tooltip: 'Gorisanson-style MCTS — strength + time + rollout cap',
+  engineMode: 'mcts',
+  tooltip: 'Updated local Rust MCTS engine — `titanium genmove` (cargo build --release in engine/)',
+};
+
+const TITANIUM_MINIMAX_ENGINE = {
+  kind: 'titanium',
+  name: 'Titanium (Minimax, Rust)',
+  key: PlayerType.TitaniumMinimax,
+  engineMode: 'minimax',
+  tooltip: 'Local Rust minimax engine — `titanium genmove --engine minimax`',
 };
 
 const PLACEHOLDER_ENGINES = [
@@ -44,7 +53,7 @@ export function getAllEngineConfigs() {
     ...entry,
     kind: 'remote',
   }));
-  return [GORISANSON_ENGINE, TITANIUM_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
+  return [GORISANSON_ENGINE, TITANIUM_ENGINE, TITANIUM_MINIMAX_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
 }
 
 export function getPlayerOptionGroups() {
@@ -64,9 +73,15 @@ export function getPlayerOptionGroups() {
         },
         {
           value: PlayerType.Titanium,
-          label: 'Titanium (MCTS)',
+          label: 'Titanium (MCTS, Rust)',
           disabled: false,
           tooltip: TITANIUM_ENGINE.tooltip,
+        },
+        {
+          value: PlayerType.TitaniumMinimax,
+          label: 'Titanium (Minimax, Rust)',
+          disabled: false,
+          tooltip: TITANIUM_MINIMAX_ENGINE.tooltip,
         },
       ],
     },
@@ -110,18 +125,43 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
   }
   const config = engineConfigs.find((entry) => entry.key === playerType);
   if ((config?.kind === 'local' || config?.kind === 'titanium') && searchInfo.time != null) {
-    const sims = searchInfo.simulations?.toLocaleString() ?? '?';
-    const limit =
-      searchInfo.stoppedBy === 'visits'
-        ? 'hit cap'
-        : searchInfo.stoppedBy === 'time'
-          ? 'time'
+    const isMinimax = searchInfo.stoppedBy === 'minimax';
+    const budgetLabel = isMinimax
+      ? `${(searchInfo.nodes ?? 0).toLocaleString()} nodes`
+      : `${searchInfo.simulations?.toLocaleString() ?? '?'} sims`;
+    const winPart =
+      searchInfo.rootWinRate != null
+        ? ` · wr ${(searchInfo.rootWinRate * 100).toFixed(0)}%`
+        : '';
+    const depthPart =
+      searchInfo.depthLog?.length > 0
+        ? ` · ${searchInfo.depthLog.map((e) => `d${e.depth}=${e.score > 0 ? '+' : ''}${e.score}`).join(' ')}`
+        : searchInfo.searchDepth
+          ? ` · d${searchInfo.searchDepth}`
           : '';
+    const distPart =
+      searchInfo.whiteDist != null
+        ? ` · W${searchInfo.whiteDist} B${searchInfo.blackDist}`
+        : '';
+    const stopLabels = {
+      visits: 'hit cap',
+      time: 'time',
+      converged: 'converged',
+      trivial: 'instant',
+      opening: 'instant',
+      minimax: 'minimax',
+      mcts: 'MCTS',
+      time: 'MCTS·time',
+      visits: 'MCTS·cap',
+      opening: 'opening',
+      hybrid: 'hybrid',
+      race: 'win path',
+    };
+    const limit = stopLabels[searchInfo.stoppedBy] ?? '';
     const suffix = limit ? ` (${limit})` : '';
-    return `Last think: ${formatWallClock(searchInfo.time / 1000)} · ${sims} sims${suffix}`;
-  }
-  if (config?.kind === 'titanium' && searchInfo.time != null) {
-    return `Last think: ${formatWallClock(searchInfo.time / 1000)}`;
+    const profile =
+      searchInfo.profileName && isMinimax ? ` · ${searchInfo.profileName}` : '';
+    return `Last think: ${formatWallClock(searchInfo.time / 1000)} · ${budgetLabel}${winPart}${depthPart}${distPart}${profile}${suffix}`;
   }
   if (config?.kind === 'remote') {
     const parts = [];

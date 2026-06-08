@@ -23,6 +23,16 @@
 - **Agrees with scraped JS + Rust** at perft depth 3: **2_062_264** nodes (standard gate)
 - **Search:** guided MCTS (2.5k–60k rollouts/move on website) — different from our αβ plan
 
+## Terminal Quoridor UIs (display only)
+
+| Project | Link | Notes |
+| ------- | ---- | ----- |
+| Zoridor | [ringtailsoftware/zoridor](https://github.com/ringtailsoftware/zoridor) | Zig CLI + web; traditional board in terminal |
+| quoridor.js | [OyvindSabo/quoridor.js](https://github.com/OyvindSabo/quoridor.js) | `getUnicodeRepresentation()` |
+| tui-quoridor | [tripasect/tui-quoridor](https://github.com/tripasect/tui-quoridor) | Python TUI |
+
+Our bench reporter: `benchmark/lib/terminal_board.mjs` (compact pawn grid).
+
 ## Chess perft tooling (pattern)
 
 - [agausmann/perftree](https://github.com/agausmann/perftree) — divide diff vs Stockfish

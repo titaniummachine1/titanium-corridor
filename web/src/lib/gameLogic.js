@@ -325,10 +325,6 @@ class QuoridorBoard {
 
   /** Would this wall block every player from their goal? */
   isWallBlocking({ coordinate, wallType }) {
-    if (!this.canWallBlock({ coordinate, wallType })) {
-      return false;
-    }
-
     const wallSet =
       wallType === WallType.Horizontal
         ? this._horizontalWalls
@@ -611,6 +607,56 @@ function boardFromGameState(gameSlice) {
   return board;
 }
 
+/** BFS pawn steps to goal row for playerNum (1 = White → row 9, 2 = Black → row 1). */
+function shortestDistanceToGoal(board, playerNum) {
+  const start = board.playerPosition({ playerNum });
+  if (board.isCoordinateGoal(playerNum, start)) {
+    return 0;
+  }
+
+  const visited = new Set([formatCoordinate(start)]);
+  const queue = [{ coordinate: start, dist: 0 }];
+
+  while (queue.length > 0) {
+    const { coordinate, dist } = queue.shift();
+    for (const direction of allDirections()) {
+      if (!board.pawnCanMove(coordinate, direction)) {
+        continue;
+      }
+      const next = stepCoordinate(coordinate, direction);
+      const key = formatCoordinate(next);
+      if (visited.has(key)) {
+        continue;
+      }
+      if (board.isCoordinateGoal(playerNum, next)) {
+        return dist + 1;
+      }
+      visited.add(key);
+      queue.push({ coordinate: next, dist: dist + 1 });
+    }
+  }
+
+  return Infinity;
+}
+
+/** Naive eval: Black steps − White steps → win chance for White. */
+function naiveDistanceEval(board) {
+  const whiteDist = shortestDistanceToGoal(board, 1);
+  const blackDist = shortestDistanceToGoal(board, 2);
+  const margin = blackDist - whiteDist;
+
+  let p1 = 0.5;
+  if (whiteDist === 0) {
+    p1 = 0.99;
+  } else if (blackDist === 0) {
+    p1 = 0.01;
+  } else if (Number.isFinite(margin)) {
+    p1 = Math.max(0.05, Math.min(0.95, 0.5 + margin * 0.07));
+  }
+
+  return { p1, margin, whiteDist, blackDist };
+}
+
 export {
   Direction,
   WallType,
@@ -622,4 +668,6 @@ export {
   boardFromGameState,
   isWallAction,
   isPawnAction,
+  shortestDistanceToGoal,
+  naiveDistanceEval,
 };
