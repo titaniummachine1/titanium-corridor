@@ -239,7 +239,7 @@ fn can_wall_block_topology(board: &Board, row: u8, col: u8, orientation: WallOri
     let js_row = row + 1;
 
     let (on_a, on_b) = match orientation {
-        WallOrientation::Horizontal => (js_col == 1, js_col == 9),
+        WallOrientation::Horizontal => (js_col == 1, js_col == 8),
         WallOrientation::Vertical => (js_row == 8, js_row == 1),
     };
 
