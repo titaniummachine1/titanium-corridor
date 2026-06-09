@@ -145,6 +145,45 @@ fn add_player_corridor_attention(
     }
 }
 
+/// Per-square heat for the web overlay — max of each player's corridor signal.
+///
+/// Search sums both players into one `CorridorAttention` (contested corridors run hotter
+/// in LMR). The board tint uses `max` so two overlapping paths do not paint the whole grid.
+pub fn build_corridor_display_squares(scratch: &mut BfsScratch, board: &Board) -> [u16; 81] {
+    let masks = DirMasks::from_board(board);
+    let mut white = CorridorAttention::default();
+    let mut black = CorridorAttention::default();
+    {
+        let (dist_from, dist_to) = scratch.dist_scratch_mut();
+        add_player_corridor_attention(
+            board,
+            Player::One,
+            masks,
+            &mut white,
+            dist_from,
+            dist_to,
+        );
+    }
+    {
+        let (dist_from, dist_to) = scratch.dist_scratch_mut();
+        add_player_corridor_attention(
+            board,
+            Player::Two,
+            masks,
+            &mut black,
+            dist_from,
+            dist_to,
+        );
+    }
+    let mut out = [0u16; 81];
+    for i in 0..81 {
+        let corridor = white.square_heat[i].max(black.square_heat[i]);
+        let bottleneck = white.bottleneck_heat[i].max(black.bottleneck_heat[i]);
+        out[i] = corridor.saturating_add(bottleneck);
+    }
+    out
+}
+
 /// Build combined two-player corridor attention for the current board.
 pub fn build_corridor_attention(scratch: &mut BfsScratch, board: &Board) -> CorridorAttention {
     let masks = DirMasks::from_board(board);

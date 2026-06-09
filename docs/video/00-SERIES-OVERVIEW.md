@@ -9,23 +9,28 @@ Save this file. Record in any order; episodes are checkpointed in git.
 3. Perft caught our first real bug — fixed with divide debugging
 4. **Plot twist:** Rust crushes perft 3, but perft 4 still hurts — compute isn't enough without make/unmake + pruning + TT
 5. Threading prep — `Engine` layout + root-parallel perft bench (`thread-bench`)
-6. Next: αβ search (single-thread), then Lazy SMP like Stockfish
+6. Hybrid search — MCTS ↔ minimax, LMR, terminal bench vs Ka
+7. **Search hardening** — perft was fine; negamax stop/tie-break/qsearch/CAT gap bugs; raw CAT overlay on web
+8. Next: BFS cache per node, killer/history, depth-4 search @ 3s midgame
 
 ## Episode list
 
-| #   | File                                                     | Topic                 |
-| --- | -------------------------------------------------------- | --------------------- |
-| 01  | [01-path-bfs.md](01-path-bfs.md)                         | Bitboards + BFS       |
-| 02  | [02-legal-moves.md](02-legal-moves.md)                   | 131 moves, JS parity  |
-| 03  | [03-perft.md](03-perft.md)                               | Divide harness        |
-| 04  | [04-bench.md](04-bench.md)                               | Criterion / NPS       |
-| 05  | [05-first-perft-bug.md](05-first-perft-bug.md)           | d8v lateral wall bug  |
-| 06  | [06-threading-prep.md](06-threading-prep.md)             | Titanium vs Titanium  |
-| 07  | [07-ai-opponents.md](07-ai-opponents.md)                 | Gorisanson local boss |
-| 08  | [08-greedy-ui-lab.md](08-greedy-ui-lab.md)               | Testing lab UI + greedy `genmove` |
-| —   | [00-HOW-THE-ENGINE-WORKS.md](00-HOW-THE-ENGINE-WORKS.md) | Narration script      |
-| —   | [BUG-DIARY.md](BUG-DIARY.md)                             | All plot twists       |
-| —   | [PERFT-BENCHMARKS.md](PERFT-BENCHMARKS.md)               | Depth timings         |
+| #   | File                                                     | Topic                              |
+| --- | -------------------------------------------------------- | ---------------------------------- |
+| 01  | [01-path-bfs.md](01-path-bfs.md)                         | Bitboards + BFS                    |
+| 02  | [02-legal-moves.md](02-legal-moves.md)                   | 131 moves, JS parity               |
+| 03  | [03-perft.md](03-perft.md)                               | Divide harness                     |
+| 04  | [04-bench.md](04-bench.md)                               | Criterion / NPS                    |
+| 05  | [05-first-perft-bug.md](05-first-perft-bug.md)           | d8v lateral wall bug               |
+| 06  | [06-threading-prep.md](06-threading-prep.md)             | Titanium vs Titanium               |
+| 07  | [07-ai-opponents.md](07-ai-opponents.md)                 | Gorisanson local boss              |
+| 08  | [08-greedy-ui-lab.md](08-greedy-ui-lab.md)               | Testing lab UI + greedy `genmove`  |
+| 10  | [10-hybrid-search.md](10-hybrid-search.md)               | MCTS↔minimax bridge                |
+| 11  | [11-search-hardening.md](11-search-hardening.md)         | Weird moves, gaps, qsearch, CAT UI |
+| —   | [00-HOW-THE-ENGINE-WORKS.md](00-HOW-THE-ENGINE-WORKS.md) | Narration script                   |
+| —   | [CAT-VIEW-UI.md](CAT-VIEW-UI.md)                         | Debug overlay spec                 |
+| —   | [BUG-DIARY.md](BUG-DIARY.md)                             | All plot twists                    |
+| —   | [PERFT-BENCHMARKS.md](PERFT-BENCHMARKS.md)               | Depth timings                      |
 
 ## Git checkpoints
 

@@ -91,16 +91,18 @@ function renderPlayerAiSettings(ui, playerNum) {
     return '';
   }
 
+  const engineName = ui.engineName ?? 'AI';
+
   if (ui.isLocalMcts) {
     const { min: tMin, max: tMax, step: tStep } = ui.wallclockRange;
     const { min: vMin, max: vMax, step: vStep } = ui.visitsRange;
-    const isMinimax = ui.playerType === 'titanium-minimax';
-    const budgetLabel = isMinimax ? 'Nodes' : 'Rollouts';
+    const budgetLabel = ui.isTitanium ? 'Nodes' : 'Rollouts';
     return `
-      <div class="player-ai-settings">
+      <div class="player-ai-settings" data-engine="${escapeHtml(engineName)}">
+        <p class="player-ai-settings__engine">${escapeHtml(engineName)}</p>
         ${ui.isTitanium
         ? renderDiscreteSlider({
-          label: 'Strength',
+          label: `Strength · ${engineName}`,
           settingName: 'strength-level',
           playerNum,
           value: ui.strengthLevel,
@@ -108,7 +110,7 @@ function renderPlayerAiSettings(ui, playerNum) {
         })
         : ''
       }
-        <label class="control-label control-label--sub">Time</label>
+        <label class="control-label control-label--sub">Time · ${escapeHtml(engineName)}</label>
         <div class="time-slider-row">
           <input
             type="range"
@@ -121,7 +123,7 @@ function renderPlayerAiSettings(ui, playerNum) {
           />
           <output class="time-slider-value" data-wallclock-label="${playerNum}">${formatWallClock(ui.wallClockSeconds)}</output>
         </div>
-        <label class="control-label control-label--sub">${budgetLabel}</label>
+        <label class="control-label control-label--sub">${budgetLabel} · ${escapeHtml(engineName)}</label>
         <div class="time-slider-row">
           <input
             type="range"
@@ -138,16 +140,17 @@ function renderPlayerAiSettings(ui, playerNum) {
   }
 
   return `
-    <div class="player-ai-settings">
+    <div class="player-ai-settings" data-engine="${escapeHtml(engineName)}">
+      <p class="player-ai-settings__engine">${escapeHtml(engineName)}</p>
       ${renderDiscreteSlider({
-    label: 'Strength',
+    label: `Strength · ${engineName}`,
     settingName: 'strength-level',
     playerNum,
     value: ui.strengthLevel,
     presets: STRENGTH_LEVEL_PRESETS,
   })}
       ${renderDiscreteSlider({
-    label: 'Time',
+    label: `Time · ${engineName}`,
     settingName: 'time-to-move',
     playerNum,
     value: ui.timeToMove,

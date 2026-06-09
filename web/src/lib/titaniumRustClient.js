@@ -11,14 +11,20 @@ export class TitaniumEngineClient {
   constructor(engineConfig) {
     this.config = engineConfig;
     this.pendingRequest = null;
+    this.queuedRequest = null;
     this.abortController = null;
   }
 
-  destroy() {
+  cancelSearch() {
+    this.queuedRequest = null;
     this.abortController?.abort();
     this.abortController = null;
     this.pendingRequest = null;
     this.setStatus('idle');
+  }
+
+  destroy() {
+    this.cancelSearch();
   }
 
   resetConnection() {
@@ -33,7 +39,25 @@ export class TitaniumEngineClient {
 
   stopPonder() { }
 
-  requestMove({ aiSettings, moveHistory, isFreshGame }) {
+  requestMove(params) {
+    if (this.pendingRequest) {
+      // Let the in-flight search finish; run the latest command next with fresh args.
+      this.queuedRequest = params;
+      return;
+    }
+    this.startRequest(params);
+  }
+
+  drainQueuedRequest() {
+    if (!this.queuedRequest) {
+      return;
+    }
+    const next = this.queuedRequest;
+    this.queuedRequest = null;
+    this.startRequest(next);
+  }
+
+  startRequest({ aiSettings, moveHistory, isFreshGame }) {
     const history =
       isFreshGame || !moveHistory?.length
         ? []
@@ -48,8 +72,17 @@ export class TitaniumEngineClient {
 
     this.setStatus('searching');
     const started = performance.now();
-    this.pendingRequest = { started };
+    this.pendingRequest = { started, timeSec };
     this.abortController = new AbortController();
+    if (engineMode === 'minimax') {
+      this.onInfo?.({
+        thinking: true,
+        mode: 'minimax',
+        stoppedBy: 'minimax',
+        nodes: 0,
+        simulations: 0,
+      });
+    }
 
     fetch(GENMOVE_URL, {
       method: 'POST',
@@ -100,6 +133,9 @@ export class TitaniumEngineClient {
             const data = JSON.parse(line.slice(6));
 
             if (data.type === 'progress') {
+              if (engineMode === 'minimax') {
+                continue;
+              }
               this.onInfo?.({
                 thinking: true,
                 mode: 'mcts',
@@ -128,6 +164,7 @@ export class TitaniumEngineClient {
                 rootScore: data.rootScore,
                 rootWinRate: isMinimax ? null : data.rootWinRate,
                 rootMoves: data.rootMoves,
+                elapsedMs: data.elapsedMs,
               });
               continue;
             }
@@ -139,10 +176,12 @@ export class TitaniumEngineClient {
             if (data.type === 'bestmove') {
               const elapsed = performance.now() - started;
               this.pendingRequest = null;
+              this.abortController = null;
               this.setStatus('idle');
               const stoppedBy = finalMeta.stoppedBy ?? data.stoppedBy ?? engineMode;
               this.onInfo?.({
                 time: elapsed,
+                elapsedMs: finalMeta.elapsedMs ?? Math.round(elapsed),
                 stoppedBy,
                 simulations: finalMeta.simulations ?? 0,
                 nodes: finalMeta.nodes ?? 0,
@@ -156,6 +195,7 @@ export class TitaniumEngineClient {
               });
               const action = parseAlgebraic(data.algebraic);
               this.onBestMove?.(action);
+              this.drainQueuedRequest();
               return;
             }
           }
@@ -164,16 +204,20 @@ export class TitaniumEngineClient {
         throw new Error('stream ended without bestmove');
       })
       .catch((err) => {
+        this.pendingRequest = null;
+        this.abortController = null;
         if (err.name === 'AbortError') {
+          this.setStatus('idle');
+          this.drainQueuedRequest();
           return;
         }
-        this.pendingRequest = null;
         this.setStatus('error');
         const message =
           err?.message === 'Failed to fetch'
             ? 'Cannot reach dev server (/api/titanium/genmove) — run npm run dev and ensure engine is built (cargo build --release in engine/)'
             : err?.message ?? String(err);
         this.onError?.(new Error(message));
+        this.drainQueuedRequest();
       });
   }
 

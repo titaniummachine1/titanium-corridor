@@ -1,5 +1,6 @@
 //! Iterative-deepening αβ with aspiration windows, LMR, quiescence, and TT.
 
+use std::io::Write;
 use std::time::Instant;
 
 use crate::cat::constants::{CAT_COLD_CM, CAT_HOT_CM, DIST_PENALTY};
@@ -8,16 +9,23 @@ use crate::cat::prune::{
     move_immediate_gain, order_moves, path_distance,
 };
 use crate::cat::CorridorAttention;
+use crate::search::lmr_profile::{
+    apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
+    MateStopReason, MateZoneState,
+};
 use crate::core::board::{Board, Move, Player, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
 use crate::path::BfsScratch;
-use crate::util::grid::{has_wall, is_goal, square_index, unpack_square, wall_touch_squares};
+use crate::util::grid::is_goal;
 use crate::util::perft::format_move;
 
 const MATE: i32 = 20_000;
 const MATE_WINDOW: i32 = 500;
-const MAX_PLY: u32 = 64;
+/// Default iterative-deepening ceiling (u8-friendly 256). Same as recursion stack cap.
+/// Do not lower this — use `SearchConfig::max_id_depth` only for explicit depth-capped runs.
+pub const DEFAULT_MAX_ID_DEPTH: u32 = 256;
+const MAX_PLY: u32 = DEFAULT_MAX_ID_DEPTH;
 const CM_PER_SQUARE: i32 = 100;
 const MAX_EVAL: i32 = 10_000;
 const WALL_INVENTORY_CM: i32 = 12;
@@ -30,7 +38,9 @@ const LMR_MIN_DEPTH: u32 = 2;
 // (e.g. the best reply wall when opp has 3 pawn options).
 const LMR_AFTER_MOVE: usize = 4;
 const ASPIRATION_DELTA: i32 = 200;
-const MAX_QDEPTH: u32 = 10;
+// Wall/path exchanges settle quickly — 6 plies of noisy-only search is plenty
+// and 10 made depth-1 iterations explode to thousands of nodes.
+const MAX_QDEPTH: u32 = 6;
 // Futility margin per depth ply in centi-squares.
 // At depth 1 we allow 2.5 squares slack, at depth 2 we allow 5.0 — beyond that no futility.
 const FUTILITY_MARGIN: [i32; 3] = [0, 250, 500];
@@ -98,6 +108,10 @@ pub struct DepthLogEntry {
     pub depth: u32,
     pub score: i32,
     pub nodes: u64,
+    /// Wall time from search start through completion of this depth (ms).
+    pub elapsed_ms: u64,
+    /// Nodes spent on this depth iteration only.
+    pub marginal_nodes: u64,
     /// Principal variation from this depth (algebraic, space-separated).
     pub pv: String,
 }
@@ -146,6 +160,10 @@ pub struct SearchConfig {
     pub log: bool,
     /// Opening book move + centimeter bias — biases ordering/aspiration only.
     pub book_hint: Option<BookHint>,
+    /// ID stops here unless time, nodes, or proven mate stop first.
+    /// Defaults to [`DEFAULT_MAX_ID_DEPTH`] (256). Set lower only for explicit
+    /// depth-capped searches (unit tests, perft-style benches).
+    pub max_id_depth: u32,
 }
 
 impl Default for SearchConfig {
@@ -155,8 +173,14 @@ impl Default for SearchConfig {
             max_nodes: DEFAULT_MAX_NODES,
             log: false,
             book_hint: None,
+            max_id_depth: DEFAULT_MAX_ID_DEPTH,
         }
     }
+}
+
+#[inline]
+fn effective_max_id_depth(config: &SearchConfig) -> u32 {
+    config.max_id_depth.clamp(1, MAX_PLY)
 }
 
 struct SearchState<'a> {
@@ -189,11 +213,67 @@ struct SearchState<'a> {
     root_moves: Vec<RootMoveInfo>,
     /// Best secondary resistance score seen at root (used for tiebreaking equal scores).
     root_best_resistance: i32,
+    /// Immediate path gain of the current root best move (tiebreak: never trade
+    /// a path-gaining move for a tempo-wasting one at equal score).
+    root_best_gain: i32,
+    /// Position hashes on the current search path (for repetition detection).
+    rep_keys: [u64; MAX_PLY as usize],
+    rep_len: u32,
+    started: Instant,
+    lmr_profile: LmrProfile,
+    mate_zone: MateZoneState,
+    eval_zone: EvalZoneState,
+    white_dist: u8,
+    black_dist: u8,
+    last_iter_asp_fails: u32,
+    last_iter_score_delta: i32,
+}
+
+/// Score a repeated position: draw when racing evenly; penalize shuffles when behind.
+fn repetition_score(state: &mut SearchState<'_>, board: &Board) -> i32 {
+    let side = board.side();
+    let stm = eval_stm(board, side, state.bfs);
+    let our = state
+        .bfs
+        .shortest_distance(board, side)
+        .unwrap_or(DIST_PENALTY) as i32;
+    let opp = state
+        .bfs
+        .shortest_distance(board, side.opposite())
+        .unwrap_or(DIST_PENALTY) as i32;
+    let race_margin = opp - our;
+    if race_margin <= -3 {
+        return stm.saturating_sub(800);
+    }
+    if race_margin < 0 {
+        return stm.saturating_sub(300);
+    }
+    if race_margin == 0 {
+        return 0;
+    }
+    // Slightly ahead — repetition still wastes tempo.
+    stm.saturating_sub(80).min(50)
 }
 
 impl SearchState<'_> {
     fn should_stop(&self) -> bool {
         self.nodes >= self.config.max_nodes || Instant::now() >= self.deadline
+    }
+
+    fn remaining_budget_ms(&self) -> u64 {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64
+    }
+
+    fn fraction_elapsed(&self) -> f32 {
+        let total = self.config.time_ms.max(1) as f32;
+        let elapsed = self
+            .started
+            .elapsed()
+            .as_millis()
+            .min(self.config.time_ms as u128) as f32;
+        (elapsed / total).clamp(0.0, 1.0)
     }
 
     fn bump_nodes(&mut self) -> bool {
@@ -203,25 +283,108 @@ impl SearchState<'_> {
     }
 }
 
-/// Precompute LMR reduction table.
-/// Formula: floor(0.5 + ln(depth) * ln(moves_searched) / 2.25)
-/// Lower base (0.5) and higher divisor (2.25) → gentler reductions that
-/// still grow with depth and move count, but protect early moves better.
-/// The cap of depth/2 ensures we never burn more than half our remaining budget.
-/// At depth 12, move 5  → 1 ply reduced.
-/// At depth 12, move 15 → 3 plies reduced.
-/// At depth 12, move 40 → 4 plies reduced.
-fn build_lmr_table() -> [[u32; 64]; 64] {
-    let mut table = [[0u32; 64]; 64];
-    for depth in 1usize..64 {
-        for mv_count in 1usize..64 {
-            let r = 0.5 + (depth as f64).ln() * (mv_count as f64).ln() / 2.25;
-            // Cap at depth/2 — never reduce by more than half the remaining budget.
-            let cap = (depth / 2) as u32;
-            table[depth][mv_count] = (r.max(0.0) as u32).min(cap);
+fn root_cat_heat_stats(
+    board: &Board,
+    moves: &[Move],
+    n: usize,
+    cat: &CorridorAttention,
+) -> (u16, u16) {
+    let mut heats = Vec::with_capacity(n);
+    for mv in &moves[..n] {
+        heats.push(move_corridor_attention(board, *mv, cat).max(0) as u16);
+    }
+    if heats.is_empty() {
+        return (0, 0);
+    }
+    heats.sort_by(|a, b| b.cmp(a));
+    let max = heats[0];
+    let p75_idx = (heats.len() * 3 / 4).min(heats.len() - 1);
+    (max, heats[p75_idx])
+}
+
+fn update_lmr_profile_for_depth(
+    state: &mut SearchState<'_>,
+    board: &mut Board,
+    depth: u32,
+    prev_score: i32,
+) {
+    let root_side = board.side();
+    let opp_root_dist = if root_side == Player::One {
+        state.black_dist
+    } else {
+        state.white_dist
+    };
+    let min_dist = state.our_root_dist.min(opp_root_dist);
+    let endgame_race = min_dist <= 4;
+    let in_mate_refine = state.mate_zone.refine_ceiling.is_some()
+        || (is_mate_score(prev_score) && mate_distance(prev_score).is_some());
+
+    if in_mate_refine {
+        state.lmr_profile = LmrProfile::mate_refine();
+    } else if depth == 1 {
+        state.lmr_profile = LmrProfile::first_iteration();
+    } else {
+        let mut buf = [Move::Pawn { row: 1, col: 4 }; MAX_LEGAL_MOVES];
+        let n = generate_legal_moves_slice(board, &mut buf, state.bfs);
+        let cat = state.bfs.build_corridor_attention(board);
+        let (cat_max, cat_p75) = root_cat_heat_stats(board, &buf, n, &cat);
+        let stage_t = compute_stage_t(
+            board,
+            state.our_root_dist,
+            opp_root_dist,
+            cat_max,
+            cat_p75,
+        );
+        state.lmr_profile = LmrProfile::from_stage(stage_t, endgame_race, false);
+
+        if depth > 1 {
+            let log = &state.depth_log;
+            let (marginal, prev_marginal) = if log.len() >= 2 {
+                (log[log.len() - 1].marginal_nodes, log[log.len() - 2].marginal_nodes)
+            } else if log.len() == 1 {
+                (log[0].marginal_nodes, 0)
+            } else {
+                (0, 0)
+            };
+            let completed = log.last().map(|e| e.depth).unwrap_or(0);
+            let fraction = state.fraction_elapsed();
+            apply_depth_feedback(
+                &mut state.lmr_profile,
+                completed,
+                marginal,
+                prev_marginal,
+                fraction,
+                state.last_iter_score_delta,
+                state.last_iter_asp_fails,
+            );
         }
     }
-    table
+
+    state.lmr_table = build_lmr_table(state.lmr_profile.aggression);
+
+    if state.log && std::env::var("TITANIUM_LOG").is_ok() {
+        let p = state.lmr_profile;
+        eprintln!(
+            "info lmr_profile depth={} t={:.2} aggression={:.2} after={} slope={:.3} hot={} cold={} floor={} remaining_ms={}",
+            depth,
+            p.stage_t,
+            p.aggression,
+            p.lmr_after_move,
+            p.cat_heat_lmr_slope,
+            p.hot_cm,
+            p.cold_cm,
+            p.depth_balance_floor,
+            state.remaining_budget_ms()
+        );
+    }
+}
+
+fn mate_stop_label(reason: MateStopReason) -> &'static str {
+    match reason {
+        MateStopReason::RefineCeiling => "refine_ceiling",
+        MateStopReason::MateSpin => "mate_spin",
+        MateStopReason::ForcedOutcome => "forced_outcome",
+    }
 }
 
 fn is_mate_score(score: i32) -> bool {
@@ -332,15 +495,11 @@ fn goal_progress(player: Player, row: u8) -> i32 {
     }
 }
 
-fn pawn_mobility(board: &Board, player: Player, bfs: &mut BfsScratch) -> i32 {
-    let mut copy = board.clone();
-    copy.side_to_move = player;
-    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-    let n = generate_legal_moves_slice(&mut copy, &mut buf, bfs);
-    buf[..n]
-        .iter()
-        .filter(|mv| matches!(mv, Move::Pawn { .. }))
-        .count() as i32
+fn pawn_mobility(board: &Board, player: Player) -> i32 {
+    // Pawn moves only — the old version ran FULL legal movegen (BFS-validating
+    // ~40 wall placements) per eval call just to count ≤5 pawn moves.
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; 8];
+    crate::movegen::legal::generate_pawn_moves_for(board, player, &mut buf) as i32
 }
 
 /// Static eval in centi-squares: 100 cm == one shortest-path step.
@@ -400,8 +559,8 @@ fn eval_stm(board: &Board, stm: Player, bfs: &mut BfsScratch) -> i32 {
     let boxed_or_urgent =
         our_steps >= opp_steps.saturating_add(2) || our_steps <= 4 || opp_steps <= 4;
     let mobility_score = if boxed_or_urgent {
-        let our_mobility = pawn_mobility(board, stm, bfs);
-        let opp_mobility = pawn_mobility(board, opp, bfs);
+        let our_mobility = pawn_mobility(board, stm);
+        let opp_mobility = pawn_mobility(board, opp);
         (our_mobility - opp_mobility) * 8
     } else {
         0
@@ -477,22 +636,34 @@ fn quiescence(
         return alpha;
     }
 
-    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-    let n = collect_search_moves(board, &mut buf, state.bfs, true, true);
-    if n == 0 {
-        return alpha;
-    }
-
+    // Quiescence skips CAT entirely — noisy moves are gated by the witness
+    // path + BFS gain; corridor heat only matters for full-width ordering.
+    let cat = crate::cat::CorridorAttention::default();
+    let mut opp_path = [0u8; 81];
+    let opp_path_len = get_shortest_path(board, board.side().opposite(), state.bfs, &mut opp_path);
+    let opp_dist = path_distance(board.side().opposite(), &opp_path, opp_path_len);
     let our_dist = state
         .bfs
         .shortest_distance(board, board.side())
         .unwrap_or(DIST_PENALTY);
-    let opp_dist = state
-        .bfs
-        .shortest_distance(board, board.side().opposite())
-        .unwrap_or(DIST_PENALTY);
 
-    let cat = state.bfs.build_corridor_attention(board);
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let n = collect_search_moves(
+        board,
+        &mut buf,
+        state.bfs,
+        &cat,
+        &opp_path,
+        opp_path_len,
+        our_dist,
+        opp_dist,
+        true,
+        true,
+    );
+    if n == 0 {
+        return alpha;
+    }
+
     let mut scores = [0i32; MAX_LEGAL_MOVES];
     order_moves(
         board,
@@ -503,18 +674,27 @@ fn quiescence(
         &mut scores,
         our_dist,
         opp_dist,
+        &opp_path,
+        opp_path_len,
         state.bfs,
         &cat,
     );
 
-    for i in 0..n {
+    // Noisy-move width cap: tactical wall sets can be 15+ wide in funnels;
+    // qsearch only needs the sharpest few to settle the horizon.
+    let qn = n.min(8);
+    for i in 0..qn {
         let mv = buf[i];
         let undo = board.make_move(mv);
         let mut score = -quiescence(state, board, -beta, -alpha, ply + 1, qdepth - 1);
-        let fallback = eval_stm(board, board.side().opposite(), state.bfs);
-        score = clamp_unproven_mate(score, qdepth.saturating_sub(1), fallback);
+        if is_mate_score(score) && !mate_proven(score, qdepth.saturating_sub(1)) {
+            let fallback = eval_stm(board, board.side().opposite(), state.bfs);
+            score = clamp_unproven_mate(score, qdepth.saturating_sub(1), fallback);
+        }
         board.unmake_move(undo);
 
+        // Check stop BEFORE using the score — an aborted child returns its own
+        // alpha (= -beta here), which negates into a fake fail-high for us.
         if state.should_stop() {
             break;
         }
@@ -526,8 +706,11 @@ fn quiescence(
         }
     }
 
-    let stand = eval_stm(board, board.side(), state.bfs);
-    clamp_unproven_mate(alpha, qdepth, stand)
+    if is_mate_score(alpha) && !mate_proven(alpha, qdepth) {
+        let stand = eval_stm(board, board.side(), state.bfs);
+        return clamp_unproven_mate(alpha, qdepth, stand);
+    }
+    alpha
 }
 
 fn make_null_move(board: &mut Board) -> u64 {
@@ -557,13 +740,14 @@ fn search_child(
     ply: u32,
 ) -> i32 {
     let mut score = -negamax(state, board, depth, -beta, -alpha, ply + 1);
-    let fallback = eval_stm(board, board.side().opposite(), state.bfs);
-    score = clamp_unproven_mate(score, depth, fallback);
 
     // Mate extension: if the child returns a mate claim that the remaining depth
     // cannot prove, keep extending (up to 3 extra plies) until either the claim
     // is proven or we run out of budget.  This ensures forcing wins are never
     // truncated at the horizon.
+    //
+    // Must run BEFORE the unproven-mate clamp — the old order clamped the mate
+    // away first, so this loop could never fire (mateExtensions was always 0).
     let mut extra = 0u32;
     while extra < 3 {
         let Some(d) = mate_distance(score) else { break };
@@ -577,7 +761,13 @@ fn search_child(
         state.mate_extensions += 1;
         extra += 1;
         score = -negamax(state, board, proven_depth + 1, -beta, -alpha, ply + 1);
-        score = clamp_unproven_mate(score, proven_depth + 1, fallback);
+    }
+
+    // Fallback eval only when an unproven mate claim survived the extensions —
+    // eval_stm costs two BFS and this path runs for EVERY child node.
+    if is_mate_score(score) && !mate_proven(score, depth + extra) {
+        let fallback = eval_stm(board, board.side().opposite(), state.bfs);
+        score = clamp_unproven_mate(score, depth + extra, fallback);
     }
 
     score
@@ -587,7 +777,7 @@ fn negamax(
     state: &mut SearchState<'_>,
     board: &mut Board,
     depth: u32,
-    mut alpha: i32,
+    alpha: i32,
     beta: i32,
     ply: u32,
 ) -> i32 {
@@ -599,11 +789,37 @@ fn negamax(
         return terminal_score(ply);
     }
 
-    // Hard ply ceiling — prevents runaway extensions from overflowing the stack.
     if ply >= MAX_PLY {
         return eval_stm(board, board.side(), state.bfs);
     }
 
+    let hash = board.hash;
+    if ply >= 2 {
+        for i in 0..state.rep_len as usize {
+            if state.rep_keys[i] == hash {
+                return repetition_score(state, board);
+            }
+        }
+    }
+
+    let rep_idx = state.rep_len as usize;
+    if rep_idx < MAX_PLY as usize {
+        state.rep_keys[rep_idx] = hash;
+    }
+    state.rep_len += 1;
+    let score = negamax_inner(state, board, depth, alpha, beta, ply);
+    state.rep_len -= 1;
+    score
+}
+
+fn negamax_inner(
+    state: &mut SearchState<'_>,
+    board: &mut Board,
+    depth: u32,
+    mut alpha: i32,
+    beta: i32,
+    ply: u32,
+) -> i32 {
     let hash = board.hash;
     let mut tt_best = None;
     if let Some(entry) = state.tt.probe(hash) {
@@ -615,8 +831,12 @@ fn negamax(
                 1 => TtBound::Lower,
                 _ => TtBound::Upper,
             };
-            let corrected =
-                clamp_unproven_mate(score, depth, eval_stm(board, board.side(), state.bfs));
+            // Lazy fallback eval — only mate scores ever need clamping.
+            let corrected = if is_mate_score(score) && !mate_proven(score, depth) {
+                clamp_unproven_mate(score, depth, eval_stm(board, board.side(), state.bfs))
+            } else {
+                score
+            };
             match bound {
                 TtBound::Exact => return corrected,
                 TtBound::Lower if corrected >= beta => return corrected,
@@ -655,12 +875,7 @@ fn negamax(
     let apply_futility =
         ply > 0 && futility_depth <= 2 && !is_mate_score(static_eval) && !is_mate_score(alpha);
 
-    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-    let n = collect_search_moves(board, &mut buf, state.bfs, false, true);
-    if n == 0 {
-        return eval_stm(board, board.side(), state.bfs);
-    }
-
+    // Witness path + dists once per node — shared by filtering, ordering, LMR.
     let mut opp_path = [0u8; 81];
     let opp_path_len = get_shortest_path(board, board.side().opposite(), state.bfs, &mut opp_path);
     let opp_dist_pre = path_distance(board.side().opposite(), &opp_path, opp_path_len);
@@ -669,7 +884,31 @@ fn negamax(
         .shortest_distance(board, board.side())
         .unwrap_or(DIST_PENALTY);
 
-    let cat = state.bfs.build_corridor_attention(board);
+    // CAT (multi-route corridor heat) only above the leaf layer: depth-1 nodes
+    // dominate the tree and only need witness-path tactics, not breadth.
+    let cat = if depth >= 2 {
+        state.bfs.build_corridor_attention(board)
+    } else {
+        crate::cat::CorridorAttention::default()
+    };
+
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let n = collect_search_moves(
+        board,
+        &mut buf,
+        state.bfs,
+        &cat,
+        &opp_path,
+        opp_path_len,
+        our_dist_pre,
+        opp_dist_pre,
+        false,
+        true,
+    );
+    if n == 0 {
+        return eval_stm(board, board.side(), state.bfs);
+    }
+
     let mut scores = [0i32; MAX_LEGAL_MOVES];
     order_moves(
         board,
@@ -680,6 +919,8 @@ fn negamax(
         &mut scores,
         our_dist_pre,
         opp_dist_pre,
+        &opp_path,
+        opp_path_len,
         state.bfs,
         &cat,
     );
@@ -694,13 +935,15 @@ fn negamax(
     // and restored after the move loop, giving each branch an independent cap
     // of MAX_EXTENSIONS_PER_BRANCH plies. When the budget hits 0 the extension
     // doesn't fire and depth decreases normally.
-    const MAX_EXTENSIONS_PER_BRANCH: u32 = 4;
     let forcing_extension: u32 = if ply > 0 && depth > 1 && state.extensions_budget > 0 {
         let pawn_count = buf[..n]
             .iter()
             .filter(|m| matches!(m, Move::Pawn { .. }))
             .count();
-        let near_goal = our_dist_pre <= 2 || opp_dist_pre <= 2;
+        // ≤1: truly decided sprints only. The old ≤2 cutoff fired in every
+        // ordinary race and blew the tree up (depth never decreased for whole
+        // subtrees in normal midgames).
+        let near_goal = our_dist_pre <= 1 || opp_dist_pre <= 1;
         if pawn_count <= 1 || near_goal {
             1
         } else {
@@ -714,7 +957,6 @@ fn negamax(
     if forcing_extension > 0 {
         state.extensions_budget = state.extensions_budget.saturating_sub(1);
     }
-    let _ = MAX_EXTENSIONS_PER_BRANCH; // used in init only
 
     let mut best_score = -MATE;
     let mut best_mv = buf[0];
@@ -722,11 +964,20 @@ fn negamax(
     let mut moves_searched = 0usize;
     let original_alpha = alpha;
 
+    let mut cat_max = 0u16;
+    for j in 0..n {
+        let cm = move_corridor_attention(board, buf[j], &cat).max(0) as u16;
+        cat_max = cat_max.max(cm);
+    }
+
     // At root, clear diagnostics so only the current depth's data is retained.
     if ply == 0 {
         state.root_moves.clear();
         state.root_best_resistance = i32::MIN;
+        state.root_best_gain = i32::MIN;
     }
+
+    let profile = state.lmr_profile;
 
     for i in 0..n {
         let mv = buf[i];
@@ -746,6 +997,12 @@ fn negamax(
         {
             // We treat early moves as tactical by definition (no reduction either way).
             true
+        } else if matches!(mv, Move::Wall { .. })
+            && !prune::wall_intersects_path(mv, &opp_path, opp_path_len)
+        {
+            // A wall off the opponent's witness path cannot lengthen their
+            // BFS distance — non-tactical without spending a make + BFS.
+            false
         } else {
             is_tactical_move(board, mv, our_dist_pre, opp_dist_pre, state.bfs)
         };
@@ -761,32 +1018,39 @@ fn negamax(
             }
         }
 
-        // ── LMR reduction ─────────────────────────────────────────────────────
-        // Formula: floor(0.5 + ln(depth) * ln(moves_searched) / 2.25)
-        // Cap: depth/2 — never burn more than half the remaining budget.
-        // Quiet walls (no path intersection at all) get +1 extra reduction ply
-        // because a wall that touches no path is very unlikely to change the eval.
-        let reduction = if is_tactical {
+        // [LMR_BLOCK_START]
+        // Adaptive LMR — profile rebuilt each ID depth on the main thread.
+        // Never LMR at root — reduced-depth scores are optimistic and, on a time
+        // budget, the last candidates may not get a full re-search before stop.
+        let reduction = if ply == 0
+            || is_tactical
+            || i < profile.lmr_after_move
+            || depth < LMR_MIN_DEPTH
+            || cat_cm >= i32::from(profile.hot_cm)
+        {
             0u32
         } else {
             let d = (depth as usize).min(63);
-            let m = moves_searched.min(63);
+            let m = (i + 1).min(63);
             let base_r = state.lmr_table[d][m];
+            let gap = cat_max.saturating_sub(cat_cm.max(0) as u16);
+            let cat_extra = (gap as f32 * profile.cat_heat_lmr_slope).round() as u32;
             // Extra reduction for pure quiet walls (not intersecting opp path at all).
-            let extra = if matches!(mv, Move::Wall { .. }) && cat_cm == 0 {
+            let wall_extra = if matches!(mv, Move::Wall { .. }) && cat_cm == 0 {
                 2u32
             } else if matches!(mv, Move::Wall { .. })
                 && !prune::wall_intersects_path(mv, &opp_path, opp_path_len)
                 && !corridor_relevant
             {
                 1u32
-            } else if cat_cm < i32::from(CAT_COLD_CM) {
+            } else if cat_cm < i32::from(profile.cold_cm) {
                 1u32
             } else {
                 0u32
             };
-            (base_r + extra).min(depth.saturating_sub(1))
+            (base_r + wall_extra + cat_extra).min(depth.saturating_sub(1))
         };
+        // [LMR_BLOCK_END]
 
         let undo = board.make_move(mv);
         // child_depth: one ply below current, plus any forcing extension so that
@@ -827,10 +1091,16 @@ fn negamax(
 
         board.unmake_move(undo);
 
+        // Stop check BEFORE consuming the score: an aborted child returns its
+        // own alpha, which negates into -alpha/-beta window artifacts here — a
+        // fake fail-high could otherwise be recorded as the best move.
+        if state.should_stop() {
+            break;
+        }
+
         // ── Root diagnostics & resistance tiebreaking ──────────────────────────
         // Board is now back to pre-move state; compute gain and resistance here.
         // Resistance = opp_dist_after - our_dist_after (higher is better for us).
-        const ROOT_TIEBREAK_BAND: i32 = 15;
         let (root_gain, root_resistance) = if ply == 0 {
             let gain = move_immediate_gain(board, mv, our_dist_pre, opp_dist_pre, state.bfs);
             let stm = board.side();
@@ -857,45 +1127,53 @@ fn negamax(
             });
         }
 
-        if state.should_stop() {
-            break;
-        }
-
         moves_searched += 1;
 
-        // At root: use resistance only as a secondary tiebreaker for near-equal
-        // non-mate losing scores. Mate losses are already ordered correctly by
-        // the score itself: -19984 is better than -19998 because it delays mate.
-        let is_better = if ply == 0 {
-            if score > best_score {
-                state.root_best_resistance = root_resistance;
-                true
-            } else if score < 0
-                && best_score < 0
-                && !is_mate_score(score)
-                && !is_mate_score(best_score)
-                && score >= best_score - ROOT_TIEBREAK_BAND
-                && root_resistance > state.root_best_resistance
-            {
-                state.root_best_resistance = root_resistance;
-                true
-            } else {
-                false
-            }
-        } else {
-            score > best_score
-        };
-
-        if is_better {
+        // best_score always tracks the true maximum (αβ/TT correctness).
+        // At root, exact score ties break on immediate path gain first (never
+        // trade a path-gaining move for a tempo-wasting wall — that was the
+        // "weird passive wall" bug), then on race resistance.
+        if score > best_score {
             best_score = score;
             best_mv = mv;
             best_packed = pack_move(best_mv);
+            if ply == 0 {
+                state.root_best_gain = root_gain;
+                state.root_best_resistance = root_resistance;
+            }
+        } else if ply == 0 && score == best_score {
+            let better_gain = root_gain > state.root_best_gain;
+            let better_resistance =
+                root_gain == state.root_best_gain && root_resistance > state.root_best_resistance;
+            if better_gain || better_resistance {
+                best_mv = mv;
+                best_packed = pack_move(best_mv);
+                state.root_best_gain = root_gain;
+                state.root_best_resistance = root_resistance;
+            }
         }
         if score > alpha {
             alpha = score;
         }
         if alpha >= beta {
             break;
+        }
+    }
+
+    // Belt-and-suspenders: root_moves must never contain a strictly higher
+    // score than the move we picked (ties are resolved by gain/resistance above).
+    if ply == 0 {
+        if let Some(entry) = state.root_moves.iter().max_by_key(|r| r.score) {
+            if entry.score > best_score {
+                if let Some(&mv) = buf[..n]
+                    .iter()
+                    .find(|m| crate::util::perft::format_move(**m) == entry.mv)
+                {
+                    best_score = entry.score;
+                    best_mv = mv;
+                    best_packed = pack_move(best_mv);
+                }
+            }
         }
     }
 
@@ -909,12 +1187,14 @@ fn negamax(
     } else {
         TtBound::Exact
     };
-    let stand_pat = eval_stm(board, board.side(), state.bfs);
-    best_score = clamp_unproven_mate(best_score, depth, stand_pat);
+    if is_mate_score(best_score) && !mate_proven(best_score, depth) {
+        let stand_pat = eval_stm(board, board.side(), state.bfs);
+        best_score = clamp_unproven_mate(best_score, depth, stand_pat);
+    }
 
     state.tt.store(
         hash,
-        depth as i8,
+        depth.min(i8::MAX as u32) as i8, // extensions can push depth past 127 — never wrap negative
         score_to_tt(best_score, ply),
         bound,
         best_packed,
@@ -929,10 +1209,16 @@ fn negamax(
 
 /// Walk TT PV — if root claims mate, line must reach a real terminal within distance.
 fn extract_pv_algebraic(board: &Board, tt: &SearchTt, max_ply: u32) -> String {
+    use std::collections::HashSet;
+
     let mut copy = board.clone();
     let mut parts = Vec::new();
+    let mut seen = HashSet::with_capacity(max_ply as usize + 1);
     for _ in 0..max_ply {
         if copy.is_terminal().is_some() {
+            break;
+        }
+        if !seen.insert(copy.hash) {
             break;
         }
         let Some(entry) = tt.probe(copy.hash) else {
@@ -1003,12 +1289,12 @@ fn find_immediate_win(moves: &[Move], stm: Player) -> Option<Move> {
     None
 }
 
-/// Stockfish-style early exit when the outcome is already decided.
+/// Stockfish-style early exit when the outcome is already decided at this depth.
 ///
-/// IMPORTANT: Only stop early on a *winning* (positive) mate.
-/// If the score is a losing mate (verified < 0), keep searching — there may be
-/// a root move that delays the loss longer, and stopping now means the engine
-/// surrenders to the first losing line it finds rather than the most resilient one.
+/// Stops once mate is PV-verified or search depth covers the claimed mate distance.
+/// Applies to both winning and losing mates: at depth ≥ d the root has been
+/// searched deeply enough to compare delaying defenses; continuing to d150+ only
+/// re-walks the same forced PV (~8k nodes/depth) without changing the answer.
 fn should_stop_forced_outcome(
     verified: i32,
     depth: u32,
@@ -1016,7 +1302,7 @@ fn should_stop_forced_outcome(
     tt: &SearchTt,
     our_root_dist: u8,
 ) -> bool {
-    if verified > 0 && is_mate_score(verified) {
+    if is_mate_score(verified) {
         if verify_pv_mate(board, tt, verified) {
             return true;
         }
@@ -1047,6 +1333,7 @@ fn log_depth(state: &SearchState<'_>, depth: u32, score: i32) {
         "info depth {} score {} nodes {} asp {} lmr {}",
         depth, display, state.nodes, state.aspiration_fails, state.lmr_re_searches
     );
+    flush_search_log();
 }
 
 fn format_depth_log_json(depth_log: &[DepthLogEntry]) -> String {
@@ -1057,11 +1344,15 @@ fn format_depth_log_json(depth_log: &[DepthLogEntry]) -> String {
         }
         let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
         depth_json.push_str(&format!(
-            "{{\"depth\":{},\"score\":{},\"nodes\":{},\"pv\":\"{}\"}}",
-            e.depth, e.score, e.nodes, pv
+            "{{\"depth\":{},\"score\":{},\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+            e.depth, e.score, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
         ));
     }
     depth_json
+}
+
+fn flush_search_log() {
+    let _ = std::io::stderr().flush();
 }
 
 fn emit_search_progress(
@@ -1074,14 +1365,17 @@ fn emit_search_progress(
         return;
     }
     let depth_json = format_depth_log_json(&state.depth_log);
+    let root_score = state.depth_log.last().map(|e| e.score).unwrap_or(0);
     eprintln!(
-        "info json {{\"stoppedBy\":\"minimax\",\"searchDepth\":{},\"nodes\":{},\"whiteDist\":{},\"blackDist\":{},\"depthLog\":[{}]}}",
+        "info json {{\"stoppedBy\":\"minimax\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"depthLog\":[{}]}}",
         state.search_depth,
         state.nodes,
+        root_score,
         white_dist,
         black_dist,
         depth_json
     );
+    flush_search_log();
 }
 
 fn emit_json_report(report: &SearchReport, log: bool) {
@@ -1218,10 +1512,21 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         search_depth: 0,
         book_hint: config.book_hint,
         our_root_dist,
-        lmr_table: build_lmr_table(),
+        lmr_table: build_lmr_table(LmrProfile::first_iteration().aggression),
         extensions_budget: 4,
         root_moves: Vec::new(),
         root_best_resistance: i32::MIN,
+        root_best_gain: i32::MIN,
+        rep_keys: [0; MAX_PLY as usize],
+        rep_len: 0,
+        started,
+        lmr_profile: LmrProfile::first_iteration(),
+        mate_zone: MateZoneState::default(),
+        eval_zone: EvalZoneState::default(),
+        white_dist,
+        black_dist,
+        last_iter_asp_fails: 0,
+        last_iter_score_delta: i32::MAX,
     };
 
     let static_eval = eval_stm(board, root_side, state.bfs);
@@ -1233,11 +1538,19 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
     };
     let mut best_mv = pv_move;
     let mut completed_depth = 0u32;
+    // Root diagnostics snapshot from the last *completed* depth — state.root_moves
+    // may hold a partially-searched (aborted) iteration when the loop exits.
+    let mut committed_root_moves: Vec<RootMoveInfo> = Vec::new();
 
-    for depth in 1u32..=64 {
+    let max_id_depth = effective_max_id_depth(&config);
+    let mut depth = 1u32;
+    loop {
         if state.should_stop() {
             break;
         }
+
+        update_lmr_profile_for_depth(&mut state, board, depth, prev_score);
+        let nodes_at_depth_start = state.nodes;
 
         let asp_start_fails = state.aspiration_fails;
         let delta = ASPIRATION_DELTA + depth as i32 * 3;
@@ -1264,6 +1577,13 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
             break s;
         };
 
+        // Iteration aborted mid-search (time/nodes): subtree scores are window
+        // artifacts. Keep the previous completed depth's answer instead of
+        // committing a partially-searched, possibly garbage best move.
+        if state.should_stop() && completed_depth > 0 {
+            break;
+        }
+
         let verified = corrected_root_score(board, state.tt, score, depth, state.bfs);
         if is_mate_score(score) && !is_mate_score(verified) {
             state.pv_mate_failures += 1;
@@ -1281,18 +1601,61 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         best_mv = state.pv_move;
         completed_depth = depth;
         state.search_depth = depth;
+        committed_root_moves.clone_from(&state.root_moves);
 
         let pv = extract_pv_algebraic(board, state.tt, depth);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let marginal_nodes = state.nodes.saturating_sub(nodes_at_depth_start);
+        let prev_log_score = state.depth_log.last().map(|e| e.score);
+        state.last_iter_score_delta = prev_log_score
+            .map(|s| (verified - s).abs())
+            .unwrap_or(i32::MAX);
+        state.last_iter_asp_fails = state.aspiration_fails.saturating_sub(asp_start_fails);
         state.depth_log.push(DepthLogEntry {
             depth,
             score: verified,
             nodes: state.nodes,
+            elapsed_ms,
+            marginal_nodes,
             pv,
         });
         log_depth(&state, depth, verified);
         emit_search_progress(&state, &config, white_dist, black_dist);
 
-        if should_stop_forced_outcome(verified, depth, board, state.tt, state.our_root_dist) {
+        let mate_proven_at_depth = verify_pv_mate(board, state.tt, verified)
+            || mate_distance(verified).is_some_and(|d| d > 0 && depth >= d);
+        if let Some(reason) = state.mate_zone.update_after_depth(
+            verified,
+            depth,
+            marginal_nodes,
+            mate_proven_at_depth,
+            verify_pv_mate(board, state.tt, verified),
+        ) {
+            if state.log {
+                eprintln!(
+                    "info mate stop {} at depth {} dist {:?}",
+                    mate_stop_label(reason),
+                    depth,
+                    mate_distance(verified)
+                );
+            }
+            break;
+        }
+
+        if state
+            .eval_zone
+            .update_after_depth(verified, depth, marginal_nodes)
+        {
+            if state.log {
+                eprintln!(
+                    "info eval stop eval_spin at depth {} score {}",
+                    depth, verified
+                );
+            }
+            break;
+        }
+
+        if state.our_root_dist == 1 && depth >= 2 {
             if state.log {
                 eprintln!("info forced outcome at depth {}, stopping search", depth);
             }
@@ -1302,6 +1665,15 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         if state.should_stop() {
             break;
         }
+
+        if depth >= max_id_depth {
+            if state.log {
+                eprintln!("info max id depth {}, stopping search", max_id_depth);
+            }
+            break;
+        }
+
+        depth = depth.saturating_add(1);
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -1318,7 +1690,7 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         pv_mate_failures: state.pv_mate_failures,
         depth_log: state.depth_log,
         elapsed_ms,
-        root_moves: state.root_moves,
+        root_moves: committed_root_moves,
     };
     emit_json_report(&report, config.log);
     Some(report)
@@ -1383,12 +1755,54 @@ mod tests {
     }
 
     #[test]
-    fn root_does_not_stop_on_losing_mate() {
+    fn default_max_id_depth_is_256() {
+        assert_eq!(DEFAULT_MAX_ID_DEPTH, 256);
+        assert_eq!(MAX_PLY, DEFAULT_MAX_ID_DEPTH);
+        assert_eq!(SearchConfig::default().max_id_depth, DEFAULT_MAX_ID_DEPTH);
+    }
+
+    #[test]
+    fn forced_outcome_stops_when_mate_proven_at_depth() {
         let board = Board::new();
         let tt = SearchTt::new();
 
-        assert!(!should_stop_forced_outcome(-MATE + 8, 12, &board, &tt, 8));
-        assert!(should_stop_forced_outcome(MATE - 8, 12, &board, &tt, 8));
+        // Shallow depth: mate claim not yet proven — keep comparing root moves.
+        assert!(!should_stop_forced_outcome(-MATE + 8, 5, &board, &tt, 8));
+        assert!(!should_stop_forced_outcome(MATE - 8, 5, &board, &tt, 8));
+        // Depth covers mate distance — stop (win or loss).
+        assert!(should_stop_forced_outcome(-MATE + 8, 8, &board, &tt, 8));
+        assert!(should_stop_forced_outcome(MATE - 8, 8, &board, &tt, 8));
+    }
+
+    #[test]
+    fn lost_endgame_does_not_run_absurd_id_depth() {
+        let moves = [
+            "e2", "d2v", "c2h", "e2h", "e1h", "e8", "f2", "e7", "g2", "g2h", "b1v", "h8h", "h2",
+            "f8h", "i2", "d8h", "i3", "e6", "h3", "e5", "g3", "g3h", "a2h", "e3h", "e4v", "e6",
+            "e6v", "d7v", "h1h", "d5v", "h3", "e7", "i3", "e8", "i4", "f8", "i5", "g8", "h5", "g7",
+            "h6", "h7", "h8", "h6", "h6v", "h5", "h4v", "h6", "g7h", "g6", "g8", "g7", "f8", "f7",
+            "e8", "f8", "e7", "g8", "e6", "h8", "e5", "i8", "e4",
+        ];
+        let mut board = Board::new();
+        for m in moves {
+            board.apply_algebraic(m);
+        }
+        assert_eq!(board.side(), Player::Two);
+
+        let config = SearchConfig {
+            time_ms: 10_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            ..SearchConfig::default()
+        };
+        let report = search_best_move(&mut board, config).expect("report");
+        assert!(
+            report.search_depth < 40,
+            "lost endgame should stop after mate is proven, got depth {} score {}",
+            report.search_depth,
+            report.root_score
+        );
     }
 
     #[test]
@@ -1415,6 +1829,7 @@ mod tests {
             max_nodes: 2_000_000,
             log: false,
             book_hint: None,
+            ..SearchConfig::default()
         };
         let report = search_best_move(&mut board, config).expect("report");
         let gain = move_immediate_gain(&mut board, report.best_move, our_dist, opp_dist, &mut bfs);
@@ -1427,6 +1842,145 @@ mod tests {
     }
 
     #[test]
+    fn root_move_matches_best_scored_candidate_when_behind_with_walls() {
+        // Regression: LMR at root + time stop left optimistic wall scores in root_moves
+        // while bestmove stayed on the first-searched pawn (e9).
+        let moves = [
+            "e2", "e8", "e3", "e7", "e4", "e7h", "e5", "c7h", "d4h", "g8h", "e6h", "d7", "b4h",
+            "d6", "f5", "f5v", "f4h", "c6", "b5v", "a8h", "a5h", "c8h", "f7v", "c7", "e5", "b7",
+            "h6h", "b8", "c6v", "c8", "h3h", "d8", "d5", "e8", "c5",
+        ];
+        let mut board = Board::new();
+        for m in moves {
+            board.apply_algebraic(m);
+        }
+        assert_eq!(board.side(), Player::Two);
+
+        let config = SearchConfig {
+            time_ms: 10_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            ..SearchConfig::default()
+        };
+        let report = search_best_move(&mut board, config).expect("report");
+        let best_root = report
+            .root_moves
+            .iter()
+            .max_by_key(|r| r.score)
+            .expect("root moves");
+        let played = report
+            .root_moves
+            .iter()
+            .find(|r| r.mv == crate::util::perft::format_move(report.best_move))
+            .expect("played move must be among root candidates");
+        // Exact ties are legal (resistance tiebreak picks among them) — the
+        // played move's SCORE must match the best candidate score.
+        assert_eq!(
+            played.score, best_root.score,
+            "played {} (score {}) but best root candidate is {} (score {})",
+            played.mv, played.score, best_root.mv, best_root.score
+        );
+    }
+
+    fn replay(moves: &[&str]) -> Board {
+        let mut board = Board::new();
+        for m in moves {
+            board.apply_algebraic(m);
+        }
+        board
+    }
+
+    const POS_TQ1_LOST_PLY69: &[&str] = &[
+        "e2", "d2v", "e4v", "e2h", "f2", "f1v", "e2", "d1h", "e8h", "b1h", "f2", "a8h", "f8v", "d9",
+        "f1", "c9", "e1", "c8", "d1", "c8h", "c1", "f6v", "b1", "c7", "a1", "b7", "b6h", "f5h", "a7v",
+        "d4v", "c6v", "c7", "c7h", "b7", "f3v", "b8", "a2", "c8", "b2", "d8", "c2", "e8", "d2", "e7",
+        "d3", "e6", "d4", "e5", "d5", "e4", "d6", "e3", "g2h", "f3", "e6", "f4", "e5", "f5", "e4", "g5",
+        "e3", "g4", "f3", "h4", "f4", "h3", "h3v", "h4", "f5",
+    ];
+
+    fn pos_tq1_lost_ply73() -> Board {
+        let mut board = replay(POS_TQ1_LOST_PLY69);
+        for m in ["h5", "g5", "i5"] {
+            board.apply_algebraic(m);
+        }
+        board
+    }
+
+    #[test]
+    fn lost_mate_tq1_ply69_stops_before_absurd_depth() {
+        let mut board = replay(POS_TQ1_LOST_PLY69);
+        let config = SearchConfig {
+            time_ms: 10_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            ..SearchConfig::default()
+        };
+        let report = search_best_move(&mut board, config).expect("report");
+        assert!(
+            report.search_depth < 40,
+            "must not spin to absurd depth, got {} score {}",
+            report.search_depth,
+            report.root_score
+        );
+        if let Some(dist) = mate_distance(report.root_score) {
+            assert!(
+                report.search_depth <= dist + 10,
+                "ply69 lost mate should stop near mate_dist+slack, got depth {} dist {}",
+                report.search_depth,
+                dist
+            );
+        }
+    }
+
+    #[test]
+    fn lost_mate_tq1_ply73_stops_before_absurd_depth() {
+        let mut board = pos_tq1_lost_ply73();
+        let config = SearchConfig {
+            time_ms: 10_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            ..SearchConfig::default()
+        };
+        let report = search_best_move(&mut board, config).expect("report");
+        assert!(
+            report.search_depth < 40,
+            "ply73 must not spin, got depth {} score {}",
+            report.search_depth,
+            report.root_score
+        );
+        if let Some(dist) = mate_distance(report.root_score) {
+            assert!(
+                report.search_depth <= dist + 6,
+                "ply73 lost mate should stop near mate_dist+slack, got depth {} dist {}",
+                report.search_depth,
+                dist
+            );
+        }
+    }
+
+    #[test]
+    fn opening_startpos_reaches_reasonable_depth() {
+        let mut board = Board::new();
+        let config = SearchConfig {
+            time_ms: 10_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            ..SearchConfig::default()
+        };
+        let report = search_best_move(&mut board, config).expect("report");
+        let min_depth = if cfg!(debug_assertions) { 3 } else { 4 };
+        assert!(
+            report.search_depth >= min_depth,
+            "opening should reach depth >= {min_depth} in 10s, got {}",
+            report.search_depth
+        );
+    }
+
+    #[test]
     fn startpos_search_no_false_mate_at_shallow_depth() {
         let mut board = Board::new();
         let config = SearchConfig {
@@ -1434,6 +1988,7 @@ mod tests {
             max_nodes: 500_000,
             log: false,
             book_hint: None,
+            ..SearchConfig::default()
         };
         let report = search_best_move(&mut board, config).expect("report");
         assert!(

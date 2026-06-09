@@ -180,6 +180,102 @@ perft_diff → only d8v and e8v subtrees differ
 
 ---
 
+## 14. Phantom gap mouths on board edges
+
+**Symptom:** Walls near funnel/gap positions incorrectly pruned or kept; `gap_mouth_keeps_t_junction` test expected non-empty gap zone at a T-junction with no actual sealed territory.
+
+**Cause:** `corridor_mouth_mask` and `gap_play_zone_mask` used neighbor bounds `0..=9` instead of `0..=8`. Row/col 9 is off the 9×9 board — every bottom/right edge square looked adjacent to "sealed" void outside the grid.
+
+**Fix:** Neighbor iteration `0..=8` only. Test updated: no sealed pocket → `gap_zone == 0`.
+
+**Lesson:** Off-by-one on board edges creates phantom topology. Gap logic is for **real** sealed components, not map borders.
+
+---
+
+## 15. Root plays passive wall at equal score (funnel `f4v` vs `e4`)
+
+**Symptom:** White behind in race; search picks tempo-wasting wall (`gain: -10`) tied at same score as `e4` (`gain: +1`).
+
+**Cause:** Root tie-break preferred wall over pawn when behind at equal score; `ROOT_TIEBREAK_BAND` (15 cm) allowed moves with **lower** scores to replace best if resistance was higher.
+
+**Fix:** Exact ties break on `move_immediate_gain` first, then resistance. Band removed. Belt-and-suspenders only promotes strictly higher scores.
+
+**Lesson:** When 80+ root moves tie on eval, **move choice** semantics matter as much as search depth. Path gain is the Quoridor analog of "is this a capture?"
+
+---
+
+## 16. Timeout fake fail-high (negamax + iterative deepening)
+
+**Symptom:** `bestmove` disagreed with best `root_moves` entry after 3s search; last-searched wall had optimistic LMR score.
+
+**Cause:** On time stop, `negamax` returned `alpha` from child; parent negated it into a window artifact. Partial depth was committed as if complete.
+
+**Fix:** `should_stop()` checked **before** consuming child score. Aborted ID iteration discarded — keep previous completed depth's move. `committed_root_moves` snapshot per finished depth.
+
+**Lesson:** Sebastian's iterative deepening rule: timer hits zero mid-depth-6 → play depth-5 move. Never play a half-searched tree.
+
+---
+
+## 17. Mate extensions never fired (`mateExtensions == 0`)
+
+**Symptom:** Log always showed `mateExtensions: 0` even with forcing lines.
+
+**Cause:** `search_child` clamped unproven mate to static eval **before** the extension loop — mate distance erased, loop never extended.
+
+**Fix:** Run extension loop first; clamp only after extensions exhausted.
+
+**Lesson:** Order of horizon handling matters. Clamp is a safety rail, not a preprocessor.
+
+---
+
+## 18. Search 10k nps vs perft 18M nps (not a perft bug)
+
+**Symptom:** "We used to get depth 4 in 3.3s" — perft 4 still ~3.4s / 247M nodes. Search stuck at depth 2–3 on funnel.
+
+**Cause:** Search nodes paid full legal movegen + BFS inside eval (`pawn_mobility`), triple opponent-path rebuild, CAT built twice, per-wall BFS in ordering, forcing extension at `dist ≤ 2`, `eval_stm` every child for mate clamp, qdepth 10 with all walls in qsearch.
+
+**Fix:** Pawn-only mobility; witness-path gate in ordering; shared path/CAT per node; qsearch noisy-only walls; lazy eval_stm; extension threshold tightened; qdepth 6 / width cap 8.
+
+**Lesson:** Perft green ≠ search fast. Profile the **search node**, not the movegen oracle.
+
+---
+
+## 19. Quiescence treated all pruned walls as noisy
+
+**Symptom:** Horizon lines explored passive walls deep in qsearch — eval saw temporary path delay, missed opponent bypass.
+
+**Cause:** `collect_search_moves(..., tactical_only: true)` only filtered pawn moves; walls still used full `wall_should_search` list.
+
+**Fix:** Qsearch wall is noisy iff it lengthens opponent shortest path (witness gate + BFS gain). Quiet → stand pat. Empty noisy set → return static eval.
+
+**Lesson:** Chess quiescence = captures. Quoridor quiescence = **path-length shocks**, not "still has walls in hand."
+
+---
+
+## 20. CAT COLD threshold in `wall_should_search` exploded tree
+
+**Symptom:** After multi-route CAT prune, depth 3 took 400k+ nodes; ~90 walls searchable per node.
+
+**Cause:** `wall_edge_heat >= CAT_COLD_CM` (60) marks huge fringe; almost every central wall qualified.
+
+**Fix:** Use `CAT_HOT_CM` (160) for prune gate. Witness path still admits exact shortest-path cuts.
+
+**Lesson:** Multi-route awareness needs a **tight** heat floor — cold fringe is for LMR, not move list membership.
+
+---
+
+## 21. `bitboard_jump_lateral` test wrong geometry
+
+**Symptom:** `bitboard_matches_scalar` failed; asserted lateral targets `(4,3)` and `(4,5)` with pawns at rows 3 and 5 (not face-to-face).
+
+**Cause:** Test position didn't block straight jump correctly; expected squares unreachable in real rules.
+
+**Fix:** Adjacent pawns `(4,4)/(5,4)`, wall behind black — laterals `(5,3)/(5,5)` only.
+
+**Lesson:** Pawn jump tests need face-to-face + blocked forward jump, not distant pawns.
+
+---
+
 ## Oracle stack (for cross-platform debugging)
 
 1. **Primary:** scraped `web/src/lib/gameLogic.js` (netlify UI rules)

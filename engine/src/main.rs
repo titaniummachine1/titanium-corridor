@@ -252,7 +252,7 @@ fn run_moves() {
 fn parse_genmove_config(args: &[String]) -> (GenmoveConfig, Vec<String>) {
     let log = std::env::var("TITANIUM_LOG").is_ok();
     let mut config = GenmoveConfig {
-        engine: GenmoveEngine::Mcts,
+        engine: GenmoveEngine::Minimax,
         mcts: MctsConfig {
             time_ms: DEFAULT_TIME_MS,
             max_simulations: MCTS_DEFAULT_MAX_SIMULATIONS,
@@ -266,6 +266,7 @@ fn parse_genmove_config(args: &[String]) -> (GenmoveConfig, Vec<String>) {
             max_nodes: DEFAULT_MAX_NODES,
             log,
             book_hint: None,
+            ..SearchConfig::default()
         },
     };
     let mut moves = Vec::new();

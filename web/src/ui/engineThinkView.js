@@ -2,6 +2,41 @@ import { PlayerType } from '../lib/engineConfig.js';
 import { formatEngineScore } from '../lib/playerRegistry.js';
 import { playerColorName } from '../lib/playerColors.js';
 
+const MCTS_MODES = new Set(['mcts', 'opening', 'visits', 'bridge', 'bridge-visits', 'forced']);
+
+function isTitaniumAb(payload) {
+  const eng = String(payload.engine ?? '');
+  return eng.includes('Titanium') || eng.includes('αβ');
+}
+
+function isNegamaxPayload(payload) {
+  return (
+    payload.stoppedBy === 'minimax' ||
+    payload.mode === 'minimax' ||
+    isTitaniumAb(payload)
+  );
+}
+
+function usesRollouts(payload) {
+  if (isNegamaxPayload(payload)) {
+    return false;
+  }
+  if (MCTS_MODES.has(payload.stoppedBy) || payload.stoppedBy === 'time') {
+    return true;
+  }
+  if (payload.stoppedBy === 'searching' || payload.stoppedBy === 'hybrid') {
+    return (
+      payload.rootWinRate != null ||
+      ((payload.simulations ?? payload.nodes ?? 0) > 0 && !payload.depthLog?.length)
+    );
+  }
+  return false;
+}
+
+function rolloutCount(payload) {
+  return payload.simulations ?? payload.nodes ?? 0;
+}
+
 const STOP_LABELS = {
   searching: 'searching',
   minimax: 'αβ',
@@ -36,12 +71,12 @@ function raceBar(whiteDist, blackDist) {
   const margin = blackDist - whiteDist;
   const pct = Math.max(8, Math.min(92, 50 + margin * 4.5));
   if (margin > 0) {
-    return { pct, label: `W +${margin}`, side: 'white' };
+    return { pct, label: `White +${margin}`, side: 'white' };
   }
   if (margin < 0) {
-    return { pct, label: `B +${-margin}`, side: 'black' };
+    return { pct, label: `Black +${-margin}`, side: 'black' };
   }
-  return { pct: 50, label: 'even', side: 'even' };
+  return { pct: 50, label: 'Even race', side: 'even' };
 }
 
 function seatFromPly(ply) {
@@ -71,8 +106,10 @@ function payloadFromSnapshot(snap) {
     blackDist: snap.blackDist,
     score: snap.score,
     depth: snap.depth,
+    depthLog: snap.depthLog ?? [],
     pv: snap.pv ?? '',
     nodes: snap.nodes,
+    simulations: snap.simulations ?? snap.nodes ?? 0,
     rootWinRate: snap.rootWinRate,
     stoppedBy: snap.stoppedBy,
     rootMoves: snap.rootMoves,
@@ -90,8 +127,10 @@ function payloadFromLiveSearch(ls, ply) {
     blackDist: ls.blackDist,
     score: deep?.score ?? ls.rootScore,
     depth: deep?.depth ?? ls.searchDepth,
+    depthLog: ls.depthLog ?? [],
     pv: deep?.pv ?? '',
     nodes: ls.nodes ?? ls.simulations,
+    simulations: ls.simulations ?? ls.nodes ?? 0,
     rootWinRate: ls.rootWinRate,
     stoppedBy: ls.mode ?? 'searching',
     rootMoves: ls.rootMoves,
@@ -145,54 +184,173 @@ function thinkPayloadForSeat(state, seatIndex) {
     blackDist: entry.blackDist,
     score: deep?.score ?? entry.rootScore,
     depth: deep?.depth ?? entry.searchDepth,
+    depthLog: entry.depthLog ?? [],
     pv: deep?.pv ?? '',
     nodes: entry.nodes,
+    simulations: entry.simulations ?? entry.nodes ?? 0,
     rootWinRate: entry.rootWinRate,
     stoppedBy: entry.stoppedBy,
     rootMoves: entry.rootMoves,
   };
 }
 
-function formatBudget(nodes, rootWinRate, stoppedBy) {
+function prefersWinRate(payload) {
+  if (payload.rootWinRate == null || isNegamaxPayload(payload)) {
+    return false;
+  }
+  if (MCTS_MODES.has(payload.stoppedBy)) {
+    return true;
+  }
+  return payload.score == null && payload.depth == null;
+}
+
+function heroRight(payload) {
+  if (usesRollouts(payload)) {
+    const n = rolloutCount(payload);
+    return { value: n > 0 ? n.toLocaleString() : '…', label: 'rollouts' };
+  }
+  return {
+    value: payload.depth ? String(payload.depth) : '…',
+    label: 'depth',
+  };
+}
+
+function heroMetric(payload) {
+  const right = heroRight(payload);
+
+  if (prefersWinRate(payload)) {
+    const pct = Number(payload.rootWinRate) * 100;
+    if (!Number.isFinite(pct)) {
+      return { left: '—', right: right.value, rightLabel: right.label, tone: 'even', mode: 'winrate' };
+    }
+    return {
+      left: `${pct.toFixed(0)}%`,
+      right: right.value,
+      rightLabel: right.label,
+      tone: pct >= 50 ? 'good' : 'bad',
+      mode: 'winrate',
+    };
+  }
+
+  if (payload.score != null && Number.isFinite(Number(payload.score))) {
+    const n = Number(payload.score);
+    return {
+      left: formatEngineScore(n),
+      right: right.value,
+      rightLabel: right.label,
+      tone: n > 50 ? 'good' : n < -50 ? 'bad' : 'even',
+      mode: 'eval',
+    };
+  }
+
+  if (payload.rootWinRate != null) {
+    const pct = Number(payload.rootWinRate) * 100;
+    return {
+      left: `${pct.toFixed(0)}%`,
+      right: right.value,
+      rightLabel: right.label,
+      tone: pct >= 50 ? 'good' : 'bad',
+      mode: 'winrate',
+    };
+  }
+
+  return {
+    left: '…',
+    right: right.value,
+    rightLabel: right.label,
+    tone: 'even',
+    mode: payload.live ? 'searching' : 'idle',
+  };
+}
+
+function renderDepthFeed(depthLog, live, payload) {
+  if (usesRollouts(payload) || !depthLog?.length) {
+    return '';
+  }
+  const rows = [...depthLog]
+    .sort((a, b) => b.depth - a.depth)
+    .slice(0, 6)
+    .map((entry) => {
+      const score = entry.score != null ? formatEngineScore(entry.score) : '—';
+      const nodes = entry.nodes > 0 ? ` · ${Number(entry.nodes).toLocaleString()}n` : '';
+      return `
+        <li class="think-card__depth-row">
+          <span class="think-card__depth-num">d${entry.depth}</span>
+          <span class="think-card__depth-score">${escapeHtml(score)}</span>
+          <span class="think-card__depth-nodes">${escapeHtml(nodes)}</span>
+        </li>`;
+    })
+    .join('');
+  const title = live ? 'Depth (live)' : 'Depth';
+  return `
+    <div class="think-card__depth-feed">
+      <div class="think-card__depth-title">${title}</div>
+      <ul class="think-card__depth-list">${rows}</ul>
+    </div>`;
+}
+
+function formatNodes(nodes, stoppedBy, payload = {}) {
+  if (!nodes || nodes <= 0) {
+    return '';
+  }
+  const label = isNegamaxPayload({ stoppedBy, ...payload }) ? 'nodes' : 'sims';
+  return `${Number(nodes).toLocaleString()} ${label}`;
+}
+
+function formatBudgetLine(payload) {
   const parts = [];
-  if (rootWinRate != null) {
-    parts.push(`${(rootWinRate * 100).toFixed(0)}% wr`);
+  const nodes = formatNodes(payload.nodes, payload.stoppedBy, payload);
+  if (nodes) {
+    parts.push(nodes);
   }
-  if (nodes > 0) {
-    const isMcts = stoppedBy === 'mcts' || stoppedBy === 'time' || stoppedBy === 'visits' || stoppedBy === 'opening';
-    parts.push(`${Number(nodes).toLocaleString()}${isMcts ? ' sims' : ''}`);
-  }
-  const stop = STOP_LABELS[stoppedBy] ?? stoppedBy;
-  if (stop) {
+  const stop = STOP_LABELS[payload.stoppedBy] ?? payload.stoppedBy;
+  if (stop && stop !== 'searching') {
     parts.push(stop);
   }
   return parts.join(' · ');
 }
 
-function formatTopRoots(rootMoves) {
+function pvHeadline(pv) {
+  if (!pv) {
+    return '';
+  }
+  const first = pv.trim().split(/\s+/)[0];
+  return first || '';
+}
+
+function renderRootMovesList(rootMoves) {
   if (!rootMoves?.length) {
     return '';
   }
-  return [...rootMoves]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3)
-    .map((r) => `${r.move} ${formatEngineScore(r.score)}`)
-    .join('  ');
+  const sorted = [...rootMoves].sort((a, b) => b.score - a.score).slice(0, 4);
+  const rows = sorted
+    .map((r, i) => {
+      const score = formatEngineScore(r.score);
+      const best = i === 0 ? ' think-card__root-row--best' : '';
+      return `
+        <li class="think-card__root-row${best}">
+          <span class="think-card__root-move">${escapeHtml(r.move)}</span>
+          <span class="think-card__root-score">${escapeHtml(score)}</span>
+        </li>`;
+    })
+    .join('');
+  return `
+    <div class="think-card__roots-block">
+      <div class="think-card__roots-title">Top lines</div>
+      <ul class="think-card__roots-list">${rows}</ul>
+    </div>`;
 }
 
 function renderThinkCard(seatIndex, payload) {
   const colorClass = seatIndex === 0 ? 'think-card--white' : 'think-card--black';
   const liveClass = payload.live ? ' think-card--live' : '';
   const bar = raceBar(payload.whiteDist, payload.blackDist);
-  const scoreText =
-    payload.score != null && Number.isFinite(Number(payload.score))
-      ? formatEngineScore(payload.score)
-      : '';
-  const depthText = payload.depth ? `d${payload.depth}` : '';
-  const budget = formatBudget(payload.nodes, payload.rootWinRate, payload.stoppedBy);
-  const roots = formatTopRoots(payload.rootMoves);
+  const hero = heroMetric(payload);
+  const budget = formatBudgetLine(payload);
   const distText =
-    payload.whiteDist != null ? `W${payload.whiteDist} · B${payload.blackDist}` : '';
+    payload.whiteDist != null ? `path W${payload.whiteDist} · B${payload.blackDist}` : '';
+  const pvLead = payload.live ? pvHeadline(payload.pv) : '';
+  const roots = renderRootMovesList(payload.rootMoves);
 
   return `
     <article class="think-card ${colorClass}${liveClass}">
@@ -201,21 +359,58 @@ function renderThinkCard(seatIndex, payload) {
         <span class="think-card__engine">${escapeHtml(payload.engine)}</span>
         ${payload.live ? '<span class="think-card__pulse">live</span>' : ''}
       </header>
-      ${payload.move ? `<div class="think-card__move">${escapeHtml(payload.move)}<span class="think-card__ply">ply ${payload.ply}</span></div>` : ''}
-      <div class="think-card__race" title="Path distance margin (B−W steps)">
+
+      ${payload.move
+    ? `<div class="think-card__played">
+            <span class="think-card__played-label">played</span>
+            <span class="think-card__played-move">${escapeHtml(payload.move)}</span>
+            <span class="think-card__ply">ply ${payload.ply}</span>
+          </div>`
+    : ''}
+
+      <div class="think-card__hero think-card__hero--${hero.tone}">
+        <div class="think-card__hero-split">
+          <div class="think-card__hero-side think-card__hero-side--eval">
+            <div class="think-card__hero-value">${escapeHtml(hero.left)}</div>
+            <div class="think-card__hero-label">${hero.mode === 'winrate' ? 'win rate' : hero.mode === 'eval' ? 'eval (sq)' : hero.mode === 'searching' ? 'searching' : '—'}</div>
+          </div>
+          <div class="think-card__hero-divider" aria-hidden="true"></div>
+          <div class="think-card__hero-side think-card__hero-side--depth">
+            <div class="think-card__hero-value think-card__hero-value--depth">${escapeHtml(hero.right)}</div>
+            <div class="think-card__hero-label">${escapeHtml(hero.rightLabel)}</div>
+          </div>
+        </div>
+      </div>
+
+      ${renderDepthFeed(payload.depthLog, payload.live, payload)}
+
+      ${pvLead && payload.live
+    ? `<div class="think-card__pv-lead">
+            <span class="think-card__pv-lead-label">PV</span>
+            <span class="think-card__pv-lead-move">${escapeHtml(pvLead)}</span>
+          </div>`
+    : ''}
+
+      <div class="think-card__race" title="Shortest-path steps to goal">
         <div class="think-card__race-track">
           <div class="think-card__race-white" style="width:${bar.pct}%"></div>
         </div>
-        <span class="think-card__race-label think-card__race-label--${bar.side}">${bar.label}</span>
+        <div class="think-card__race-meta">
+          <span class="think-card__race-label think-card__race-label--${bar.side}">${bar.label}</span>
+          ${distText ? `<span class="think-card__race-dist">${escapeHtml(distText)}</span>` : ''}
+        </div>
       </div>
-      <div class="think-card__metrics">
-        ${distText ? `<span>${distText}</span>` : ''}
-        ${scoreText ? `<span class="think-card__score">${scoreText}</span>` : ''}
-        ${depthText ? `<span>${depthText}</span>` : ''}
-      </div>
+
+      ${payload.pv && !(payload.live && pvLead)
+    ? `<div class="think-card__pv">
+            <span class="think-card__pv-label">line</span>
+            <span class="think-card__pv-text">${escapeHtml(payload.pv)}</span>
+          </div>`
+    : ''}
+
+      ${roots}
+
       ${budget ? `<div class="think-card__budget">${escapeHtml(budget)}</div>` : ''}
-      ${payload.pv ? `<div class="think-card__pv">${escapeHtml(payload.pv)}</div>` : ''}
-      ${roots ? `<div class="think-card__roots">${escapeHtml(roots)}</div>` : ''}
     </article>
   `;
 }

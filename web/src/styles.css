@@ -180,10 +180,10 @@ body {
   background: rgba(0, 0, 0, 0.18);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 10px 11px;
+  padding: 12px 13px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 10px;
 }
 
 .think-card--white {
@@ -229,20 +229,160 @@ body {
   animation: pulse 1.4s ease-in-out infinite;
 }
 
-.think-card__move {
-  font-family: 'Roboto Mono', monospace;
-  font-size: 1.05rem;
-  font-weight: 700;
-  color: var(--text);
+.think-card__played {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.think-card__played-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.think-card__played-move {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: var(--text);
 }
 
 .think-card__ply {
-  font-size: 0.68rem;
+  font-size: 0.72rem;
   font-weight: 500;
   color: var(--muted);
+}
+
+.think-card__hero {
+  padding: 8px 6px 6px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.think-card__hero-split {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.think-card__hero-side {
+  text-align: center;
+  min-width: 0;
+}
+
+.think-card__hero-divider {
+  width: 1px;
+  height: 2.6rem;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.think-card__hero-value {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 2.15rem;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+}
+
+.think-card__hero-value--depth {
+  font-size: 2rem;
+  color: #9ec8ff;
+}
+
+.think-card__hero-label {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.think-card__depth-feed {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.think-card__depth-title {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.think-card__depth-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.think-card__depth-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: 'Roboto Mono', monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.think-card__depth-num {
+  flex: 0 0 2rem;
+  color: #9ec8ff;
+  font-weight: 600;
+}
+
+.think-card__depth-score {
+  flex: 1;
+  font-weight: 600;
+}
+
+.think-card__depth-nodes {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.think-card__hero--good .think-card__hero-value {
+  color: #8fd48f;
+}
+
+.think-card__hero--bad .think-card__hero-value {
+  color: #e89a8a;
+}
+
+.think-card__hero--even .think-card__hero-value {
+  color: var(--text);
+}
+
+.think-card__pv-lead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(107, 191, 107, 0.08);
+}
+
+.think-card__pv-lead-label {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #8fd48f;
+}
+
+.think-card__pv-lead-move {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--text);
 }
 
 .think-card__race {
@@ -265,41 +405,111 @@ body {
   transition: width 0.35s ease;
 }
 
+.think-card__race-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .think-card__race-label {
-  font-size: 0.7rem;
-  font-weight: 600;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.think-card__race-dist {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
 }
 
 .think-card__race-label--white { color: #d4b896; }
 .think-card__race-label--black { color: #c49a6c; }
 .think-card__race-label--even { color: var(--muted); }
 
-.think-card__metrics {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.think-card__budget {
   font-size: 0.72rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+.think-card__pv {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.think-card__pv-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
   color: var(--muted);
 }
 
-.think-card__score {
+.think-card__pv-text {
   font-family: 'Roboto Mono', monospace;
+  font-size: 0.82rem;
+  color: var(--text);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.think-card__roots-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.think-card__roots-title {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.think-card__roots-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.think-card__root-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.think-card__root-row--best {
+  background: rgba(107, 191, 107, 0.12);
+  outline: 1px solid rgba(107, 191, 107, 0.25);
+}
+
+.think-card__root-move {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 1rem;
   font-weight: 700;
   color: var(--text);
 }
 
-.think-card__budget {
-  font-size: 0.7rem;
-  color: var(--muted);
+.think-card__root-score {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #d4b896;
 }
 
-.think-card__pv,
-.think-card__roots {
-  font-family: 'Roboto Mono', monospace;
-  font-size: 0.68rem;
-  color: var(--muted);
-  line-height: 1.35;
-  word-break: break-word;
+.think-card__root-row--best .think-card__root-score {
+  color: #8fd48f;
 }
 
 .cat-hint {
@@ -870,6 +1080,14 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.player-ai-settings__engine {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.02em;
 }
 
 .discrete-slider {

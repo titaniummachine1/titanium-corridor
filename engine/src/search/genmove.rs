@@ -3,15 +3,19 @@
 //! Move generation is `moves`; pruning is `prune`; search is `search`; routing is `pipeline`.
 
 use crate::core::board::Board;
-use crate::search::mcts::{MctsConfig, DEFAULT_TIME_MS};
-use crate::search::alphabeta::{SearchConfig, DEFAULT_MAX_NODES};
+use crate::search::alphabeta::SearchConfig;
+use crate::search::deprecated::mcts::MctsConfig;
 
-pub use crate::search::pipeline::{search_phase, walls_placed, SearchPhase};
-pub use crate::search::mcts::DEFAULT_MAX_SIMULATIONS as MCTS_DEFAULT_MAX_SIMULATIONS;
-pub use crate::search::mcts::DEFAULT_UCT as MCTS_DEFAULT_UCT;
+pub use crate::search::deprecated::mcts::DEFAULT_MAX_SIMULATIONS as MCTS_DEFAULT_MAX_SIMULATIONS;
+pub use crate::search::deprecated::mcts::DEFAULT_UCT as MCTS_DEFAULT_UCT;
+pub use crate::search::pipeline::{lmr_stage_inputs, search_phase, walls_placed, LmrStageInputs, SearchPhase};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenmoveEngine {
+    #[deprecated(
+        since = "0.2.0",
+        note = "MCTS is inactive; routes silently to negamax"
+    )]
     Mcts,
     Minimax,
     Greedy,
@@ -19,13 +23,14 @@ pub enum GenmoveEngine {
 
 impl Default for GenmoveEngine {
     fn default() -> Self {
-        Self::Mcts
+        Self::Minimax
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct GenmoveConfig {
     pub engine: GenmoveEngine,
+    #[allow(deprecated)]
     pub mcts: MctsConfig,
     pub minimax: SearchConfig,
 }
@@ -33,14 +38,9 @@ pub struct GenmoveConfig {
 impl Default for GenmoveConfig {
     fn default() -> Self {
         Self {
-            engine: GenmoveEngine::Mcts,
+            engine: GenmoveEngine::Minimax,
             mcts: MctsConfig::default(),
-            minimax: SearchConfig {
-                time_ms: DEFAULT_TIME_MS,
-                max_nodes: DEFAULT_MAX_NODES,
-                log: false,
-                book_hint: None,
-            },
+            minimax: SearchConfig::default(),
         }
     }
 }

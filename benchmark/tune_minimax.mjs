@@ -6,8 +6,14 @@
  *   TITANIUM_BIN=engine/target/tune/release/titanium.exe node benchmark/tune_minimax.mjs
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { playMatch } from './lib/match_engine.mjs';
 import { RUST_TITANIUM_ID, GORISANSON_ID } from './lib/engine_ids.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const BASELINE_PATH = path.join(ROOT, 'benchmark', 'baseline_depths.json');
 
 function parseArgs(argv) {
   const opts = { games: 4, timeSec: 10, gorisansonTimeSec: 3, quiet: true, disableBook: false };
@@ -83,8 +89,31 @@ async function main() {
     bin: process.env.TITANIUM_BIN ?? 'default',
   };
 
-  console.log(JSON.stringify(summary));
+  let baselineDelta = null;
+  if (fs.existsSync(BASELINE_PATH)) {
+    const baseline = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8'));
+    const opening = baseline.positions?.opening_ply0;
+    if (opening?.searchDepth != null) {
+      baselineDelta = {
+        openingDepthBaseline: opening.searchDepth,
+        openingDepthNow: reportOpeningDepth(match),
+        note: 'Compare opening_ply0 searchDepth vs baseline_depths.json',
+      };
+    }
+  }
+
+  console.log(JSON.stringify({ ...summary, baselineDelta }));
   process.exit(match.scoreA > match.scoreB ? 0 : 1);
+}
+
+function reportOpeningDepth(match) {
+  for (const game of match.results ?? []) {
+    const first = game.searchLog?.[0];
+    if (first?.searchDepth != null) {
+      return first.searchDepth;
+    }
+  }
+  return null;
 }
 
 main().catch((err) => {

@@ -7,7 +7,7 @@
 //! path/     BFS reachability
 //! cat/      Corridor Attention Table v3 + pruning + viz
 //! eval/     static evaluation (see search::alphabeta)
-//! search/   αβ, MCTS, TT, pipeline, genmove
+//! search/   αβ negamax, TT, pipeline, genmove
 //! opening/  book
 //! ```
 
@@ -37,6 +37,7 @@ pub use movegen::{
 pub use opening::{ply_number, BOOK_MAX_PLY};
 pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
 pub use search::greedy::choose_greedy_move;
+#[allow(deprecated)]
 pub use search::{
     genmove_algebraic, search_best_move, search_mcts, search_phase, walls_placed, Engine,
     GenmoveConfig, GenmoveEngine, MctsConfig, MctsReport, SearchConfig, SearchPhase, SearchReport,

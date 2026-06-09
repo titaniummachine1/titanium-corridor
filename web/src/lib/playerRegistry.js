@@ -24,19 +24,20 @@ const GORISANSON_ENGINE = {
 
 const TITANIUM_ENGINE = {
   kind: 'titanium',
-  name: 'Titanium (MCTS, Rust)',
+  name: 'Titanium αβ + CAT',
   key: PlayerType.Titanium,
-  engineMode: 'mcts',
-  tooltip: 'Updated local Rust MCTS engine — `titanium genmove` (cargo build --release in engine/)',
+  engineMode: 'minimax',
+  tooltip:
+    'Iterative-deepening negamax with corridor attention — `titanium genmove` (cargo build --release in engine/)',
 };
 
 const TITANIUM_MINIMAX_ENGINE = {
   kind: 'titanium',
-  name: 'Titanium Hybrid (strongest)',
+  name: 'Titanium αβ + CAT',
   key: PlayerType.TitaniumMinimax,
   engineMode: 'minimax',
   tooltip:
-    'Full pipeline: MCTS opening/book → minimax+CAT v3 (`cargo build --release` in engine/)',
+    'Iterative-deepening negamax with adaptive LMR and CAT v3 (`cargo build --release` in engine/)',
 };
 
 const PLACEHOLDER_ENGINES = [
@@ -74,13 +75,13 @@ export function getPlayerOptionGroups() {
         },
         {
           value: PlayerType.Titanium,
-          label: 'Titanium (MCTS, Rust)',
+          label: TITANIUM_ENGINE.name,
           disabled: false,
           tooltip: TITANIUM_ENGINE.tooltip,
         },
         {
           value: PlayerType.TitaniumMinimax,
-          label: 'Titanium Hybrid (strongest)',
+          label: TITANIUM_MINIMAX_ENGINE.name,
           disabled: false,
           tooltip: TITANIUM_MINIMAX_ENGINE.tooltip,
         },
@@ -186,9 +187,13 @@ function buildSearchDepthHeader(header, { live }) {
   } else if (header.time != null) {
     parts.push(formatWallClock(header.time / 1000));
   }
+  const isAb =
+    header.stoppedBy === 'minimax' ||
+    header.mode === 'minimax' ||
+    header.playerLabel?.includes('Titanium');
   if (header.nodes != null) {
     parts.push(`${Number(header.nodes).toLocaleString()} nodes`);
-  } else if (header.simulations != null) {
+  } else if (header.simulations != null && !isAb) {
     parts.push(`${Number(header.simulations).toLocaleString()} sims`);
   }
   if (header.whiteDist != null) {
@@ -238,10 +243,14 @@ export function buildSearchDepthPanel(liveSearch, searchInfo) {
     })
     .join('');
   const wrSource = source.live ? liveSearch : searchInfo;
-  const wr =
-    wrSource?.rootWinRate != null
-      ? `<div class="search-depth__wr">MCTS win rate: <strong>${(wrSource.rootWinRate * 100).toFixed(1)}%</strong></div>`
-      : '';
+  const showWr =
+    wrSource?.rootWinRate != null &&
+    wrSource.stoppedBy !== 'minimax' &&
+    wrSource.mode !== 'minimax' &&
+    !wrSource.playerLabel?.includes('Titanium');
+  const wr = showWr
+    ? `<div class="search-depth__wr">Win rate: <strong>${(wrSource.rootWinRate * 100).toFixed(1)}%</strong></div>`
+    : '';
   return `${header}${wr}<table class="search-depth"><thead><tr><th>depth</th><th>eval</th><th>nodes</th><th>pv</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -288,7 +297,10 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
   }
   const config = engineConfigs.find((entry) => entry.key === playerType);
   if ((config?.kind === 'local' || config?.kind === 'titanium') && searchInfo.time != null) {
-    const isMinimax = searchInfo.stoppedBy === 'minimax';
+    const isMinimax =
+      searchInfo.stoppedBy === 'minimax' ||
+      searchInfo.mode === 'minimax' ||
+      config.engineMode === 'minimax';
     const budgetLabel = isMinimax
       ? `${(searchInfo.nodes ?? 0).toLocaleString()} nodes`
       : `${searchInfo.simulations?.toLocaleString() ?? '?'} sims`;

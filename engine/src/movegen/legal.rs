@@ -1,6 +1,8 @@
 //! Legal move generation — pawn jumps + wall placements with path validation.
 
 use crate::core::board::{Board, Move, Player, WallOrientation};
+use crate::movegen::pawn_bits::generate_pawn_moves_bitboard_with_masks;
+use crate::path::masks::DirMasks;
 use crate::util::grid::{can_step, goal_row, has_wall, set_wall, square_index, unpack_square};
 use crate::path::BfsScratch;
 
@@ -27,7 +29,8 @@ pub fn generate_legal_moves_slice(
         return 0;
     }
 
-    let mut n = generate_pawn_moves_slice(board, out);
+    let masks = DirMasks::from_board(board);
+    let mut n = generate_pawn_moves_bitboard_with_masks(board, &masks, out);
     if board.walls_remaining[board.side_to_move as usize] > 0 {
         n += generate_wall_moves_slice(board, &mut out[n..], scratch);
     }
@@ -55,8 +58,20 @@ pub fn generate_pawn_moves_into(board: &Board, out: &mut Vec<Move>) {
     out.extend_from_slice(&buf[..n]);
 }
 
-fn generate_pawn_moves_slice(board: &Board, out: &mut [Move]) -> usize {
-    let side = board.side_to_move as usize;
+pub(crate) fn generate_pawn_moves_slice(board: &Board, out: &mut [Move]) -> usize {
+    generate_pawn_moves_scalar_for(board, board.side_to_move, out)
+}
+
+/// Pawn moves for an arbitrary player — no board clone, no wall generation.
+/// Hot path for mobility eval: counting pawn moves must never trigger the
+/// full legal movegen (which BFS-validates every wall placement).
+pub(crate) fn generate_pawn_moves_for(board: &Board, player: Player, out: &mut [Move]) -> usize {
+    generate_pawn_moves_scalar_for(board, player, out)
+}
+
+/// Scalar pawn moves — kept for mobility eval and differential tests vs bitboard.
+fn generate_pawn_moves_scalar_for(board: &Board, player: Player, out: &mut [Move]) -> usize {
+    let side = player as usize;
     let (fr, fc) = board.pawns[side];
     let (or, oc) = board.pawns[1 - side];
     let mut n = 0usize;
@@ -304,6 +319,7 @@ fn path_ok_after_wall(
     set_wall(board, row, col, orientation, true);
     let ok = scratch.both_players_reach_goals(board);
     set_wall(board, row, col, orientation, false);
+    scratch.invalidate_dir_masks();
     ok
 }
 

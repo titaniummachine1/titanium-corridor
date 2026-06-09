@@ -95,6 +95,28 @@ pub fn path_distance(player: Player, path: &[u8], len: usize) -> u8 {
     }
 }
 
+/// Opponent path gain and our path loss from a wall — one make/unmake, two BFS.
+pub fn wall_race_swing(
+    board: &mut Board,
+    mv: Move,
+    our_dist: u8,
+    opp_dist: u8,
+    bfs: &mut BfsScratch,
+) -> (i32, i32) {
+    let Move::Wall { .. } = mv else {
+        return (0, 0);
+    };
+    let us = board.side();
+    let opp = us.opposite();
+    let undo = board.make_move(mv);
+    let our_after = bfs.shortest_distance(board, us).unwrap_or(DIST_PENALTY);
+    let opp_after = bfs.shortest_distance(board, opp).unwrap_or(DIST_PENALTY);
+    board.unmake_move(undo);
+    let opp_gain = i32::from(opp_after.saturating_sub(opp_dist));
+    let our_loss = i32::from(our_after.saturating_sub(our_dist));
+    (opp_gain, our_loss)
+}
+
 /// Net race swing from playing a wall: opponent path lengthening minus our path lengthening.
 pub fn wall_net_race(
     board: &mut Board,
@@ -103,15 +125,7 @@ pub fn wall_net_race(
     opp_dist: u8,
     bfs: &mut BfsScratch,
 ) -> i32 {
-    let Move::Wall { .. } = mv else {
-        return 0;
-    };
-    let us = board.side();
-    let opp_gain = opp_path_gain(board, mv, opp_dist, bfs);
-    let undo = board.make_move(mv);
-    let our_after = bfs.shortest_distance(board, us).unwrap_or(DIST_PENALTY);
-    board.unmake_move(undo);
-    let our_loss = i32::from(our_after.saturating_sub(our_dist));
+    let (opp_gain, our_loss) = wall_race_swing(board, mv, our_dist, opp_dist, bfs);
     opp_gain - our_loss
 }
 
@@ -302,7 +316,9 @@ pub fn corridor_mouth_mask(reachable: u128) -> u128 {
         for (dr, dc) in [(-1i8, 0), (1, 0), (0, -1), (0, 1)] {
             let nr = r as i16 + dr as i16;
             let nc = c as i16 + dc as i16;
-            if !(0..=9).contains(&nr) || !(0..=9).contains(&nc) {
+            // 0..=8 — board edges are NOT sealed territory. With 0..=9 every
+            // bottom/right edge square became a phantom "mouth".
+            if !(0..=8).contains(&nr) || !(0..=8).contains(&nc) {
                 continue;
             }
             let neighbor = square_index(nr as u8, nc as u8);
@@ -327,7 +343,7 @@ pub fn gap_play_zone_mask(reachable: u128) -> u128 {
         for (dr, dc) in [(-1i8, 0), (1, 0), (0, -1), (0, 1)] {
             let nr = r as i16 + dr as i16;
             let nc = c as i16 + dc as i16;
-            if !(0..=9).contains(&nr) || !(0..=9).contains(&nc) {
+            if !(0..=8).contains(&nr) || !(0..=8).contains(&nc) {
                 continue;
             }
             // Include both live ring and the sealed gap cell — half-walls and cross-gap H/V land here.
@@ -367,30 +383,6 @@ fn wall_touches_gap_zone(mv: Move, gap_zone: u128) -> bool {
     };
     for (r, c) in wall_touch_squares(row, col, orientation) {
         if gap_zone & (1u128 << square_index(r, c)) != 0 {
-            return true;
-        }
-    }
-    false
-}
-
-/// Wall touches a reachable square on a live corridor (not sealed void).
-fn wall_touches_live_corridor(mv: Move, cat: &CorridorAttention, reachable: u128) -> bool {
-    let Move::Wall {
-        row,
-        col,
-        orientation,
-    } = mv
-    else {
-        return false;
-    };
-    if cat.wall_edge_heat(row, col, orientation) >= CAT_COLD_CM {
-        return true;
-    }
-    for (r, c) in wall_touch_squares(row, col, orientation) {
-        if reachable & (1u128 << square_index(r, c)) == 0 {
-            continue;
-        }
-        if cat.square_heat(r, c) >= CAT_COLD_CM {
             return true;
         }
     }
@@ -453,26 +445,17 @@ pub fn wall_should_search(
     if gap_zone != 0 && wall_probes_sealed_interior(mv, reachable, gap_zone) {
         return false;
     }
-    let on_opp_path = wall_intersects_path(mv, opp_path, opp_path_len);
-    if on_opp_path {
+    // Fast exact hit: wall blocks a step of the opponent's current shortest path.
+    if wall_intersects_path(mv, opp_path, opp_path_len) {
         return true;
     }
-    if opp_path_gain(board, mv, opp_dist, bfs) > 0 {
-        return true;
-    }
-    // Cold / passive walls stay in the move list — search applies LMR from CAT heat & net race.
-    let net = wall_net_race(board, mv, our_dist, opp_dist, bfs);
-    let min_net = min_wall_net_race(our_dist, opp_dist);
-    let behind = our_dist >= opp_dist;
-    if behind {
-        if net < min_net {
-            return false;
-        }
-    } else if net < min_net {
-        return false;
-    }
-
-    true
+    // CAT v3 multi-route check: does the wall cut an edge on a HOT corridor
+    // (exact shortest routes / contested lanes) of either player? This is the
+    // anti-tunnel-vision signal — a single witness path (CAT v2) misses
+    // equal-length reroutes. CAT is built once per node: no extra BFS per wall.
+    // HOT (not COLD) keeps the move list tight — the delta-2/3 fringe admitted
+    // nearly every wall on the board and exploded the tree.
+    cat.wall_edge_heat(row, col, orientation) >= CAT_HOT_CM
 }
 
 /// Hard skip — dead void or sealed interior away from gap; never searched (not LMR).
@@ -500,10 +483,18 @@ pub fn wall_completely_skipped(mv: Move, board: &Board, reachable: u128, gap_zon
 }
 
 /// Filter legal moves for search — never generates moves, only prunes `moves` output.
+/// `cat` is the caller's corridor attention and `opp_path` the caller's witness
+/// shortest path — both computed once per node and shared with move ordering.
+#[allow(clippy::too_many_arguments)]
 pub fn collect_search_moves(
     board: &mut Board,
     buf: &mut [Move],
     bfs: &mut BfsScratch,
+    cat: &CorridorAttention,
+    opp_path: &[u8; 81],
+    opp_path_len: usize,
+    our_dist: u8,
+    opp_dist: u8,
     tactical_only: bool,
     allow_walls: bool,
 ) -> usize {
@@ -513,20 +504,6 @@ pub fn collect_search_moves(
         return 0;
     }
 
-    let mut opp_dist = DIST_PENALTY;
-    let mut opp_path = [0u8; 81];
-    let mut opp_path_len = 0usize;
-    let cat = if allow_walls {
-        let opp = board.side().opposite();
-        opp_dist = bfs.shortest_distance(board, opp).unwrap_or(DIST_PENALTY);
-        opp_path_len = get_shortest_path(board, opp, bfs, &mut opp_path);
-        bfs.build_corridor_attention(board)
-    } else {
-        CorridorAttention::default()
-    };
-    let our_dist = bfs
-        .shortest_distance(board, board.side())
-        .unwrap_or(DIST_PENALTY);
     let reachable = bfs.both_reachable_mask(board);
     let gap_zone = if allow_walls {
         gap_play_zone_mask(reachable)
@@ -550,15 +527,25 @@ pub fn collect_search_moves(
                 if !allow_walls {
                     continue;
                 }
-                if !wall_should_search(
+                // Quiescence (tactical_only): walls are "noisy" only when they
+                // actually lengthen the opponent's shortest path — the Quoridor
+                // analog of a capture. Quiet walls must stand pat, not extend.
+                if tactical_only {
+                    // Cheap witness-path gate first; BFS only for the few that touch it.
+                    if !wall_intersects_path(mv, opp_path, opp_path_len)
+                        || opp_path_gain(board, mv, opp_dist, bfs) <= 0
+                    {
+                        continue;
+                    }
+                } else if !wall_should_search(
                     mv,
-                    &cat,
+                    cat,
                     reachable,
                     gap_zone,
                     board,
                     our_dist,
                     opp_dist,
-                    &opp_path,
+                    opp_path,
                     opp_path_len,
                     bfs,
                 ) {
@@ -570,17 +557,12 @@ pub fn collect_search_moves(
         }
     }
 
+    // Main search must never be left without moves — fall back to full legality.
+    // Quiescence (tactical_only) returns 0 instead: a position with no noisy
+    // moves is quiet by definition and the caller stands pat on static eval.
     if n == 0 && !tactical_only {
         buf[..full].copy_from_slice(&scratch[..full]);
         return full;
-    }
-    if n == 0 && tactical_only {
-        for i in 0..full {
-            if matches!(scratch[i], Move::Pawn { .. }) {
-                buf[n] = scratch[i];
-                n += 1;
-            }
-        }
     }
     n
 }
@@ -608,6 +590,8 @@ pub fn move_order_score(
     book_hint: Option<BookHint>,
     our_dist: u8,
     opp_dist: u8,
+    opp_path: &[u8],
+    opp_path_len: usize,
     bfs: &mut BfsScratch,
     cat: &CorridorAttention,
 ) -> i32 {
@@ -621,12 +605,18 @@ pub fn move_order_score(
             return 9_000 + i32::from(hint.priority) + bias;
         }
     }
-    let gain = move_immediate_gain(board, mv, our_dist, opp_dist, bfs);
     let behind = our_dist > opp_dist;
     let race_pressure = behind || opp_dist <= 4;
 
     if matches!(mv, Move::Wall { .. }) {
-        let net = wall_net_race(board, mv, our_dist, opp_dist, bfs);
+        // Witness-path gate: a wall off the opponent's current shortest path
+        // has opp_gain = 0, so net ≤ 0 < min_net — score it without any BFS.
+        // Only walls that actually cut the path pay one make + two BFS.
+        if !wall_intersects_path(mv, opp_path, opp_path_len) {
+            return -20_000 + move_corridor_attention(board, mv, cat);
+        }
+        let (opp_gain, our_loss) = wall_race_swing(board, mv, our_dist, opp_dist, bfs);
+        let net = opp_gain - our_loss;
         let min_net = min_wall_net_race(our_dist, opp_dist);
         if net < min_net {
             return -20_000 + move_corridor_attention(board, mv, cat);
@@ -634,20 +624,17 @@ pub fn move_order_score(
         if race_pressure {
             return 15_000 + net * 120 + move_corridor_attention(board, mv, cat) / 8;
         }
-        if net >= min_net {
-            return 12_000 + net * 80;
-        }
+        return 12_000 + net * 80;
     }
 
-    if our_dist >= opp_dist {
-        if matches!(mv, Move::Pawn { .. }) && gain > 0 {
-            // Lateral / slow sprint while clearly losing the race is not a tactic.
-            let closes_gap = gain >= 2 || our_dist.saturating_sub(1) <= opp_dist;
-            if behind && !closes_gap {
-                return 800 + gain * 40;
-            }
-            return 14_000 + gain * 100;
+    let gain = our_path_gain(board, mv, our_dist, bfs);
+    if our_dist >= opp_dist && gain > 0 {
+        // Lateral / slow sprint while clearly losing the race is not a tactic.
+        let closes_gap = gain >= 2 || our_dist.saturating_sub(1) <= opp_dist;
+        if behind && !closes_gap {
+            return 800 + gain * 40;
         }
+        return 14_000 + gain * 100;
     }
     if gain > 0 {
         1000 + gain * 100
@@ -656,6 +643,7 @@ pub fn move_order_score(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn order_moves(
     board: &mut Board,
     moves: &mut [Move],
@@ -665,12 +653,23 @@ pub fn order_moves(
     scores: &mut [i32; MAX_LEGAL_MOVES],
     our_dist: u8,
     opp_dist: u8,
+    opp_path: &[u8; 81],
+    opp_path_len: usize,
     bfs: &mut BfsScratch,
     cat: &CorridorAttention,
 ) {
     for i in 0..n {
         scores[i] = move_order_score(
-            board, moves[i], tt_best, book_hint, our_dist, opp_dist, bfs, cat,
+            board,
+            moves[i],
+            tt_best,
+            book_hint,
+            our_dist,
+            opp_dist,
+            opp_path,
+            opp_path_len,
+            bfs,
+            cat,
         );
     }
     let mut order: [usize; MAX_LEGAL_MOVES] = core::array::from_fn(|i| i);
@@ -850,9 +849,11 @@ mod tests {
         let cat = bfs.build_corridor_attention(&board);
         let reachable = bfs.both_reachable_mask(&board);
         let gap_zone = gap_play_zone_mask(reachable);
-        assert!(
-            gap_zone != 0,
-            "T mouth should produce a non-empty gap play zone"
+        // No square is actually sealed here — gap zone must be empty. (The old
+        // 0..=9 bounds bug made every board edge a phantom mouth.)
+        assert_eq!(
+            gap_zone, 0,
+            "no sealed territory → gap play zone must be empty"
         );
         let our_dist = bfs
             .shortest_distance(&board, Player::One)
@@ -1102,9 +1103,22 @@ mod tests {
         let opp = bfs
             .shortest_distance(&board, Player::Two)
             .unwrap_or(DIST_PENALTY);
-        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-        let n = collect_search_moves(&mut board, &mut buf, &mut bfs, false, true);
         let cat = bfs.build_corridor_attention(&board);
+        let mut opp_path = [0u8; 81];
+        let opp_path_len = get_shortest_path(&board, Player::Two, &mut bfs, &mut opp_path);
+        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let n = collect_search_moves(
+            &mut board,
+            &mut buf,
+            &mut bfs,
+            &cat,
+            &opp_path,
+            opp_path_len,
+            our,
+            opp,
+            false,
+            true,
+        );
         let mut scores = [0i32; MAX_LEGAL_MOVES];
         order_moves(
             &mut board,
@@ -1115,6 +1129,8 @@ mod tests {
             &mut scores,
             our,
             opp,
+            &opp_path,
+            opp_path_len,
             &mut bfs,
             &cat,
         );
@@ -1152,8 +1168,22 @@ mod tests {
             .unwrap_or(DIST_PENALTY);
         assert!(our > opp, "white should be behind in race, W{our} B{opp}");
 
+        let cat = bfs.build_corridor_attention(&board);
+        let mut opp_path = [0u8; 81];
+        let opp_path_len = get_shortest_path(&board, Player::Two, &mut bfs, &mut opp_path);
         let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-        let n = collect_search_moves(&mut board, &mut buf, &mut bfs, false, true);
+        let n = collect_search_moves(
+            &mut board,
+            &mut buf,
+            &mut bfs,
+            &cat,
+            &opp_path,
+            opp_path_len,
+            our,
+            opp,
+            false,
+            true,
+        );
         let walls: Vec<String> = buf[..n]
             .iter()
             .filter(|mv| matches!(mv, Move::Wall { .. }))

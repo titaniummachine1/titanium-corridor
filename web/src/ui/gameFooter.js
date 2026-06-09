@@ -1,6 +1,14 @@
 import { formatCoordinate, toAlgebraic } from '../lib/gameLogic.js';
 import { encodeReplayFromActions } from '../lib/replayCode.js';
 import { playerColorName } from '../lib/playerColors.js';
+import { formatVisits, formatWallClock, TIME_TO_MOVE_PRESETS, STRENGTH_LEVEL_PRESETS } from '../lib/timeControl.js';
+
+const SETTINGS_FIELD_LABELS = {
+  wallClockSeconds: 'wall clock',
+  visitsBudget: 'visits cap',
+  timeToMove: 'time preset',
+  strength: 'strength',
+};
 
 export function renderGameFooter(container, state) {
   const {
@@ -105,6 +113,18 @@ function isTitaniumThinkEntry(entry) {
 }
 
 /** Top root candidates for copied reports: `roots: d5=-991 W6/B5 g0; h3h=-803 W5/B6 g2` */
+function formatThinkDuration(entry) {
+  const ms = entry.thinkMs ?? entry.elapsedMs ?? entry.time;
+  if (ms == null || !Number.isFinite(Number(ms))) {
+    return '';
+  }
+  const n = Number(ms);
+  if (n < 1000) {
+    return ` ${Math.round(n)}ms`;
+  }
+  return ` ${(n / 1000).toFixed(2)}s`;
+}
+
 function formatRootMovesSummary(rootMoves) {
   if (!rootMoves?.length) {
     return '';
@@ -117,20 +137,61 @@ function formatRootMovesSummary(rootMoves) {
   return ` roots: ${roots}`;
 }
 
+function formatSettingsValue(field, value) {
+  if (value == null) {
+    return '?';
+  }
+  if (field === 'wallClockSeconds') {
+    return formatWallClock(Number(value));
+  }
+  if (field === 'visitsBudget') {
+    return formatVisits(Number(value));
+  }
+  if (field === 'timeToMove') {
+    return TIME_TO_MOVE_PRESETS.find((p) => p.id === value)?.label ?? String(value);
+  }
+  if (field === 'strength') {
+    return STRENGTH_LEVEL_PRESETS.find((p) => p.id === value)?.label ?? String(value);
+  }
+  return String(value);
+}
+
+function formatSettingsChangelog(changelog) {
+  if (!changelog?.length) {
+    return '';
+  }
+  return changelog
+    .map(
+      (e) =>
+        `  ply ${e.ply} · ${e.seat} · ${e.player}: ${SETTINGS_FIELD_LABELS[e.field] ?? e.field} ${formatSettingsValue(e.field, e.from)} → ${formatSettingsValue(e.field, e.to)}`,
+    )
+    .join('\n');
+}
+
 function formatThinkEntry(entry) {
   const who =
     entry.ply % 2 === 1 ? 'White' : 'Black';
   const engine = entry.engine ? ` [${entry.engine}]` : '';
+  const budget = entry.budget ? ` budget=${entry.budget}` : '';
   const dist =
     entry.whiteDist != null && entry.blackDist != null
       ? ` W${entry.whiteDist} B${entry.blackDist}`
       : '';
 
-  const isMcts = entry.stoppedBy === 'mcts' || entry.stoppedBy === 'time' ||
-    entry.stoppedBy === 'visits' || entry.stoppedBy === 'bridge' || entry.stoppedBy === 'bridge-visits' ||
-    entry.stoppedBy === 'forced' || entry.stoppedBy === 'win-in-1' || entry.stoppedBy === 'opening';
+  const isMcts =
+    !isTitaniumThinkEntry(entry) &&
+    entry.stoppedBy !== 'minimax' &&
+    (entry.stoppedBy === 'mcts' ||
+      entry.stoppedBy === 'time' ||
+      entry.stoppedBy === 'visits' ||
+      entry.stoppedBy === 'bridge' ||
+      entry.stoppedBy === 'bridge-visits' ||
+      entry.stoppedBy === 'forced' ||
+      entry.stoppedBy === 'win-in-1' ||
+      entry.stoppedBy === 'opening');
 
   const sims = entry.nodes > 0 ? ` ${entry.nodes.toLocaleString()}nodes` : '';
+  const think = formatThinkDuration(entry);
   const wr = entry.rootWinRate != null && isMcts
     ? ` wr=${(entry.rootWinRate * 100).toFixed(0)}%`
     : '';
@@ -139,7 +200,7 @@ function formatThinkEntry(entry) {
 
   if (isMcts && !entry.depthLog?.length) {
     const stopped = entry.stoppedBy ? ` (${entry.stoppedBy})` : '';
-    return `ply${entry.ply} ${who}${engine} ${entry.move}${dist}${sims}${wr}${stopped}${rootCands}`;
+    return `ply${entry.ply} ${who}${engine} ${entry.move}${budget}${dist}${sims}${think}${wr}${stopped}${rootCands}`;
   }
 
   const depth = entry.searchDepth ? ` d${entry.searchDepth}` : '';
@@ -148,7 +209,7 @@ function formatThinkEntry(entry) {
       ? ' ' + formatDepthLog(entry.depthLog)
       : '';
 
-  return `ply${entry.ply} ${who}${engine} ${entry.move}${dist}${depth}${sims}${dlog}${rootCands}`;
+  return `ply${entry.ply} ${who}${engine} ${entry.move}${budget}${dist}${depth}${sims}${think}${dlog}${rootCands}`;
 }
 
 function engineLabelForSlot(state, playerNum) {
@@ -218,6 +279,8 @@ function buildGameHeader(state) {
     eval: evalState,
     playReplayCode,
     timeBudgetHint,
+    initialBudgetHint,
+    settingsChangelog,
     moveThinkLog,
   } = state;
 
@@ -248,8 +311,18 @@ function buildGameHeader(state) {
     `White: ${engineLabelForSlot(state, 1)}`,
     `Black: ${engineLabelForSlot(state, 2)}`,
   );
+  if (initialBudgetHint && initialBudgetHint !== timeBudgetHint) {
+    lines.push(`Budget at start: ${initialBudgetHint}`);
+  }
   if (timeBudgetHint) {
-    lines.push(`Budget: ${timeBudgetHint}`);
+    lines.push(`Budget (final): ${timeBudgetHint}`);
+  } else if (initialBudgetHint) {
+    lines.push(`Budget: ${initialBudgetHint}`);
+  }
+  const changelogText = formatSettingsChangelog(settingsChangelog);
+  if (changelogText) {
+    lines.push('Settings changes during game:');
+    lines.push(changelogText);
   }
   lines.push('');
 

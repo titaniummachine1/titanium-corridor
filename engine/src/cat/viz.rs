@@ -2,7 +2,9 @@
 
 use std::collections::HashSet;
 
-use crate::cat::constants::{CAT_COLD_CM, CAT_HOT_CM, DIST_PENALTY};
+use crate::cat::constants::{
+    BOTTLENECK_BONUS_CM, CAT_COLD_CM, CAT_CORRIDOR_CM, CAT_HOT_CM, DIST_PENALTY,
+};
 use crate::cat::prune::{collect_search_moves, gap_play_zone_mask, wall_completely_skipped};
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
@@ -17,8 +19,31 @@ pub fn cat_snapshot_json(board: &mut Board) -> String {
     let mut legal = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
     let legal_n = generate_legal_moves_slice(board, &mut legal, &mut bfs);
 
+    let mut opp_path = [0u8; 81];
+    let opp_path_len = crate::cat::prune::get_shortest_path(
+        board,
+        board.side().opposite(),
+        &mut bfs,
+        &mut opp_path,
+    );
+    let opp_dist =
+        crate::cat::prune::path_distance(board.side().opposite(), &opp_path, opp_path_len);
+    let our_dist_stm = bfs
+        .shortest_distance(board, board.side())
+        .unwrap_or(DIST_PENALTY);
     let mut search = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-    let search_n = collect_search_moves(board, &mut search, &mut bfs, false, true);
+    let search_n = collect_search_moves(
+        board,
+        &mut search,
+        &mut bfs,
+        &cat,
+        &opp_path,
+        opp_path_len,
+        our_dist_stm,
+        opp_dist,
+        false,
+        true,
+    );
 
     let searchable: HashSet<String> = search[..search_n]
         .iter()
@@ -31,9 +56,9 @@ pub fn cat_snapshot_json(board: &mut Board) -> String {
     let reachable = bfs.both_reachable_mask(board);
     let gap_zone = gap_play_zone_mask(reachable);
 
-    let square_parts: Vec<String> = (0u8..9)
-        .flat_map(|row| (0u8..9).map(move |col| cat.square_heat(row, col).to_string()))
-        .collect();
+    // Board overlay: per-player max (not summed search heat — that floods mid-game).
+    let display_squares = crate::cat::build::build_corridor_display_squares(&mut bfs, board);
+    let square_parts: Vec<String> = display_squares.iter().map(|h| h.to_string()).collect();
 
     let reachable_parts: Vec<&str> = (0u8..81)
         .map(|sq| {
@@ -75,13 +100,6 @@ pub fn cat_snapshot_json(board: &mut Board) -> String {
 
     let skipped_squares = reachable_parts.iter().filter(|&&b| b == "0").count();
 
-    let max_cm = square_parts
-        .iter()
-        .filter_map(|s| s.parse::<u16>().ok())
-        .max()
-        .unwrap_or(400)
-        .max(1);
-
     format!(
         "{{\"squares\":[{}],\"reachable\":[{}],\"walls\":[{}],\"whiteDist\":{},\"blackDist\":{},\"skippedSquares\":{},\"hotCm\":{},\"coldCm\":{},\"maxCm\":{}}}",
         square_parts.join(","),
@@ -92,6 +110,65 @@ pub fn cat_snapshot_json(board: &mut Board) -> String {
         skipped_squares,
         CAT_HOT_CM,
         CAT_COLD_CM,
-        max_cm,
+        // Display squares are per-player max (not the summed search table), so the
+        // color ceiling is one player's full corridor + bottleneck bonus.
+        CAT_CORRIDOR_CM + BOTTLENECK_BONUS_CM,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::grid::square_index;
+
+    #[test]
+    fn snapshot_uses_sparse_corridor_not_full_board_flood() {
+        let mut board = Board::new();
+        board.apply_algebraic("e2");
+        board.apply_algebraic("e8");
+        board.apply_algebraic("e3");
+        let json = cat_snapshot_json(&mut board);
+        let values = parse_snapshot_squares(&json);
+        let warm = values.iter().filter(|&&v| v >= CAT_COLD_CM).count();
+        assert!(
+            warm < 45,
+            "corridor CAT should not flood the board, got {warm} warm squares"
+        );
+        let e3 = values[square_index(2, 4) as usize];
+        let a1 = values[square_index(0, 0) as usize];
+        assert!(e3 > a1, "pawn corridor hotter than far corner");
+        assert!(a1 < CAT_COLD_CM, "far corner stays cold fringe");
+    }
+
+    #[test]
+    fn snapshot_midgame_corridor_stays_focused() {
+        let moves = [
+            "e2", "e8", "e3", "e7", "d7v", "e4", "d8v", "f3", "e5", "e6", "b5v",
+        ];
+        let mut board = Board::new();
+        for mv in moves {
+            board.apply_algebraic(mv);
+        }
+        let json = cat_snapshot_json(&mut board);
+        let values = parse_snapshot_squares(&json);
+        let warm = values.iter().filter(|&&v| v >= CAT_COLD_CM).count();
+        assert!(
+            warm < 35,
+            "mid-game CAT overlay should stay corridor-focused, got {warm} warm squares"
+        );
+        let e6 = values[square_index(5, 4) as usize];
+        let a1 = values[square_index(0, 0) as usize];
+        assert!(e6 >= CAT_COLD_CM, "white pawn corridor visible");
+        assert!(a1 < CAT_COLD_CM, "far corner cold");
+    }
+
+    fn parse_snapshot_squares(json: &str) -> Vec<u16> {
+        let edge = "\"squares\":[";
+        let start = json.find(edge).unwrap() + edge.len();
+        let end = json.find("],\"reachable\"").unwrap();
+        json[start..end]
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
 }

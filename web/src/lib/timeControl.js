@@ -180,8 +180,8 @@ export function describePlayerAiSettings(playerType, aiSettings, engineConfigs) 
     const cap = formatVisitsCap(aiSettings.visitsBudget ?? LOCAL_VISITS_RANGE.default);
     if (isTitaniumEngine(playerType, engineConfigs)) {
       const modeLabel =
-        config.engineMode === 'minimax' ? 'Hybrid MCTS opening→AB' : 'Rust MCTS only';
-      const budgetLabel = config.engineMode === 'minimax' ? 'nodes' : 'sims';
+        config.engineMode === 'minimax' ? 'Titanium αβ + CAT' : 'Titanium αβ + CAT';
+      const budgetLabel = 'nodes';
       return `${config.name}: ${time} · ${cap} ${budgetLabel} · ${modeLabel}`;
     }
     return `${config.name}: ${time} · ${cap}`;

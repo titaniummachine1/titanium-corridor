@@ -31,6 +31,27 @@ function deepestDepthEntry(depthLog) {
   return depthLog.reduce((best, entry) => (entry.depth > (best?.depth ?? 0) ? entry : best));
 }
 
+function scoreFromDepthLog(depthLog, rootScore) {
+  const deep = deepestDepthEntry(depthLog);
+  if (deep?.score != null && Number.isFinite(Number(deep.score))) {
+    return deep.score;
+  }
+  return rootScore ?? null;
+}
+
+function resolveThinkMs(info, thinkStartedAt) {
+  if (info?.elapsedMs != null && Number.isFinite(Number(info.elapsedMs))) {
+    return Math.round(Number(info.elapsedMs));
+  }
+  if (info?.time != null && Number.isFinite(Number(info.time))) {
+    return Math.round(Number(info.time));
+  }
+  if (thinkStartedAt != null) {
+    return Math.round(performance.now() - thinkStartedAt);
+  }
+  return null;
+}
+
 function buildThinkSeatSnapshot({
   engine,
   live = false,
@@ -46,6 +67,7 @@ function buildThinkSeatSnapshot({
   rootWinRate,
   stoppedBy,
   rootMoves,
+  thinkMs,
 }) {
   const deep = deepestDepthEntry(depthLog);
   return {
@@ -59,10 +81,12 @@ function buildThinkSeatSnapshot({
     depth: deep?.depth ?? searchDepth ?? null,
     pv: deep?.pv ?? '',
     nodes: nodes ?? simulations ?? 0,
+    simulations: simulations ?? nodes ?? 0,
     rootWinRate,
     stoppedBy: stoppedBy ?? (live ? 'searching' : '?'),
     rootMoves: rootMoves ? [...rootMoves] : [],
     depthLog: depthLog ? [...depthLog] : [],
+    thinkMs: thinkMs ?? null,
   };
 }
 import {
@@ -77,6 +101,7 @@ import {
   isRemoteEngine,
   isTitaniumEngine,
 } from '../lib/timeControl.js';
+import { playerColorName } from '../lib/playerColors.js';
 import { ponderCandidateSlots } from '../lib/enginePonder.js';
 
 function isSavedSettingsValid(playerType, saved, engineConfigs) {
@@ -130,14 +155,24 @@ export class AppController {
     this.engineErrors = {};
     this.searchInfo = {};
     this.moveThinkLog = [];
+    this.settingsChangelog = [];
+    this.initialBudgetHint = null;
     this.lastThinkBySeat = [null, null];
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     this.aiThinking = false;
     this.liveSearch = null;
     this.thinkingPlayerType = null;
     this._moveRequestSeq = 0;
+    this._thinkAiSettings = null;
 
     this.session.subscribe(() => this.onSessionChange());
+    // First paint: Titanium vs Gorisanson AI should not always be White.
+    this.maybeRandomizeTitaniumGorisansonSeats();
+    this.initialBudgetHint = describeTimeBudget(
+      this.settings.players,
+      this.settings.playerAiSettings,
+      this.engineConfigs,
+    );
   }
 
   getState() {
@@ -182,6 +217,8 @@ export class AppController {
         ? this.searchInfo[this.thinkingPlayerType]
         : null,
       moveThinkLog: this.moveThinkLog,
+      settingsChangelog: this.settingsChangelog,
+      initialBudgetHint: this.initialBudgetHint,
       lastThinkBySeat: this.lastThinkBySeat,
       uiMode: this.settings.uiMode,
       catViz: this.catViz,
@@ -268,6 +305,21 @@ export class AppController {
     this.settings.playerAiSettings[index] = { ...aiSettings };
   }
 
+  recordSettingsChange(playerNum, field, from, to) {
+    if (this.settings.uiMode !== 'play' || this.session.winner || from === to) {
+      return;
+    }
+    const seat = playerColorName(playerNum);
+    this.settingsChangelog.push({
+      ply: this.session.actions.length,
+      seat,
+      player: this.engineLabel(this.settings.players[playerNum - 1]),
+      field,
+      from,
+      to,
+    });
+  }
+
   getPlayerAiSettingsUiForSlot(playerNum) {
     const index = playerNum - 1;
     const playerType = this.settings.players[index];
@@ -295,6 +347,7 @@ export class AppController {
         step: 1,
       },
       hint: describePlayerAiSettings(playerType, current, this.engineConfigs),
+      engineName: this.engineLabel(playerType),
     };
   }
 
@@ -309,9 +362,11 @@ export class AppController {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
+    const next = Number(strengthLevel);
+    this.recordSettingsChange(playerNum, 'strength', current.strengthLevel, next);
     this.rememberPlayerAiSettings(playerNum, {
       ...current,
-      strengthLevel: Number(strengthLevel),
+      strengthLevel: next,
     });
     if (!silent) {
       this.onChange?.();
@@ -325,9 +380,11 @@ export class AppController {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
+    const next = Number(timeToMove);
+    this.recordSettingsChange(playerNum, 'timeToMove', current.timeToMove, next);
     this.rememberPlayerAiSettings(playerNum, {
       ...current,
-      timeToMove: Number(timeToMove),
+      timeToMove: next,
     });
     if (!silent) {
       this.onChange?.();
@@ -341,9 +398,11 @@ export class AppController {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
+    const next = Number(seconds);
+    this.recordSettingsChange(playerNum, 'wallClockSeconds', current.wallClockSeconds, next);
     this.rememberPlayerAiSettings(playerNum, {
       ...current,
-      wallClockSeconds: Number(seconds),
+      wallClockSeconds: next,
     });
     if (!silent) {
       this.onChange?.();
@@ -357,9 +416,11 @@ export class AppController {
       return;
     }
     const current = this.settings.playerAiSettings[index] ?? {};
+    const next = clampVisits(visits);
+    this.recordSettingsChange(playerNum, 'visitsBudget', current.visitsBudget, next);
     this.rememberPlayerAiSettings(playerNum, {
       ...current,
-      visitsBudget: clampVisits(visits),
+      visitsBudget: next,
     });
     if (!silent) {
       this.onChange?.();
@@ -430,13 +491,45 @@ export class AppController {
     this.refreshCatViz();
   }
 
+  /** Titanium vs Gorisanson AI-vs-AI: 50/50 White/Black on load and each new game. */
+  maybeRandomizeTitaniumGorisansonSeats() {
+    const { players, playerAiSettings, playerAiSettingsMemory } = this.settings;
+    if (players.includes(PlayerType.Human)) {
+      return;
+    }
+    const titaniumSeat = (i) => isTitaniumEngine(players[i], this.engineConfigs);
+    const gorisansonSeat = (i) => players[i] === PlayerType.GorisansonMCTS;
+    const isTiGo =
+      (titaniumSeat(0) && gorisansonSeat(1)) || (gorisansonSeat(0) && titaniumSeat(1));
+    if (!isTiGo) {
+      return;
+    }
+    // Pick Titanium on White or Black; Gorisanson takes the other seat.
+    if (Math.random() >= 0.5) {
+      return;
+    }
+    this.settings.players = [players[1], players[0]];
+    this.settings.playerAiSettings = [playerAiSettings[1], playerAiSettings[0]];
+    this.settings.playerAiSettingsMemory = [
+      playerAiSettingsMemory[1],
+      playerAiSettingsMemory[0],
+    ];
+  }
+
   newGame() {
+    this.maybeRandomizeTitaniumGorisansonSeats();
     this._moveRequestSeq += 1;
     this.aiThinking = false;
     this.liveSearch = null;
     this.engineErrors = {};
     this.replay = null;
     this.moveThinkLog = [];
+    this.settingsChangelog = [];
+    this.initialBudgetHint = describeTimeBudget(
+      this.settings.players,
+      this.settings.playerAiSettings,
+      this.engineConfigs,
+    );
     this.lastThinkBySeat = [null, null];
     this.catHintDismissed = false;
     this.showCatHint = false;
@@ -704,25 +797,34 @@ export class AppController {
       };
       engine.onInfo = (info) => {
         const prev = this.searchInfo[playerType] ?? {};
-        const depthLog = info.depthLog?.length
-          ? mergeDepthLogs(prev.depthLog, info.depthLog)
-          : prev.depthLog;
+        const depthLog = info.thinking
+          ? info.depthLog?.length
+            ? mergeDepthLogs(prev.depthLog, info.depthLog)
+            : prev.depthLog
+          : info.depthLog ?? [];
         this.searchInfo[playerType] = {
           ...prev,
           ...info,
-          ...(depthLog?.length ? { depthLog } : {}),
+          depthLog,
         };
         if (info.thinking) {
           const liveDepthLog = depthLog?.length
             ? depthLog
             : mergeDepthLogs(this.liveSearch?.depthLog, info.depthLog);
+          const liveRootScore = scoreFromDepthLog(
+            liveDepthLog,
+            info.rootScore ?? this.liveSearch?.rootScore,
+          );
           this.liveSearch = {
             playerType,
             playerLabel: this.engineLabel(playerType),
             simulations: info.simulations ?? this.liveSearch?.simulations,
             nodes: info.nodes ?? this.liveSearch?.nodes,
             progress: info.progress,
-            mode: info.mode ?? info.stoppedBy ?? 'mcts',
+            mode:
+              info.mode ??
+              info.stoppedBy ??
+              (isTitaniumEngine(playerType, this.engineConfigs) ? 'minimax' : 'mcts'),
             searchDepth: info.searchDepth ?? this.liveSearch?.searchDepth,
             depthLog: liveDepthLog,
             rootWinRate:
@@ -730,7 +832,7 @@ export class AppController {
             whiteDist: info.whiteDist ?? this.liveSearch?.whiteDist,
             blackDist: info.blackDist ?? this.liveSearch?.blackDist,
             rootMoves: info.rootMoves ?? this.liveSearch?.rootMoves,
-            rootScore: info.rootScore ?? this.liveSearch?.rootScore,
+            rootScore: liveRootScore,
           };
           const seat = this.seatIndexForPlayerType(playerType);
           this.snapshotThinkSeat(seat, {
@@ -749,7 +851,7 @@ export class AppController {
             engine: this.liveSearch.playerLabel,
           });
           const now = performance.now();
-          if (now - this._liveUpdateLastMs >= 120) {
+          if (now - this._liveUpdateLastMs >= 50) {
             this._liveUpdateLastMs = now;
             (this.onLiveUpdate ?? this.onChange)?.();
           }
@@ -898,6 +1000,8 @@ export class AppController {
 
     this.aiThinking = true;
     this.thinkingPlayerType = playerType;
+    this._thinkStartedAt = performance.now();
+    this.searchInfo[playerType] = { depthLog: [] };
     const seat = this.seatIndexForPlayerType(playerType);
     const prevThink = seat >= 0 ? this.lastThinkBySeat[seat] : null;
     this.snapshotThinkSeat(seat, {
@@ -961,8 +1065,16 @@ export class AppController {
       if (applied) {
         const plyNum = this.session.actions.length;
         const si = this.searchInfo[playerType] ?? {};
+        const thinkMs = resolveThinkMs(si, this._thinkStartedAt);
+        this._thinkStartedAt = null;
         const moveLabel = this.session.actionToLabel(action);
         const seat = this.seatIndexForPlayerType(playerType);
+        const budgetHint = describePlayerAiSettings(
+          playerType,
+          this._thinkAiSettings ?? this.settings.playerAiSettings[seat],
+          this.engineConfigs,
+        );
+        this._thinkAiSettings = null;
         this.snapshotThinkSeat(seat, {
           live: false,
           move: moveLabel,
@@ -978,20 +1090,23 @@ export class AppController {
           stoppedBy: si.stoppedBy ?? si.mode ?? '?',
           rootMoves: si.rootMoves,
           engine: this.engineLabel(playerType),
+          thinkMs,
         });
         this.moveThinkLog.push({
           ply: plyNum,
           move: moveLabel,
           engine: this.engineLabel(playerType),
+          budget: budgetHint,
           stoppedBy: si.stoppedBy ?? si.mode ?? '?',
           nodes: si.nodes ?? si.simulations ?? 0,
           searchDepth: si.searchDepth,
           whiteDist: si.whiteDist,
           blackDist: si.blackDist,
-          rootScore: si.rootScore,
+          rootScore: scoreFromDepthLog(si.depthLog, si.rootScore),
           rootWinRate: si.rootWinRate,
           depthLog: si.depthLog ? [...si.depthLog] : [],
           rootMoves: si.rootMoves ? [...si.rootMoves] : [],
+          thinkMs,
         });
       }
       if (this.session.winner) {
@@ -1051,6 +1166,7 @@ export class AppController {
     }
     const moveHistory = this.session.actions;
     const isFreshGame = moveHistory.length === 0;
+    this._thinkAiSettings = { ...aiSettings };
 
     engine.requestMove({
       aiSettings,

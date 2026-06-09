@@ -16,6 +16,9 @@ pub struct BfsScratch {
     queue: [u8; 81],
     dist_from_pawn: [u8; 81],
     dist_to_goal: [u8; 81],
+    /// Cached `DirMasks` for the current board hash — one build per movegen node.
+    masks_hash: u64,
+    masks: DirMasks,
 }
 
 impl Default for BfsScratch {
@@ -31,7 +34,25 @@ impl BfsScratch {
             queue: [0; 81],
             dist_from_pawn: [0; 81],
             dist_to_goal: [0; 81],
+            masks_hash: 0,
+            masks: DirMasks::default(),
         }
+    }
+
+    /// Direction masks for the current position — rebuilt only when `board.hash` changes.
+    #[inline]
+    pub fn dir_masks(&mut self, board: &Board) -> DirMasks {
+        if self.masks_hash != board.hash {
+            self.masks_hash = board.hash;
+            self.masks = DirMasks::from_board(board);
+        }
+        self.masks
+    }
+
+    /// Call after in-place wall trials — `board.hash` may match a stale cache entry.
+    #[inline]
+    pub fn invalidate_dir_masks(&mut self) {
+        self.masks_hash = !0;
     }
 
     pub(crate) fn dist_scratch_mut(&mut self) -> (&mut [u8; 81], &mut [u8; 81]) {
@@ -48,7 +69,7 @@ impl BfsScratch {
 
     #[inline]
     pub fn can_reach_goal(&mut self, board: &Board, player: Player) -> bool {
-        let masks = DirMasks::from_board(board);
+        let masks = self.dir_masks(board);
         let (sr, sc) = board.pawn(player);
         let start = square_index(sr, sc);
         flood_to_goal(start, masks, goal_square_mask(player)).0
@@ -56,7 +77,7 @@ impl BfsScratch {
 
     #[inline]
     pub fn both_players_reach_goals(&mut self, board: &Board) -> bool {
-        let masks = DirMasks::from_board(board);
+        let masks = self.dir_masks(board);
         let (r1, c1) = board.pawn(Player::One);
         let start1 = square_index(r1, c1);
         let goal1 = goal_square_mask(Player::One);
@@ -78,7 +99,7 @@ impl BfsScratch {
     }
 
     pub fn fill_reachable(&mut self, board: &Board, player: Player, mask: &mut u128) {
-        let masks = DirMasks::from_board(board);
+        let masks = self.dir_masks(board);
         let (sr, sc) = board.pawn(player);
         let start = square_index(sr, sc);
         *mask |= pack_flood_mask(flood_fill_flood_bits(start, masks));
@@ -92,7 +113,7 @@ impl BfsScratch {
     }
 
     pub fn shortest_distance(&mut self, board: &Board, player: Player) -> Option<u8> {
-        let masks = DirMasks::from_board(board);
+        let masks = self.dir_masks(board);
         let (sr, sc) = board.pawn(player);
         let start = square_index(sr, sc);
         let goal_mask = goal_square_mask(player);

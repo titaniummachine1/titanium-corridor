@@ -210,7 +210,13 @@ function renderBoardCell({
     const reachable =
       catViz?.reachable == null ? true : catViz.reachable[sqIdx] === true;
     const skipped = catViz && isSquareSkipped(reachable);
-    const overlay = catViz ? catSquareOverlay(heat, reachable, catViz.maxCm) : null;
+    const overlay = catViz
+      ? catSquareOverlay(heat, reachable, {
+        coldCm: catViz.coldCm,
+        hotCm: catViz.hotCm,
+        maxCm: catViz.maxCm,
+      })
+      : null;
 
     const square = document.createElement('div');
     square.className = 'board-cell__square';
@@ -227,15 +233,36 @@ function renderBoardCell({
         tint.style.backgroundColor = overlay.fill;
         square.appendChild(tint);
       }
+      // Raw engine heat in centi-squares — exactly what search sees, no scaling.
+      if (!skipped && heat > 0) {
+        const cold = catViz.coldCm ?? 60;
+        const hot = catViz.hotCm ?? 160;
+        const val = document.createElement('span');
+        val.className =
+          'board-cell__cat-val ' +
+          (heat >= hot
+            ? 'board-cell__cat-val--hot'
+            : heat >= cold
+              ? 'board-cell__cat-val--warm'
+              : 'board-cell__cat-val--cold');
+        val.textContent = String(heat);
+        square.appendChild(val);
+      }
     }
     square.dataset.action = key;
     square.dataset.isValid = String(isValid);
     if (catViz) {
+      const cold = catViz.coldCm ?? 60;
+      const hot = catViz.hotCm ?? 160;
       square.title = skipped
         ? 'Skipped — unreachable void'
-        : heat > 0
-          ? `CAT ${heat} cm`
-          : 'Cold — LMR depth only';
+        : heat >= hot
+          ? `CAT hot ${heat} cm (tactical / no LMR)`
+          : heat >= cold
+            ? `CAT warm ${heat} cm (corridor)`
+            : heat > 0
+              ? `CAT cold ${heat} cm (LMR fringe)`
+              : 'Off corridor — cold';
     }
 
     if (pawnPlayer >= 0) {
@@ -287,7 +314,14 @@ function renderBoardCell({
           ? 'board-cell__cat-wall-hint--h'
           : 'board-cell__cat-wall-hint--v',
       );
-      hint.style.setProperty('--cat-wall-color', catWallOutlineColor(wallCat.heat, catViz.maxCm));
+      hint.style.setProperty(
+        '--cat-wall-color',
+        catWallOutlineColor(wallCat.heat, {
+          coldCm: catViz.coldCm,
+          hotCm: catViz.hotCm,
+          maxCm: catViz.maxCm,
+        }),
+      );
       hint.title = `CAT ${wallCat.heat} cm`;
       cell.appendChild(hint);
     }

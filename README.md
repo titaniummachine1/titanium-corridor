@@ -53,6 +53,17 @@ node benchmark/titanium_vs_ishtar.mjs --games 1
 3. **Hybrid** — Time-split tactical + rollout phases
 4. **Bench** — vs MCTS JS, vs Ishtar@Short (external exam)
 
+## Documentation
+
+| Doc                                                                    | Purpose                                                       |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------- |
+| [docs/STATE.md](docs/STATE.md)                                         | **Session handoff** — current status, what broke, what's next |
+| [docs/video/README.md](docs/video/README.md)                           | Video episode index + git checkpoints                         |
+| [docs/video/11-search-hardening.md](docs/video/11-search-hardening.md) | Latest arc: negamax bugs, CAT gaps, qsearch, CAT UI           |
+| [docs/video/BUG-DIARY.md](docs/video/BUG-DIARY.md)                     | Chronological plot twists for recording                       |
+
+Analysis mode: toggle **CAT** on the board to see raw corridor heat (cm) from the engine.
+
 ## References (ideas only — not ports)
 
 - [gorisanson/quoridor-ai](https://github.com/gorisanson/quoridor-ai) — MCTS heuristics

@@ -11,6 +11,7 @@ pub mod build;
 pub mod constants;
 pub mod prune;
 pub mod viz;
+pub mod viz_build;
 
 pub use attention::CorridorAttention;
 pub use constants::{CAT_COLD_CM, CAT_CORRIDOR_CM, CAT_HOT_CM, DIST_PENALTY};

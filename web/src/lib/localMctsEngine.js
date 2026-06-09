@@ -15,6 +15,7 @@ export class LocalMctsEngineClient {
     this.algebraicMoves = [];
     this.isPondering = false;
     this.pendingRequest = null;
+    this.queuedRequest = null;
   }
 
   ensureWorker() {
@@ -36,14 +37,12 @@ export class LocalMctsEngineClient {
         return;
       }
       if (data.type === 'error') {
-        this.pendingRequest = null;
         this.setStatus('error');
         pending.onError?.(new Error(data.message ?? 'Worker error'));
         return;
       }
       if (data.type === 'bestmove') {
         const elapsed = performance.now() - pending.started;
-        this.pendingRequest = null;
         this.setStatus('idle');
         pending.onInfo?.({
           time: elapsed,
@@ -95,11 +94,19 @@ export class LocalMctsEngineClient {
     this.setStatus('idle');
   }
 
-  destroy() {
-    this.worker?.terminate();
-    this.worker = null;
-    this.algebraicMoves = [];
+  cancelSearch() {
+    this.queuedRequest = null;
+    this.pendingRequest = null;
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = null;
+    }
     this.setStatus('idle');
+  }
+
+  destroy() {
+    this.cancelSearch();
+    this.algebraicMoves = [];
   }
 
   resetConnection() {
@@ -114,7 +121,24 @@ export class LocalMctsEngineClient {
     this.setStatus('idle');
   }
 
-  requestMove({ aiSettings, moveHistory, isFreshGame }) {
+  requestMove(params) {
+    if (this.pendingRequest) {
+      this.queuedRequest = params;
+      return;
+    }
+    this.startRequest(params);
+  }
+
+  drainQueuedRequest() {
+    if (!this.queuedRequest) {
+      return;
+    }
+    const next = this.queuedRequest;
+    this.queuedRequest = null;
+    this.startRequest(next);
+  }
+
+  startRequest({ aiSettings, moveHistory, isFreshGame }) {
     if (isFreshGame) {
       this.algebraicMoves = [];
     } else if (moveHistory?.length) {
@@ -148,8 +172,16 @@ export class LocalMctsEngineClient {
         });
       },
       onInfo: (info) => this.onInfo?.(info),
-      onBestMove: (action) => this.onBestMove?.(action),
-      onError: (err) => this.onError?.(err),
+      onBestMove: (action) => {
+        this.pendingRequest = null;
+        this.onBestMove?.(action);
+        this.drainQueuedRequest();
+      },
+      onError: (err) => {
+        this.pendingRequest = null;
+        this.onError?.(err);
+        this.drainQueuedRequest();
+      },
     };
 
     const payload = {

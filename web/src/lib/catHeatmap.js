@@ -5,52 +5,72 @@ export function isSquareSkipped(reachable) {
   return reachable === false;
 }
 
-/** @returns {{ fill: string, opacity: number } | null} */
-export function catSquareOverlay(heat, reachable, maxCm = 400) {
+const DEFAULT_COLD_CM = 60;
+const DEFAULT_HOT_CM = 160;
+// Per-player corridor ceiling: CAT_CORRIDOR_CM + BOTTLENECK_BONUS_CM (engine constants).
+const DEFAULT_MAX_CM = 240;
+
+// Fixed normalized position of the hot threshold on the color ramp.
+// cold → 0, hot → 0.65, max → 1. Piecewise-linear with engine-true anchors:
+// the same cm value ALWAYS renders the same color, and crossing CAT_HOT_CM
+// (tactical / no-LMR) is always the same visual jump regardless of maxCm.
+const HOT_ANCHOR_T = 0.65;
+
+/**
+ * Engine-true heat → normalized 0..1 ramp position. Anchored to the engine's
+ * own thresholds (coldCm LMR cutoff, hotCm tactical cutoff, maxCm ceiling) —
+ * never per-position normalization.
+ */
+export function catHeatT(heat, scale = {}) {
+  const coldCm = scale.coldCm ?? DEFAULT_COLD_CM;
+  const hotCm = Math.max(scale.hotCm ?? DEFAULT_HOT_CM, coldCm + 1);
+  const maxCm = Math.max(scale.maxCm ?? DEFAULT_MAX_CM, hotCm + 1);
+  if (!Number.isFinite(heat) || heat < coldCm) {
+    return 0;
+  }
+  if (heat >= hotCm) {
+    return HOT_ANCHOR_T + (1 - HOT_ANCHOR_T) * Math.min(1, (heat - hotCm) / (maxCm - hotCm));
+  }
+  return HOT_ANCHOR_T * ((heat - coldCm) / (hotCm - coldCm));
+}
+
+/**
+ * Engine-true heat → color. Below `coldCm` (LMR fringe) there is no tint —
+ * the raw cm value is still shown as a number on the square.
+ *
+ * @returns {{ fill: string, opacity: number } | null}
+ */
+export function catSquareOverlay(heat, reachable, scale = {}) {
   if (isSquareSkipped(reachable)) {
     return null;
   }
   if (!Number.isFinite(heat) || heat <= 0) {
     return null;
   }
-  const scale = Number.isFinite(maxCm) && maxCm > 0 ? maxCm : 400;
-  const t = Math.min(1, heat / scale);
-  if (t < 0.15) {
-    const u = t / 0.15;
-    const g = Math.round(110 + 50 * u);
-    return {
-      fill: `rgba(${g}, ${g}, ${Math.round(100 + 20 * u)}, ${0.22 + 0.12 * u})`,
-      opacity: 1,
-    };
+  const coldCm = scale.coldCm ?? DEFAULT_COLD_CM;
+  // Below CAT_COLD_CM: search treats as cold fringe (extra LMR) — no board tint.
+  if (heat < coldCm) {
+    return null;
   }
-  const u = (t - 0.15) / 0.85;
-  if (u < 0.35) {
-    const v = u / 0.35;
-    return {
-      fill: `rgba(255, ${Math.round(200 + 30 * v)}, ${Math.round(40 * (1 - v))}, ${0.28 + 0.12 * v})`,
-      opacity: 1,
-    };
-  }
-  if (u < 0.7) {
-    const v = (u - 0.35) / 0.35;
-    return {
-      fill: `rgba(255, ${Math.round(150 - 70 * v)}, 0, ${0.32 + 0.1 * v})`,
-      opacity: 1,
-    };
-  }
-  const v = (u - 0.7) / 0.3;
+  const t = catHeatT(heat, scale);
+  // Yellow (55°) → orange → red (0°); alpha ramps so even the coolest warm
+  // square reads against the background instead of vanishing into it.
+  const hue = Math.round(55 * (1 - t));
+  const sat = Math.round(88 + 8 * t);
+  const light = Math.round(56 - 8 * t);
+  const alpha = Math.min(0.62, 0.3 + 0.28 * t);
   return {
-    fill: `rgba(${Math.round(230 - 40 * v)}, ${Math.round(50 - 30 * v)}, ${Math.round(30 + 10 * v)}, ${0.38 + 0.12 * v})`,
+    fill: `hsla(${hue}, ${sat}%, ${light}%, ${alpha.toFixed(2)})`,
     opacity: 1,
   };
 }
 
 /** Outline color for searchable wall hints (not filled bars). */
-export function catWallOutlineColor(heat, maxCm = 400) {
+export function catWallOutlineColor(heat, scale = {}) {
   if (!Number.isFinite(heat) || heat <= 0) {
     return 'rgba(120, 115, 105, 0.55)';
   }
-  const overlay = catSquareOverlay(heat, true, maxCm);
+  const overlay = catSquareOverlay(heat, true, scale);
   if (!overlay) {
     return 'rgba(120, 115, 105, 0.55)';
   }
