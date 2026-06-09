@@ -1,57 +1,50 @@
-# CAT v3 - Half-protruding wall shape attention
+# CAT v3 - Cross-gap wall shape attention
 
-**Episode hook:** Search was pruning walls that looked geometrically irrelevant but were tactically sharp.
+**Episode hook:** Search was pruning useful corridor walls, but the first shape pass over-credited useless T-junctions far from the race.
 
 ---
 
 ## Problem
 
-Tactical wall pruning (`wall_should_search`) correctly dropped enclosed T-walls and dead-zone junk, but it also dropped **half-protruding corridor walls**: perpendicular placements at the junction of two aligned same-orientation chain segments. These walls often sit on or beside hot CAT squares yet had weak `wall_edge_heat` because only one edge of the segment touches the corridor.
-
-The old fallback ("hot touched square") was implicit and easy to miss when the protrusion anchor was one step off the wall's four touch squares.
-
----
-
-## Shape patterns (explicit geometry)
-
-### Half-protrusion
-
-A candidate wall is **half-protruding** when it is perpendicular to two adjacent chain walls:
-
-- **Vertical** at `(r,c)`: horizontal chain `H(r,c-1)` + `H(r,c)` (also checked one row below the slot).
-- **Horizontal** at `(r,c)`: vertical chain `V(r-1,c)` + `V(r,c)`.
-
-This is the classic "half T" sticking out of a wall line.
-
-### Prophylactic block
-
-A candidate is a **prevention** move when it sits **one step left/right (or up/down along the chain)** from a would-be half-protrusion site, blocking the opponent from completing the pattern next turn.
+1. Opening MCTS loved `e5v` after `e3v d4h` because rollouts saw +1 on Black while ignoring that White's own path also lengthened.
+2. The first geometry pass treated any perpendicular-at-chain-end as "half protrusion". That revived futile T-walls on the opposite side of the board and polluted ordering.
 
 ---
 
-## Search integration (subtle, not eval)
+## Correct geometry
+
+### Cross-gap (tiny ordering nudge only)
+
+Perpendicular wall placed **through the one-row/col gap** between two parallel walls:
+
+- `V(r-1,c) + V(r+1,c)` -> candidate `H(r,c)`
+- `H(r,c-1) + H(r,c+1)` -> candidate `V(r,c)`
+
+Adjacent chain ends (`V(r,c)+V(r+1,c)` with `H` at the junction) are **not** cross-gap walls.
+
+### Cross-gap block
+
+Shifted placement beside the door slot that would become a cross-gap:
+
+- vertical gap at col `c` -> `H(r,c-1)` or `H(r,c+1)`
+- horizontal gap at row `r` -> `V(r-1,c)` or `V(r+1,c)`
+
+---
+
+## Search integration
 
 | Mechanism | Effect |
 |-----------|--------|
-| `wall_shape_attention_bonus` | +60 cm for protrusion or +50 cm for prevention in move ordering |
-| `wall_should_search` | Keeps shape-relevant walls when local CAT heat >= `CAT_COLD_CM` |
-| `move_corridor_attention` | Feeds LMR / futility "corridor relevant" without touching static eval |
+| `wall_shape_attention_bonus` | +40 cm cross / +35 cm block in move ordering only |
+| Gating | `max(edge heat, touched heat) >= CAT_HOT_CM` (160) |
+| Pruning | Shape bonus does **not** rescue otherwise dead walls |
 
-**Gating:** Bonus and pruning rescue only fire when `max(wall_edge_heat, touched_square_heat) >= 60 cm`. Delta > 3 corridors stay cold; no board-wide bleed.
-
----
-
-## Why it works
-
-Pure distance eval cannot see "this wall completes a corridor mouth." CAT already knows *where* routes compete; v3 adds a cheap geometric filter so search **notices** T-junction tactics near those routes without turning them into a strategic heuristic.
+Static eval is unchanged.
 
 ---
 
-## Files
+## Opening fix
 
-| Symbol | Location |
-|--------|----------|
-| `is_half_protruding_wall` | `engine/src/search.rs` |
-| `prevents_half_protruding_wall` | `engine/src/search.rs` |
-| `wall_shape_attention_bonus` | `engine/src/search.rs` |
-| Tests | `half_protruding_wall_*`, `prevents_half_protruding_wall_*`, `wall_shape_bonus_*` |
+Hybrid switches to minimax once `walls_placed >= 2`, so ply 9 after `e3v d4h` no longer uses opening MCTS.
+
+MCTS expansion now drops walls with non-positive net race value (`opp_gain - our_loss <= 0`, or `net < 2` when tied/behind).

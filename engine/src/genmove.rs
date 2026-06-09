@@ -126,11 +126,17 @@ pub fn genmove_algebraic(board: &mut Board, config: GenmoveConfig) -> Option<Str
             let mut minimax_cfg = config.minimax;
             minimax_cfg.book_hint = book_hint;
             if phase == SearchPhase::Book {
-                let mut opening = config.mcts;
-                opening.time_ms = config.minimax.time_ms;
-                opening.log = config.minimax.log;
-                opening.book_hint = book_hint;
-                mcts_algebraic(board, opening)
+                // Once walls are on the board the opening is tactical, not exploratory.
+                // MCTS rollouts over-rate walls that trade our path for +1 on theirs.
+                if walls_placed(board) >= 2 {
+                    minimax_algebraic(board, minimax_cfg)
+                } else {
+                    let mut opening = config.mcts;
+                    opening.time_ms = config.minimax.time_ms;
+                    opening.log = config.minimax.log;
+                    opening.book_hint = book_hint;
+                    mcts_algebraic(board, opening)
+                }
             } else if use_bridge(board) {
                 let bridge = MctsConfig {
                     time_ms: config.minimax.time_ms,
@@ -220,6 +226,32 @@ mod tests {
         assert!(
             matches!(reply.as_str(), "e3v" | "d3v" | "c3v"),
             "expected Standard/Shiller vertical wall, got {reply}"
+        );
+    }
+
+    #[test]
+    fn hybrid_avoids_e5v_trap_after_d4h() {
+        let mut board = replay(&["e2", "e8", "e3", "e7", "e4", "e6", "e3v", "d4h"]);
+        assert!(walls_placed(&board) >= 2);
+        let cfg = GenmoveConfig {
+            engine: GenmoveEngine::Minimax,
+            mcts: MctsConfig {
+                time_ms: 500,
+                max_simulations: 50_000,
+                log: false,
+                ..MctsConfig::default()
+            },
+            minimax: SearchConfig {
+                time_ms: 500,
+                max_nodes: 200_000,
+                log: false,
+                book_hint: None,
+            },
+        };
+        let mv = genmove_algebraic(&mut board, cfg).expect("move");
+        assert_ne!(
+            mv, "e5v",
+            "hybrid should not repeat the e5v wall trap after d4h, got {mv}"
         );
     }
 

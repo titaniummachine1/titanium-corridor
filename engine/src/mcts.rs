@@ -310,12 +310,43 @@ fn allows_opponent_double_advance(board: &mut Board, candidate: Move, bfs: &mut 
     gives_jump
 }
 
-fn wall_adds_detour(board: &mut Board, mv: Move, target: Player, bfs: &mut BfsScratch) -> u8 {
-    let before = bfs.shortest_distance(board, target).unwrap_or(255);
+fn wall_race_delta(
+    board: &mut Board,
+    mv: Move,
+    stm: Player,
+    opp: Player,
+    bfs: &mut BfsScratch,
+) -> (u8, u8) {
+    let our_before = bfs.shortest_distance(board, stm).unwrap_or(255);
+    let opp_before = bfs.shortest_distance(board, opp).unwrap_or(255);
     let undo = board.make_move(mv);
-    let after = bfs.shortest_distance(board, target).unwrap_or(255);
+    let our_after = bfs.shortest_distance(board, stm).unwrap_or(255);
+    let opp_after = bfs.shortest_distance(board, opp).unwrap_or(255);
     board.unmake_move(undo);
-    after.saturating_sub(before)
+    (
+        opp_after.saturating_sub(opp_before),
+        our_after.saturating_sub(our_before),
+    )
+}
+
+fn wall_is_race_positive(
+    board: &mut Board,
+    mv: Move,
+    stm: Player,
+    opp: Player,
+    bfs: &mut BfsScratch,
+) -> bool {
+    let (opp_gain, our_loss) = wall_race_delta(board, mv, stm, opp, bfs);
+    let net = i16::from(opp_gain) - i16::from(our_loss);
+    if net <= 0 {
+        return false;
+    }
+    let our_dist = bfs.shortest_distance(board, stm).unwrap_or(255);
+    let opp_dist = bfs.shortest_distance(board, opp).unwrap_or(255);
+    if our_dist >= opp_dist {
+        return net >= 2;
+    }
+    opp_gain >= 1
 }
 
 fn expansion_moves_fixed(board: &mut Board, buf: &mut [Move], bfs: &mut BfsScratch) -> usize {
@@ -349,13 +380,6 @@ fn expansion_moves_fixed(board: &mut Board, buf: &mut [Move], bfs: &mut BfsScrat
         return full;
     }
 
-    let our_dist = bfs.shortest_distance(board, stm).unwrap_or(255);
-    let opp_dist = bfs.shortest_distance(board, opp).unwrap_or(255);
-    // When we're behind or tied in the race, only include walls that add ≥2 steps
-    // to the opponent. Sprinting is almost always better than passive walls.
-    let race_deficit = our_dist.saturating_sub(opp_dist);
-    let min_wall_detour: u8 = if race_deficit >= 2 { 2 } else { 1 };
-
     for i in 0..full {
         let mv = scratch[i];
         match mv {
@@ -367,7 +391,7 @@ fn expansion_moves_fixed(board: &mut Board, buf: &mut [Move], bfs: &mut BfsScrat
                 if !self_has_walls {
                     continue;
                 }
-                if wall_adds_detour(board, mv, opp, bfs) >= min_wall_detour {
+                if wall_is_race_positive(board, mv, stm, opp, bfs) {
                     buf[n] = mv;
                     n += 1;
                 }

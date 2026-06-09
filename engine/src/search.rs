@@ -27,10 +27,10 @@ const TEMPO_PENALTY: i32 = -10;
 // COLD (<60):  delta≥3 for both players, or near floor      → apply extra LMR reduction.
 const CAT_HOT_CM: u16 = 160;
 const CAT_COLD_CM: u16 = 60;
-/// Small ordering bonus for half-protruding corridor walls (centi-units, not eval).
-const WALL_SHAPE_PROTRUSION_CM: i32 = 60;
-/// Slightly weaker bonus for prophylactic blocks one step along the chain.
-const WALL_SHAPE_PREVENT_CM: i32 = 50;
+/// Tiny ordering nudge for cross-gap walls (centi-units, not eval).
+const WALL_CROSS_GAP_CM: i32 = 40;
+/// Slightly weaker nudge for shifted blocks beside a cross-gap slot.
+const WALL_CROSS_BLOCK_CM: i32 = 35;
 
 const LMR_MIN_DEPTH: u32 = 2;
 // Full-depth moves before LMR kicks in — 4 protects the critical 4th move
@@ -595,93 +595,65 @@ fn wall_coord_in_bounds(row: u8, col: u8) -> bool {
     row <= 7 && col <= 7
 }
 
-/// Perpendicular wall at the junction of two aligned same-orientation chain segments.
-fn is_half_protruding_wall(board: &Board, row: u8, col: u8, orientation: WallOrientation) -> bool {
+/// Perpendicular wall placed through the one-row gap between two parallel walls.
+fn is_cross_gap_wall(board: &Board, row: u8, col: u8, orientation: WallOrientation) -> bool {
     if !wall_coord_in_bounds(row, col) || has_wall(board, row, col, orientation) {
         return false;
     }
     match orientation {
-        WallOrientation::Vertical => {
-            for hr in [row, row.saturating_add(1)] {
-                if hr > 7 {
-                    continue;
-                }
-                if col > 0
-                    && has_wall(board, hr, col - 1, WallOrientation::Horizontal)
-                    && has_wall(board, hr, col, WallOrientation::Horizontal)
-                {
-                    return true;
-                }
-            }
-        }
         WallOrientation::Horizontal => {
-            if row == 0 {
-                return false;
-            }
-            for vc in [col, col.saturating_add(1)] {
-                if vc > 7 {
-                    continue;
-                }
-                if has_wall(board, row - 1, vc, WallOrientation::Vertical)
-                    && has_wall(board, row, vc, WallOrientation::Vertical)
-                {
-                    return true;
-                }
-            }
+            row >= 1
+                && row <= 6
+                && has_wall(board, row - 1, col, WallOrientation::Vertical)
+                && has_wall(board, row + 1, col, WallOrientation::Vertical)
+        }
+        WallOrientation::Vertical => {
+            col >= 1
+                && col <= 6
+                && has_wall(board, row, col - 1, WallOrientation::Horizontal)
+                && has_wall(board, row, col + 1, WallOrientation::Horizontal)
         }
     }
-    false
 }
 
-/// Shifted one step along the chain from a would-be half-protrusion site.
-fn prevents_half_protruding_wall(
+/// Shifted beside a cross-gap slot, denying the perpendicular door without filling it.
+fn blocks_cross_gap_wall(
     board: &Board,
     row: u8,
     col: u8,
     orientation: WallOrientation,
 ) -> bool {
-    if is_half_protruding_wall(board, row, col, orientation) {
+    if is_cross_gap_wall(board, row, col, orientation) || !wall_coord_in_bounds(row, col) {
         return false;
     }
-    if !wall_coord_in_bounds(row, col) {
-        return false;
-    }
-
-    let check_shift = |sr: u8, sc: u8, so: WallOrientation, dr: i8, dc: i8| -> bool {
-        if so != orientation {
-            return false;
-        }
-        let br = sr as i8 + dr;
-        let bc = sc as i8 + dc;
-        if br >= 0 && br <= 7 && bc >= 0 && bc <= 7 {
-            br as u8 == row && bc as u8 == col
-        } else {
-            false
-        }
-    };
-
-    for hr in 0..=7u8 {
-        for hc in 1..=7u8 {
-            if has_wall(board, hr, hc - 1, WallOrientation::Horizontal)
-                && has_wall(board, hr, hc, WallOrientation::Horizontal)
-            {
-                if check_shift(hr, hc, WallOrientation::Vertical, 0, -1)
-                    || check_shift(hr, hc, WallOrientation::Vertical, 0, 1)
+    match orientation {
+        WallOrientation::Horizontal => {
+            for dc in [-1i8, 1i8] {
+                let gap_col = col as i8 + dc;
+                if !(1..=6).contains(&gap_col) {
+                    continue;
+                }
+                let gc = gap_col as u8;
+                if row >= 1
+                    && row <= 6
+                    && has_wall(board, row - 1, gc, WallOrientation::Vertical)
+                    && has_wall(board, row + 1, gc, WallOrientation::Vertical)
                 {
                     return true;
                 }
             }
         }
-    }
-    for hc in 0..=7u8 {
-        for vr in 1..=7u8 {
-            if has_wall(board, vr - 1, hc, WallOrientation::Vertical)
-                && has_wall(board, vr, hc, WallOrientation::Vertical)
-            {
-                if check_shift(vr, hc, WallOrientation::Horizontal, -1, 0)
-                    || check_shift(vr, hc, WallOrientation::Horizontal, 1, 0)
-                    || check_shift(vr, hc, WallOrientation::Horizontal, -1, -1)
-                    || check_shift(vr, hc, WallOrientation::Horizontal, 1, -1)
+        WallOrientation::Vertical => {
+            for dr in [-1i8, 1i8] {
+                let gap_row = row as i8 + dr;
+                if !(1..=6).contains(&gap_row) {
+                    continue;
+                }
+                let gr = gap_row as u8;
+                if col >= 1
+                    && col <= 6
+                    && has_wall(board, gr, col - 1, WallOrientation::Horizontal)
+                    && has_wall(board, gr, col + 1, WallOrientation::Horizontal)
                 {
                     return true;
                 }
@@ -715,20 +687,16 @@ fn wall_shape_attention_bonus(board: &Board, mv: Move, cat: &CorridorAttention) 
     else {
         return 0;
     };
-    if wall_shape_local_heat(cat, row, col, orientation) < CAT_COLD_CM {
+    if wall_shape_local_heat(cat, row, col, orientation) < CAT_HOT_CM {
         return 0;
     }
-    if is_half_protruding_wall(board, row, col, orientation) {
-        WALL_SHAPE_PROTRUSION_CM
-    } else if prevents_half_protruding_wall(board, row, col, orientation) {
-        WALL_SHAPE_PREVENT_CM
+    if is_cross_gap_wall(board, row, col, orientation) {
+        WALL_CROSS_GAP_CM
+    } else if blocks_cross_gap_wall(board, row, col, orientation) {
+        WALL_CROSS_BLOCK_CM
     } else {
         0
     }
-}
-
-fn wall_shape_relevant(board: &Board, mv: Move, cat: &CorridorAttention) -> bool {
-    wall_shape_attention_bonus(board, mv, cat) > 0
 }
 
 fn wall_in_dead_zone(mv: Move, reachable: u128) -> bool {
@@ -789,9 +757,6 @@ fn wall_should_search(
         if cat.square_heat(r, c) >= CAT_COLD_CM {
             return true;
         }
-    }
-    if wall_shape_relevant(board, mv, cat) {
-        return true;
     }
     false
 }
@@ -2010,34 +1975,34 @@ mod tests {
     }
 
     #[test]
-    fn half_protruding_wall_detects_perpendicular_junction() {
+    fn cross_gap_wall_detects_perpendicular_through_gap() {
         use crate::grid::set_wall;
 
         let mut board = Board::new();
-        set_wall(&mut board, 3, 3, WallOrientation::Horizontal, true);
-        set_wall(&mut board, 3, 4, WallOrientation::Horizontal, true);
-        assert!(is_half_protruding_wall(
-            &board,
-            3,
-            4,
-            WallOrientation::Vertical
-        ));
-        assert!(!is_half_protruding_wall(
+        set_wall(&mut board, 2, 4, WallOrientation::Vertical, true);
+        set_wall(&mut board, 4, 4, WallOrientation::Vertical, true);
+        assert!(is_cross_gap_wall(
             &board,
             3,
             4,
             WallOrientation::Horizontal
         ));
+        assert!(!is_cross_gap_wall(
+            &board,
+            3,
+            4,
+            WallOrientation::Vertical
+        ));
     }
 
     #[test]
-    fn half_protruding_wall_detects_vertical_chain_junction() {
+    fn cross_gap_ignores_adjacent_chain_t_junction() {
         use crate::grid::set_wall;
 
         let mut board = Board::new();
         set_wall(&mut board, 2, 4, WallOrientation::Vertical, true);
         set_wall(&mut board, 3, 4, WallOrientation::Vertical, true);
-        assert!(is_half_protruding_wall(
+        assert!(!is_cross_gap_wall(
             &board,
             3,
             4,
@@ -2046,84 +2011,47 @@ mod tests {
     }
 
     #[test]
-    fn half_protruding_wall_detects_vertical_chain_other_endpoint() {
+    fn blocks_cross_gap_detects_shifted_prevention() {
         use crate::grid::set_wall;
 
         let mut board = Board::new();
-        set_wall(&mut board, 2, 5, WallOrientation::Vertical, true);
-        set_wall(&mut board, 3, 5, WallOrientation::Vertical, true);
-        assert!(is_half_protruding_wall(
-            &board,
-            3,
-            4,
-            WallOrientation::Horizontal
-        ));
-    }
-
-    #[test]
-    fn prevents_half_protruding_wall_shifted_from_other_endpoint() {
-        use crate::grid::set_wall;
-
-        let mut board = Board::new();
-        set_wall(&mut board, 2, 5, WallOrientation::Vertical, true);
-        set_wall(&mut board, 3, 5, WallOrientation::Vertical, true);
-        assert!(prevents_half_protruding_wall(
-            &board,
-            2,
-            4,
-            WallOrientation::Horizontal
-        ));
-        assert!(prevents_half_protruding_wall(
-            &board,
-            4,
-            4,
-            WallOrientation::Horizontal
-        ));
-    }
-
-    #[test]
-    fn prevents_half_protruding_wall_shifted_along_chain() {
-        use crate::grid::set_wall;
-
-        let mut board = Board::new();
-        set_wall(&mut board, 3, 3, WallOrientation::Horizontal, true);
-        set_wall(&mut board, 3, 4, WallOrientation::Horizontal, true);
-
-        assert!(prevents_half_protruding_wall(
+        set_wall(&mut board, 2, 4, WallOrientation::Vertical, true);
+        set_wall(&mut board, 4, 4, WallOrientation::Vertical, true);
+        assert!(blocks_cross_gap_wall(
             &board,
             3,
             3,
-            WallOrientation::Vertical
+            WallOrientation::Horizontal
         ));
-        assert!(prevents_half_protruding_wall(
+        assert!(blocks_cross_gap_wall(
             &board,
             3,
             5,
-            WallOrientation::Vertical
+            WallOrientation::Horizontal
         ));
-        assert!(!prevents_half_protruding_wall(
+        assert!(!blocks_cross_gap_wall(
             &board,
             3,
             4,
-            WallOrientation::Vertical
+            WallOrientation::Horizontal
         ));
     }
 
     #[test]
-    fn wall_shape_bonus_gated_by_local_cat_heat() {
+    fn wall_shape_bonus_only_for_hot_cross_gap() {
         use crate::grid::set_wall;
 
         let mut board = Board::new();
-        set_wall(&mut board, 3, 3, WallOrientation::Horizontal, true);
-        set_wall(&mut board, 3, 4, WallOrientation::Horizontal, true);
+        set_wall(&mut board, 2, 4, WallOrientation::Vertical, true);
+        set_wall(&mut board, 4, 4, WallOrientation::Vertical, true);
         let cold_cat = CorridorAttention::default();
-        let protrusion = Move::Wall {
+        let cross = Move::Wall {
             row: 3,
             col: 4,
-            orientation: WallOrientation::Vertical,
+            orientation: WallOrientation::Horizontal,
         };
         assert_eq!(
-            wall_shape_attention_bonus(&board, protrusion, &cold_cat),
+            wall_shape_attention_bonus(&board, cross, &cold_cat),
             0,
             "cold CAT should not revive unrelated shape bonus"
         );
@@ -2131,46 +2059,29 @@ mod tests {
         let mut bfs = BfsScratch::new();
         let hot_cat = bfs.build_corridor_attention(&board);
         assert!(
-            wall_shape_attention_bonus(&board, protrusion, &hot_cat) >= WALL_SHAPE_PROTRUSION_CM,
-            "central corridor should pick up half-protrusion bonus"
+            wall_shape_attention_bonus(&board, cross, &hot_cat) >= WALL_CROSS_GAP_CM,
+            "hot corridor cross-gap should get a tiny ordering nudge"
         );
     }
 
     #[test]
-    fn wall_search_keeps_shape_relevant_protrusion() {
+    fn useless_t_junction_gets_no_shape_bonus() {
         use crate::grid::set_wall;
 
         let mut board = Board::new();
-        set_wall(&mut board, 3, 3, WallOrientation::Horizontal, true);
-        set_wall(&mut board, 3, 4, WallOrientation::Horizontal, true);
-
+        set_wall(&mut board, 0, 5, WallOrientation::Vertical, true);
+        set_wall(&mut board, 1, 5, WallOrientation::Vertical, true);
         let mut bfs = BfsScratch::new();
         let cat = bfs.build_corridor_attention(&board);
-        let reachable = bfs.both_reachable_mask(&board);
-        let opp_dist = bfs
-            .shortest_distance(&board, Player::Two)
-            .unwrap_or(DIST_PENALTY);
-        let mut opp_path = [0u8; 81];
-        let opp_path_len = get_shortest_path(&board, Player::Two, &mut bfs, &mut opp_path);
-
-        let protrusion = Move::Wall {
-            row: 3,
-            col: 4,
-            orientation: WallOrientation::Vertical,
+        let t_junction = Move::Wall {
+            row: 1,
+            col: 5,
+            orientation: WallOrientation::Horizontal,
         };
-        let mut search_board = board.clone();
-        assert!(
-            wall_should_search(
-                protrusion,
-                &cat,
-                reachable,
-                &mut search_board,
-                opp_dist,
-                &opp_path,
-                opp_path_len,
-                &mut bfs,
-            ),
-            "half-protruding corridor wall should stay searchable"
+        assert_eq!(
+            wall_shape_attention_bonus(&board, t_junction, &cat),
+            0,
+            "far-side T junction should not get shape attention"
         );
     }
 
