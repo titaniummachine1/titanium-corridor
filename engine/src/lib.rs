@@ -32,7 +32,8 @@ pub use cat::{
 };
 pub use core::board::{Board, Column, Move, Player, Row, Undo, WallOrientation};
 pub use movegen::{
-    generate_legal_moves, generate_legal_moves_into, generate_legal_moves_slice, MAX_LEGAL_MOVES,
+    generate_legal_moves, generate_legal_moves_into, generate_legal_moves_slice,
+    generate_legal_moves_slice_mode, PawnGenMode, MAX_LEGAL_MOVES,
 };
 pub use opening::{ply_number, BOOK_MAX_PLY};
 pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
@@ -46,5 +47,5 @@ pub use search::{
 };
 pub use util::perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_iterative, perft_naive,
-    perft_parallel_root, PerftContext, PERFT3_STARTPOS, PERFT4_STARTPOS,
+    perft_no_tt_mode, perft_parallel_root, PerftContext, PERFT3_STARTPOS, PERFT4_STARTPOS,
 };

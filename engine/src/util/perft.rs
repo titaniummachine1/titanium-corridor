@@ -9,7 +9,10 @@ pub const PERFT3_STARTPOS: u64 = 2_062_264;
 pub const PERFT4_STARTPOS: u64 = 247_569_030;
 
 use crate::core::board::{Board, Move};
-use crate::movegen::{generate_legal_moves_into, generate_legal_moves_slice, MAX_LEGAL_MOVES};
+use crate::movegen::{
+    generate_legal_moves_into, generate_legal_moves_slice, generate_legal_moves_slice_mode,
+    PawnGenMode, MAX_LEGAL_MOVES,
+};
 use crate::path::BfsScratch;
 use crate::search::context::{SharedState, WorkerContext};
 use std::collections::BTreeMap;
@@ -46,6 +49,35 @@ pub fn perft_fast_ctx(
 
     if let Some(shared) = shared {
         shared.tt.store(board.hash, depth as u8, nodes);
+    }
+    nodes
+}
+
+/// Perft without TT — for timing pawn-generation variants fairly.
+pub fn perft_no_tt_mode(board: &mut Board, depth: u32, mode: PawnGenMode) -> u64 {
+    let mut scratch = BfsScratch::new();
+    perft_no_tt_mode_ctx(board, depth, mode, &mut scratch)
+}
+
+pub fn perft_no_tt_mode_ctx(
+    board: &mut Board,
+    depth: u32,
+    mode: PawnGenMode,
+    scratch: &mut BfsScratch,
+) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let mut move_buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let move_count = generate_legal_moves_slice_mode(board, &mut move_buf, scratch, mode);
+    let mut nodes = 0u64;
+
+    for i in 0..move_count {
+        let mv = move_buf[i];
+        let undo = board.make_move(mv);
+        nodes += perft_no_tt_mode_ctx(board, depth - 1, mode, scratch);
+        board.unmake_move(undo);
     }
     nodes
 }

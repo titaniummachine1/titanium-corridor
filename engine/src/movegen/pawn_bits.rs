@@ -1,10 +1,12 @@
-//! Bitmask pawn move generation — one-step + jump/lateral via `DirMasks` shifts.
+//! Pawn move generation — scalar reference, `DirMasks` bitboard, and shift+wall-check.
 //!
-//! Compare against `generate_pawn_moves_slice` (scalar `can_step`) in tests/benches.
+//! Compare against `generate_pawn_moves_scalar_for` in tests/benches.
 
 use crate::core::board::{Board, Move};
 use crate::path::masks::DirMasks;
-use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, square_index, unpack_square, FLOOD_STRIDE};
+use crate::util::grid::{
+    can_step, flood_bit_sq, flood_sq_from_bit, square_index, unpack_square, FLOOD_STRIDE,
+};
 
 type StepFn = fn(u128, &DirMasks) -> u128;
 
@@ -96,10 +98,116 @@ pub fn generate_pawn_moves_bitboard_slice(board: &Board, out: &mut [Move]) -> us
     generate_pawn_moves_bitboard_with_masks(board, &masks, out)
 }
 
+#[inline]
+fn push_pawn(row: u8, col: u8, out: &mut [Move], n: &mut usize) {
+    out[*n] = Move::Pawn { row, col };
+    *n += 1;
+}
+
+#[inline]
+fn shift_playable(bit: u128, shifter: fn(u128) -> u128) -> u128 {
+    let shifted = shifter(bit);
+    if shifted == 0 {
+        return 0;
+    }
+    if flood_sq_from_bit(shifted.trailing_zeros()).is_some() {
+        shifted
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn shift_north_raw(bit: u128) -> u128 {
+    bit >> FLOOD_STRIDE
+}
+
+#[inline]
+fn shift_south_raw(bit: u128) -> u128 {
+    bit << FLOOD_STRIDE
+}
+
+#[inline]
+fn shift_east_raw(bit: u128) -> u128 {
+    bit << 1
+}
+
+#[inline]
+fn shift_west_raw(bit: u128) -> u128 {
+    bit >> 1
+}
+
+/// One axis: blind bit shift, then `can_step` wall validation + jump/lateral logic.
+fn axis_shift(
+    board: &Board,
+    fr: u8,
+    fc: u8,
+    or: u8,
+    oc: u8,
+    from: u128,
+    dr: i8,
+    dc: i8,
+    shifter: fn(u128) -> u128,
+    perp_a: (i8, i8),
+    perp_b: (i8, i8),
+    out: &mut [Move],
+    n: &mut usize,
+) {
+    let neighbor_bit = shift_playable(from, shifter);
+    if neighbor_bit == 0 || !can_step(board, fr, fc, dr, dc) {
+        return;
+    }
+    let sq = flood_sq_from_bit(neighbor_bit.trailing_zeros()).expect("playable");
+    let (nr, nc) = unpack_square(sq);
+    debug_assert_eq!(nr, (fr as i8 + dr) as u8);
+    debug_assert_eq!(nc, (fc as i8 + dc) as u8);
+
+    if (nr, nc) != (or, oc) {
+        push_pawn(nr, nc, out, n);
+        return;
+    }
+
+    if can_step(board, nr, nc, dr, dc) {
+        push_pawn((nr as i8 + dr) as u8, (nc as i8 + dc) as u8, out, n);
+        return;
+    }
+
+    for (pdr, pdc) in [perp_a, perp_b] {
+        if can_step(board, nr, nc, pdr, pdc) {
+            push_pawn((nr as i8 + pdr) as u8, (nc as i8 + pdc) as u8, out, n);
+        }
+    }
+}
+
+/// Shift pawn bit N/S/E/W; validate edges with `can_step` — no `DirMasks` table.
+pub fn generate_pawn_moves_shift_slice(board: &Board, out: &mut [Move]) -> usize {
+    let side = board.side_to_move as usize;
+    let (fr, fc) = board.pawns[side];
+    let (or, oc) = board.pawns[1 - side];
+    let from = flood_bit_sq(square_index(fr, fc));
+    let mut n = 0usize;
+
+    axis_shift(
+        board, fr, fc, or, oc, from, -1, 0, shift_north_raw, (0, -1), (0, 1), out, &mut n,
+    );
+    axis_shift(
+        board, fr, fc, or, oc, from, 1, 0, shift_south_raw, (0, -1), (0, 1), out, &mut n,
+    );
+    axis_shift(
+        board, fr, fc, or, oc, from, 0, 1, shift_east_raw, (-1, 0), (1, 0), out, &mut n,
+    );
+    axis_shift(
+        board, fr, fc, or, oc, from, 0, -1, shift_west_raw, (-1, 0), (1, 0), out, &mut n,
+    );
+
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::movegen::legal::generate_pawn_moves_slice;
+    use crate::movegen::legal::generate_pawn_moves_scalar_for;
+    use crate::core::board::Player;
     use crate::movegen::MAX_LEGAL_MOVES;
     use crate::path::BfsScratch;
 
@@ -113,11 +221,19 @@ mod tests {
     fn assert_pawn_moves_match(board: &Board) {
         let mut scalar = [Move::Pawn { row: 0, col: 0 }; 8];
         let mut bitboard = [Move::Pawn { row: 0, col: 0 }; 8];
-        let ns = generate_pawn_moves_slice(board, &mut scalar);
+        let mut shift = [Move::Pawn { row: 0, col: 0 }; 8];
+        let ns = generate_pawn_moves_scalar_for(board, board.side_to_move, &mut scalar);
         let nb = generate_pawn_moves_bitboard_slice(board, &mut bitboard);
+        let nsh = generate_pawn_moves_shift_slice(board, &mut shift);
         assert!(
             same_pawn_multiset(&scalar[..ns], &bitboard[..nb]),
-            "pawn move mismatch stm={:?} pawns={:?}",
+            "bitboard mismatch stm={:?} pawns={:?}",
+            board.side_to_move,
+            board.pawns
+        );
+        assert!(
+            same_pawn_multiset(&scalar[..ns], &shift[..nsh]),
+            "shift mismatch stm={:?} pawns={:?}",
             board.side_to_move,
             board.pawns
         );

@@ -1,7 +1,9 @@
 //! Legal move generation — pawn jumps + wall placements with path validation.
 
 use crate::core::board::{Board, Move, Player, WallOrientation};
-use crate::movegen::pawn_bits::generate_pawn_moves_bitboard_with_masks;
+use crate::movegen::pawn_bits::{
+    generate_pawn_moves_bitboard_with_masks, generate_pawn_moves_shift_slice,
+};
 use crate::path::masks::DirMasks;
 use crate::util::grid::{can_step, goal_row, has_wall, set_wall, square_index, unpack_square};
 use crate::path::BfsScratch;
@@ -10,6 +12,45 @@ const DIRS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
 
 /// Upper bound on legal moves in any Quoridor position (startpos ≈ 131).
 pub const MAX_LEGAL_MOVES: usize = 140;
+
+/// Pawn-generation strategy — production uses [`PawnGenMode::ShiftCanStep`]; other modes for benches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PawnGenMode {
+    /// ~4× `can_step` per node — no mask table.
+    Scalar,
+    /// Full-board `DirMasks::from_board` + bitmask axis logic (current default).
+    BitboardFreshDirMasks,
+    /// Reuse `BfsScratch::dir_masks` — incorrect if stale after wall trials.
+    BitboardCachedDirMasks,
+    /// Blind bit shift + `can_step` wall check — no `DirMasks`.
+    ShiftCanStep,
+}
+
+impl Default for PawnGenMode {
+    fn default() -> Self {
+        Self::ShiftCanStep
+    }
+}
+
+fn generate_pawn_moves_with_mode(
+    board: &Board,
+    scratch: &mut BfsScratch,
+    out: &mut [Move],
+    mode: PawnGenMode,
+) -> usize {
+    match mode {
+        PawnGenMode::Scalar => generate_pawn_moves_scalar_for(board, board.side_to_move, out),
+        PawnGenMode::BitboardFreshDirMasks => {
+            let masks = DirMasks::from_board(board);
+            generate_pawn_moves_bitboard_with_masks(board, &masks, out)
+        }
+        PawnGenMode::BitboardCachedDirMasks => {
+            let masks = scratch.dir_masks(board);
+            generate_pawn_moves_bitboard_with_masks(board, &masks, out)
+        }
+        PawnGenMode::ShiftCanStep => generate_pawn_moves_shift_slice(board, out),
+    }
+}
 
 pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
     let mut copy = board.clone();
@@ -29,8 +70,21 @@ pub fn generate_legal_moves_slice(
         return 0;
     }
 
-    let masks = DirMasks::from_board(board);
-    let mut n = generate_pawn_moves_bitboard_with_masks(board, &masks, out);
+    generate_legal_moves_slice_mode(board, out, scratch, PawnGenMode::default())
+}
+
+/// Legal moves with a selectable pawn generator — wall path logic unchanged.
+pub fn generate_legal_moves_slice_mode(
+    board: &mut Board,
+    out: &mut [Move],
+    scratch: &mut BfsScratch,
+    mode: PawnGenMode,
+) -> usize {
+    if board.is_terminal().is_some() {
+        return 0;
+    }
+
+    let mut n = generate_pawn_moves_with_mode(board, scratch, out, mode);
     if board.walls_remaining[board.side_to_move as usize] > 0 {
         n += generate_wall_moves_slice(board, &mut out[n..], scratch);
     }
@@ -70,7 +124,7 @@ pub(crate) fn generate_pawn_moves_for(board: &Board, player: Player, out: &mut [
 }
 
 /// Scalar pawn moves — kept for mobility eval and differential tests vs bitboard.
-fn generate_pawn_moves_scalar_for(board: &Board, player: Player, out: &mut [Move]) -> usize {
+pub(crate) fn generate_pawn_moves_scalar_for(board: &Board, player: Player, out: &mut [Move]) -> usize {
     let side = player as usize;
     let (fr, fc) = board.pawns[side];
     let (or, oc) = board.pawns[1 - side];

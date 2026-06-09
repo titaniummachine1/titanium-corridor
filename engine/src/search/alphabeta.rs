@@ -9,14 +9,14 @@ use crate::cat::prune::{
     move_immediate_gain, order_moves, path_distance,
 };
 use crate::cat::CorridorAttention;
-use crate::search::lmr_profile::{
-    apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
-    MateStopReason, MateZoneState,
-};
 use crate::core::board::{Board, Move, Player, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
 use crate::path::BfsScratch;
+use crate::search::lmr_profile::{
+    apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
+    MateStopReason, MateZoneState,
+};
 use crate::util::grid::is_goal;
 use crate::util::perft::format_move;
 
@@ -328,19 +328,16 @@ fn update_lmr_profile_for_depth(
         let n = generate_legal_moves_slice(board, &mut buf, state.bfs);
         let cat = state.bfs.build_corridor_attention(board);
         let (cat_max, cat_p75) = root_cat_heat_stats(board, &buf, n, &cat);
-        let stage_t = compute_stage_t(
-            board,
-            state.our_root_dist,
-            opp_root_dist,
-            cat_max,
-            cat_p75,
-        );
+        let stage_t = compute_stage_t(board, state.our_root_dist, opp_root_dist, cat_max, cat_p75);
         state.lmr_profile = LmrProfile::from_stage(stage_t, endgame_race, false);
 
         if depth > 1 {
             let log = &state.depth_log;
             let (marginal, prev_marginal) = if log.len() >= 2 {
-                (log[log.len() - 1].marginal_nodes, log[log.len() - 2].marginal_nodes)
+                (
+                    log[log.len() - 1].marginal_nodes,
+                    log[log.len() - 2].marginal_nodes,
+                )
             } else if log.len() == 1 {
                 (log[0].marginal_nodes, 0)
             } else {
@@ -1892,11 +1889,11 @@ mod tests {
     }
 
     const POS_TQ1_LOST_PLY69: &[&str] = &[
-        "e2", "d2v", "e4v", "e2h", "f2", "f1v", "e2", "d1h", "e8h", "b1h", "f2", "a8h", "f8v", "d9",
-        "f1", "c9", "e1", "c8", "d1", "c8h", "c1", "f6v", "b1", "c7", "a1", "b7", "b6h", "f5h", "a7v",
-        "d4v", "c6v", "c7", "c7h", "b7", "f3v", "b8", "a2", "c8", "b2", "d8", "c2", "e8", "d2", "e7",
-        "d3", "e6", "d4", "e5", "d5", "e4", "d6", "e3", "g2h", "f3", "e6", "f4", "e5", "f5", "e4", "g5",
-        "e3", "g4", "f3", "h4", "f4", "h3", "h3v", "h4", "f5",
+        "e2", "d2v", "e4v", "e2h", "f2", "f1v", "e2", "d1h", "e8h", "b1h", "f2", "a8h", "f8v",
+        "d9", "f1", "c9", "e1", "c8", "d1", "c8h", "c1", "f6v", "b1", "c7", "a1", "b7", "b6h",
+        "f5h", "a7v", "d4v", "c6v", "c7", "c7h", "b7", "f3v", "b8", "a2", "c8", "b2", "d8", "c2",
+        "e8", "d2", "e7", "d3", "e6", "d4", "e5", "d5", "e4", "d6", "e3", "g2h", "f3", "e6", "f4",
+        "e5", "f5", "e4", "g5", "e3", "g4", "f3", "h4", "f4", "h3", "h3v", "h4", "f5",
     ];
 
     fn pos_tq1_lost_ply73() -> Board {
