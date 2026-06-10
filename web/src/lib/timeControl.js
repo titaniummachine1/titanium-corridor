@@ -31,6 +31,9 @@ export const WALL_CLOCK_RANGE = {
   defaultSeconds: 10,
 };
 
+/** Default think budget for Quoridor v3 (JS αβ) — primary local adversary until Titanium NNUE lands. */
+export const QUORIDOR_V3_WALL_CLOCK_DEFAULT = 0.5;
+
 /** Exponential visit cap for local MCTS — slider is linear, stored value is log-spaced. */
 export const LOCAL_VISITS_RANGE = {
   min: 1_000,
@@ -93,7 +96,8 @@ export function isRemoteEngine(playerType, engineConfigs) {
 }
 
 export function isLocalEngine(playerType, engineConfigs) {
-  return getEngineConfig(playerType, engineConfigs)?.kind === 'local';
+  const kind = getEngineConfig(playerType, engineConfigs)?.kind;
+  return kind === 'local' || kind === 'quoridor-v3';
 }
 
 export function isTitaniumEngine(playerType, engineConfigs) {
@@ -104,9 +108,26 @@ export function isTitaniumEngine(playerType, engineConfigs) {
   );
 }
 
+export function isQuoridorV3Engine(playerType, engineConfigs) {
+  return (
+    playerType === PlayerType.QuoridorV3 ||
+    getEngineConfig(playerType, engineConfigs)?.kind === 'quoridor-v3'
+  );
+}
+
 export function isLocalMctsEngine(playerType, engineConfigs) {
   const kind = getEngineConfig(playerType, engineConfigs)?.kind;
-  return kind === 'local' || kind === 'titanium';
+  return kind === 'local' || kind === 'titanium' || kind === 'quoridor-v3';
+}
+
+/** Map visit slider → iterative-deepening cap for Quoridor v3 (4–30 plies). */
+export function maxDepthFromVisitsBudget(visits) {
+  const t = sliderPositionFromVisits(visits) / LOCAL_VISITS_RANGE.sliderSteps;
+  return Math.round(4 + t * 26);
+}
+
+export function formatMaxDepth(depth) {
+  return `≤d${Math.min(30, Math.max(4, Math.round(depth)))}`;
 }
 
 /** Higher UCT = more exploration — weaker play (mirrors strength tiers). */
@@ -124,6 +145,12 @@ export function defaultPlayerAiSettings(playerType, engineConfigs) {
       strengthLevel: StrengthLevel.Alpha,
       wallClockSeconds: WALL_CLOCK_RANGE.defaultSeconds,
       visitsBudget: TITANIUM_NODE_CAP,
+    };
+  }
+  if (isQuoridorV3Engine(playerType, engineConfigs)) {
+    return {
+      wallClockSeconds: QUORIDOR_V3_WALL_CLOCK_DEFAULT,
+      visitsBudget: visitsFromSliderPosition(Math.round(LOCAL_VISITS_RANGE.sliderSteps * 0.45)),
     };
   }
   if (isLocalEngine(playerType, engineConfigs)) {
@@ -195,6 +222,10 @@ export function describePlayerAiSettings(playerType, aiSettings, engineConfigs) 
         config.engineMode === 'minimax' ? 'Titanium αβ + CAT' : 'Titanium αβ + CAT';
       const budgetLabel = 'nodes';
       return `${config.name}: ${time} · ${cap} ${budgetLabel} · ${modeLabel}`;
+    }
+    if (isQuoridorV3Engine(playerType, engineConfigs)) {
+      const depthCap = formatMaxDepth(maxDepthFromVisitsBudget(aiSettings.visitsBudget));
+      return `${config.name}: ${time} · ${depthCap}`;
     }
     return `${config.name}: ${time} · ${cap}`;
   }

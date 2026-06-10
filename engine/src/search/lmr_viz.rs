@@ -2,21 +2,18 @@
 
 use crate::cat::constants::DIST_PENALTY;
 use crate::cat::prune::{
-    collect_search_moves, get_shortest_path, is_tactical_move, move_corridor_attention,
-    order_moves, path_distance,
+    cat_heat_fraction, cat_heat_ref_max, cat_heat_refs, cat_lmr_total_reduction,
+    collect_search_moves, get_shortest_path, is_lmr_heat_hot, is_tactical_move,
+    move_corridor_attention, order_moves, path_distance,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move};
 use crate::movegen::MAX_LEGAL_MOVES;
 use crate::path::BfsScratch;
 use crate::search::lmr_profile::{build_lmr_table, compute_stage_t, LmrProfile};
-use crate::search::root_cap::root_wall_keep_mask;
 use crate::util::perft::format_move;
 
 const LMR_MIN_DEPTH: u32 = 2;
-const ROOT_WALL_CAP_OPENING: usize = 26;
-const ROOT_WALL_CAP_MID: usize = 38;
-
 #[derive(Debug, Clone)]
 pub struct RootLmrPlan {
     pub mv: String,
@@ -117,42 +114,23 @@ pub fn plan_root_lmr(
         |_| 0,
     );
 
-    let mut cat_max = 0u16;
-    for j in 0..n {
-        let cm = move_corridor_attention(board, buf[j], &cat).max(0) as u16;
-        cat_max = cat_max.max(cm);
-    }
-
-    let wall_keep = if id_depth >= 3 {
-        let cap = profile.root_wall_cap().min(if profile.stage_t < 0.40 {
-            ROOT_WALL_CAP_OPENING
-        } else {
-            ROOT_WALL_CAP_MID
-        });
-        root_wall_keep_mask(&buf, n, &cat, cap)
-    } else {
-        [true; MAX_LEGAL_MOVES]
-    };
+    let cat_refs = cat_heat_refs(&buf, n, board, &cat);
+    let cat_max = cat_refs.all;
 
     let lmr_table = build_lmr_table(profile.aggression);
     let depth = id_depth.max(1);
     let child_depth_full = depth.saturating_sub(1);
-    let full_depth_slots = profile.move_window.max(profile.lmr_after_move);
 
     let mut plans = Vec::with_capacity(n);
-    let mut moves_searched = 0usize;
 
     for i in 0..n {
         let mv = buf[i];
         let cat_cm = move_corridor_attention(board, mv, &cat);
-        let heat_ratio_hot = cat_max > 0
-            && (cat_cm.max(0) as u32) * 100 >= (cat_max as u32) * u32::from(profile.hot_ratio_pct);
+        let cat_ref = cat_heat_ref_max(mv, cat_refs);
+        let heat_ratio_hot =
+            is_lmr_heat_hot(cat_cm, cat_max, profile.cold_cm, profile.hot_ratio_pct);
         let corridor_relevant = cat_cm >= i32::from(profile.cold_cm);
-        let in_full_window = moves_searched < full_depth_slots;
-        let is_tactical = if moves_searched == 0
-            || depth < LMR_MIN_DEPTH
-            || heat_ratio_hot
-        {
+        let is_tactical = if i == 0 || depth < LMR_MIN_DEPTH {
             true
         } else if matches!(mv, Move::Wall { .. })
             && !crate::cat::prune::wall_intersects_path(mv, &opp_path, opp_path_len)
@@ -162,41 +140,27 @@ pub fn plan_root_lmr(
             is_tactical_move(board, mv, our_dist, opp_dist_path, bfs)
         };
 
-        let pruned = matches!(mv, Move::Wall { .. }) && !wall_keep[i];
-
-        let reduction = if pruned {
-            child_depth_full
-        } else if moves_searched == 0
-            || depth < LMR_MIN_DEPTH
-            || heat_ratio_hot
-        {
+        let reduction = if i == 0 || depth < LMR_MIN_DEPTH {
             0u32
         } else {
             let d = (depth as usize).min(63);
             let m = (i + 1).min(63);
             let base_r = lmr_table[d][m];
-            let gap = cat_max.saturating_sub(cat_cm.max(0) as u16);
-            let cat_extra = (gap as f32 * profile.cat_heat_lmr_slope).round() as u32;
-            let wall_extra = if matches!(mv, Move::Wall { .. }) && cat_cm == 0 {
-                4u32
-            } else if matches!(mv, Move::Wall { .. })
-                && !crate::cat::prune::wall_intersects_path(mv, &opp_path, opp_path_len)
-                && !corridor_relevant
-            {
-                3u32
-            } else if cat_cm < i32::from(profile.cold_cm) {
-                if profile.stage_t < 0.35 {
-                    3u32
-                } else {
-                    1u32
-                }
-            } else {
-                0u32
-            };
-            (base_r + wall_extra + cat_extra).min(depth.saturating_sub(1))
+            cat_lmr_total_reduction(
+                mv,
+                cat_cm,
+                cat_refs,
+                profile.cold_cm,
+                depth,
+                base_r,
+                &opp_path,
+                opp_path_len,
+                corridor_relevant,
+            )
         };
 
         let child_depth_used = child_depth_full.saturating_sub(reduction);
+        let in_full_window = child_depth_used >= child_depth_full.saturating_sub(1);
 
         plans.push(RootLmrPlan {
             mv: format_move(mv),
@@ -204,17 +168,13 @@ pub fn plan_root_lmr(
             order: i,
             cat_cm,
             tactical: is_tactical,
-            hot: heat_ratio_hot,
-            pruned,
+            hot: heat_ratio_hot || cat_heat_fraction(cat_cm, cat_ref, profile.cold_cm) >= 0.72,
+            pruned: false,
             reduction,
             child_depth_full,
             child_depth_used,
             in_full_window,
         });
-
-        if !pruned {
-            moves_searched += 1;
-        }
     }
 
     (profile, plans)
@@ -313,6 +273,59 @@ mod tests {
         assert!(
             !plans.iter().any(|p| p.mv == "a1h" && p.cat_cm < 40),
             "cold fringe walls should not dominate shallow plan"
+        );
+    }
+
+    #[test]
+    fn shallow_includes_e_file_corridor_walls_at_e4_e6() {
+        let mut board = Board::new();
+        for m in ["e2", "e8", "e3", "e7", "e4", "e6"] {
+            board.apply_algebraic(m);
+        }
+        let mut bfs = BfsScratch::new();
+        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0);
+        assert!(
+            plans.len() >= 15,
+            "expected CAT-filtered root list at e4/e6, got {}",
+            plans.len()
+        );
+        let corridor = ["d4h", "e4h", "d5h", "e5h", "d6h", "e6h"];
+        for wall in corridor {
+            let p = plans
+                .iter()
+                .find(|p| p.mv == wall)
+                .unwrap_or_else(|| panic!("missing corridor wall {wall} in shallow plan"));
+            assert!(
+                p.cat_cm >= 160,
+                "{wall} should be CAT-hot, got {}cm",
+                p.cat_cm
+            );
+            assert!(!p.pruned, "CAT-hot wall {wall} must stay in plan");
+        }
+        let d5 = plans.iter().find(|p| p.mv == "d5h").expect("d5h");
+        let d6 = plans.iter().find(|p| p.mv == "d6h").expect("d6h");
+        assert!(
+            d6.reduction >= d5.reduction,
+            "cooler wall should not get less cut than hotter peak: d6={} d5={}",
+            d6.reduction,
+            d5.reduction
+        );
+        assert!(
+            d5.child_depth_used > d6.child_depth_used || d5.reduction < d6.reduction,
+            "243cm peak should search deeper than 194cm: d5=d{} d6=d{}",
+            d5.child_depth_used,
+            d6.child_depth_used
+        );
+        let hot = plans
+            .iter()
+            .filter(|p| !p.is_pawn)
+            .max_by_key(|p| p.cat_cm)
+            .expect("hot wall");
+        assert!(
+            hot.cat_cm >= 200,
+            "hottest wall should be corridor-hot, got {} on {}",
+            hot.cat_cm,
+            hot.mv
         );
     }
 }

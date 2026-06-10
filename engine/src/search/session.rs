@@ -50,16 +50,24 @@ impl GameSearchSession {
         self.prev_score = None;
     }
 
-    pub fn set_position(&mut self, moves: &[String]) {
-        self.board = Board::new();
+    /// Replay from start. Returns `Ok(plies)` or the first illegal move string.
+    pub fn set_position(&mut self, moves: &[String]) -> Result<usize, String> {
+        self.reset();
+        let mut applied = 0usize;
         for mv in moves {
             if mv.is_empty() {
                 continue;
             }
             if !self.apply_algebraic(mv) {
-                break;
+                return Err(format!(
+                    "illegal move {mv} at ply {} (terminal={:?})",
+                    applied + 1,
+                    self.board.is_terminal()
+                ));
             }
+            applied += 1;
         }
+        Ok(applied)
     }
 
     pub fn apply_algebraic(&mut self, algebraic: &str) -> bool {

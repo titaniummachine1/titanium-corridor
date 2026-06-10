@@ -1,8 +1,10 @@
 import {
   STRENGTH_LEVEL_PRESETS,
   TIME_TO_MOVE_PRESETS,
+  formatMaxDepth,
   formatVisitsCap,
   formatWallClock,
+  maxDepthFromVisitsBudget,
   visitsFromSliderPosition,
 } from '../lib/timeControl.js';
 import { playerColorLabel, playerColorName } from '../lib/playerColors.js';
@@ -79,7 +81,10 @@ function wirePlayerAiSettings(container, controller, playerNum) {
       controller.setPlayerVisitsBudget(playerNum, visits, { silent: true });
       const label = container.querySelector(`[data-visits-label="${playerNum}"]`);
       if (label) {
-        label.textContent = formatVisitsCap(visits);
+        const isV3 = controller.getPlayerAiSettingsUiForSlot(playerNum).isQuoridorV3;
+        label.textContent = isV3
+          ? formatMaxDepth(maxDepthFromVisitsBudget(visits))
+          : formatVisitsCap(visits);
       }
     },
     refresh,
@@ -96,7 +101,7 @@ function renderPlayerAiSettings(ui, playerNum) {
   if (ui.isLocalMcts) {
     const { min: tMin, max: tMax, step: tStep } = ui.wallclockRange;
     const { min: vMin, max: vMax, step: vStep } = ui.visitsRange;
-    const budgetLabel = ui.isTitanium ? 'Nodes' : 'Rollouts';
+    const budgetLabel = ui.isTitanium ? 'Nodes' : ui.isQuoridorV3 ? 'Depth' : 'Rollouts';
     return `
       <div class="player-ai-settings" data-engine="${escapeHtml(engineName)}">
         <p class="player-ai-settings__engine">${escapeHtml(engineName)}</p>
@@ -134,7 +139,11 @@ function renderPlayerAiSettings(ui, playerNum) {
             step="${vStep}"
             value="${ui.visitsSliderPosition}"
           />
-          <output class="time-slider-value" data-visits-label="${playerNum}">${formatVisitsCap(ui.visitsBudget)}</output>
+          <output class="time-slider-value" data-visits-label="${playerNum}">${
+            ui.isQuoridorV3
+              ? formatMaxDepth(maxDepthFromVisitsBudget(ui.visitsBudget))
+              : formatVisitsCap(ui.visitsBudget)
+          }</output>
         </div>
       </div>`;
   }

@@ -9,6 +9,7 @@ import {
   describeAiSettingsForPlayers,
   formatWallClock,
   getEngineConfig,
+  isQuoridorV3Engine,
 } from './timeControl.js';
 
 export { STRENGTH_LEVEL_PRESETS, TIME_TO_MOVE_PRESETS };
@@ -21,6 +22,14 @@ const GORISANSON_ENGINE = {
   key: PlayerType.GorisansonMCTS,
   tooltip: 'Original JavaScript MCTS — first boss (github.com/gorisanson/quoridor-ai)',
   uctConst: 0.2,
+};
+
+const QUORIDOR_V3_ENGINE = {
+  kind: 'quoridor-v3',
+  name: 'Quoridor v3 (JS αβ)',
+  key: PlayerType.QuoridorV3,
+  tooltip:
+    'Self-contained αβ engine — Texel-tuned eval, TT, LMR, aspiration (from quoridor.html standalone)',
 };
 
 const TITANIUM_ENGINE = {
@@ -47,7 +56,7 @@ export function getAllEngineConfigs() {
     ...entry,
     kind: 'remote',
   }));
-  return [GORISANSON_ENGINE, TITANIUM_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
+  return [GORISANSON_ENGINE, QUORIDOR_V3_ENGINE, TITANIUM_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
 }
 
 export function getPlayerOptionGroups() {
@@ -64,6 +73,12 @@ export function getPlayerOptionGroups() {
           label: 'Gorisanson (JS, original)',
           disabled: false,
           tooltip: GORISANSON_ENGINE.tooltip,
+        },
+        {
+          value: PlayerType.QuoridorV3,
+          label: QUORIDOR_V3_ENGINE.name,
+          disabled: false,
+          tooltip: QUORIDOR_V3_ENGINE.tooltip,
         },
         {
           value: PlayerType.TitaniumMinimax,
@@ -176,7 +191,8 @@ function buildSearchDepthHeader(header, { live }) {
   const isAb =
     header.stoppedBy === 'minimax' ||
     header.mode === 'minimax' ||
-    header.playerLabel?.includes('Titanium');
+    header.playerLabel?.includes('Titanium') ||
+    header.playerLabel?.includes('Quoridor v3');
   if (header.nodes != null) {
     parts.push(`${Number(header.nodes).toLocaleString()} nodes`);
   } else if (header.simulations != null && !isAb) {
@@ -282,11 +298,17 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
     return '';
   }
   const config = getEngineConfig(playerType, engineConfigs);
-  if ((config?.kind === 'local' || config?.kind === 'titanium') && searchInfo.time != null) {
+  if (
+    (config?.kind === 'local' ||
+      config?.kind === 'titanium' ||
+      config?.kind === 'quoridor-v3') &&
+    searchInfo.time != null
+  ) {
     const isMinimax =
       searchInfo.stoppedBy === 'minimax' ||
       searchInfo.mode === 'minimax' ||
-      config.engineMode === 'minimax';
+      config.engineMode === 'minimax' ||
+      isQuoridorV3Engine(playerType, engineConfigs);
     const budgetLabel = isMinimax
       ? `${(searchInfo.nodes ?? 0).toLocaleString()} nodes`
       : `${searchInfo.simulations?.toLocaleString() ?? '?'} sims`;

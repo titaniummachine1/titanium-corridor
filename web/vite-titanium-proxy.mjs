@@ -11,36 +11,91 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const binName = process.platform === 'win32' ? 'titanium.exe' : 'titanium';
 const releaseBin = path.join(repoRoot, 'engine', 'target', 'release', binName);
+const altReleaseBin = path.join(repoRoot, 'engine', 'target-alt', 'release', binName);
 const debugBin = path.join(repoRoot, 'engine', 'target', 'debug', binName);
+const altDebugBin = path.join(repoRoot, 'engine', 'target-alt', 'debug', binName);
 
-/** Cached after first successful smoke test — avoids stale release exe panicking on `--depth`. */
+/** Cached after first successful smoke test — rejects stale binaries missing CAT corridor walls. */
 let resolvedBin = null;
 
-function titaniumSmokeOk(bin) {
-  const result = spawnSync(bin, ['lmr', '--time', '0.1', '--depth', '8'], {
+function titaniumBinaryQuickCheck(bin) {
+  const result = spawnSync(bin, ['lmr', 'e2', '--time', '0.1', '--depth', '4'], {
     encoding: 'utf8',
     cwd: repoRoot,
     timeout: 15_000,
   });
-  return (
-    result.status === 0 &&
-    String(result.stdout ?? '').includes('"source":"shallow"')
+  if (result.status !== 0) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(String(result.stdout ?? '').trim());
+    return (
+      payload.source === 'shallow' &&
+      Array.isArray(payload.moves) &&
+      payload.moves.length >= 4
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Strict CAT/LMR alignment check — corridor walls must appear in shallow plan. */
+function titaniumSmokeStrict(bin) {
+  const result = spawnSync(
+    bin,
+    ['lmr', 'e2', 'e8', 'e3', 'e7', 'e4', 'e6', '--time', '10', '--depth', '8'],
+    {
+      encoding: 'utf8',
+      cwd: repoRoot,
+      timeout: 25_000,
+    },
   );
+  if (result.status !== 0) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(String(result.stdout ?? '').trim());
+    const moves = payload.moves ?? [];
+    const d5 = moves.find((m) => m.move === 'd5h');
+    return (
+      payload.source === 'shallow' &&
+      moves.length >= 15 &&
+      d5 &&
+      Number(d5.catCm) >= 200 &&
+      d5.reduction === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+function titaniumSmokeOk(bin) {
+  return titaniumSmokeStrict(bin) || titaniumBinaryQuickCheck(bin);
+}
+
+function candidateBinaries() {
+  return [altReleaseBin, altDebugBin, debugBin, releaseBin].filter((p) => existsSync(p));
 }
 
 function resolveBinary() {
-  if (resolvedBin && existsSync(resolvedBin)) {
+  if (resolvedBin && existsSync(resolvedBin) && titaniumBinaryQuickCheck(resolvedBin)) {
     return resolvedBin;
   }
+  resolvedBin = null;
+
   if (process.env.TITANIUM_BIN) {
     const bin = process.env.TITANIUM_BIN;
     if (!existsSync(bin)) {
       throw new Error(`Titanium binary missing at ${bin}`);
     }
+    if (!titaniumBinaryQuickCheck(bin)) {
+      throw new Error(`Titanium binary failed smoke test at ${bin}`);
+    }
     resolvedBin = bin;
     return bin;
   }
-  const candidates = [releaseBin, debugBin].filter((p) => existsSync(p));
+
+  const candidates = candidateBinaries();
   for (const bin of candidates) {
     if (titaniumSmokeOk(bin)) {
       resolvedBin = bin;
@@ -49,12 +104,27 @@ function resolveBinary() {
   }
   if (candidates.length) {
     throw new Error(
-      `Titanium binary failed lmr smoke test — rebuild: cd engine && cargo build (release locked? stop dev server first)`,
+      `Titanium binary failed smoke test — rebuild: cd engine && cargo build --release --target-dir target-alt`,
     );
   }
   throw new Error(
-    `Titanium binary missing — run: cd engine && cargo build`,
+    `Titanium binary missing — run: cd engine && cargo build --release --target-dir target-alt`,
   );
+}
+
+function prewarmTitaniumBinary() {
+  resolvedBin = null;
+  if (!process.env.TITANIUM_BIN && existsSync(altReleaseBin)) {
+    process.env.TITANIUM_BIN = altReleaseBin;
+  }
+  try {
+    const bin = resolveBinary();
+    console.log(`[titanium] proxy using ${bin}`);
+    return bin;
+  } catch (err) {
+    console.error(`[titanium] proxy: ${err.message ?? err}`);
+    return null;
+  }
 }
 
 function parseProgressLine(line) {
@@ -307,7 +377,7 @@ class TitaniumSeatSession {
     if (!line || !this.pending) {
       return;
     }
-    if (line === 'ready' || line.startsWith('bestmove ') || line.startsWith('error ')) {
+    if (line === 'ready' || line.startsWith('ready ') || line.startsWith('bestmove ') || line.startsWith('error ')) {
       const { resolve, reject } = this.pending;
       this.pending = null;
       if (line.startsWith('error ')) {
@@ -500,6 +570,8 @@ export function titaniumProxyPlugin() {
   return {
     name: 'titanium-rust-proxy',
     configureServer(server) {
+      prewarmTitaniumBinary();
+
       server.middlewares.use('/api/titanium/lmr', (req, res) => {
         if (req.method !== 'POST') {
           res.statusCode = 405;

@@ -20,7 +20,6 @@ use crate::search::lmr_profile::{
 };
 use crate::search::move_pack::{pack_move, unpack_move};
 use crate::search::search_tt::{SearchTt, TtBound};
-use crate::search::root_cap::cap_root_wall_moves;
 use crate::search::session::GameSearchSession;
 use crate::util::grid::is_goal;
 use crate::util::perft::format_move;
@@ -40,8 +39,6 @@ const LOW_WALL_TRAP_CM: i32 = 18;
 
 const LMR_MIN_DEPTH: u32 = 2;
 /// Max walls expanded at the root when `stage_t` is low — rest are CAT-ranked out.
-const ROOT_WALL_CAP_OPENING: usize = 26;
-const ROOT_WALL_CAP_MID: usize = 38;
 const ASPIRATION_DELTA: i32 = 200;
 // Futility margin per depth ply in centi-squares.
 // At depth 1 we allow 2.5 squares slack, at depth 2 we allow 5.0 — beyond that no futility.
@@ -912,11 +909,8 @@ fn negamax_inner(
     let mut moves_searched = 0usize;
     let original_alpha = alpha;
 
-    let mut cat_max = 0u16;
-    for j in 0..n {
-        let cm = move_corridor_attention(board, buf[j], &cat).max(0) as u16;
-        cat_max = cat_max.max(cm);
-    }
+    let cat_refs = prune::cat_heat_refs(&buf, n, board, &cat);
+    let cat_max = cat_refs.all;
 
     // At root, clear diagnostics so only the current depth's data is retained.
     if ply == 0 {
@@ -926,15 +920,6 @@ fn negamax_inner(
     }
 
     let profile = state.lmr_profile;
-
-    if ply == 0 && depth >= 3 {
-        let cap = profile.root_wall_cap().min(if profile.stage_t < 0.40 {
-            ROOT_WALL_CAP_OPENING
-        } else {
-            ROOT_WALL_CAP_MID
-        });
-        cap_root_wall_moves(&mut buf, &mut n, &cat, cap);
-    }
 
     for i in 0..n {
         let mv = buf[i];
@@ -946,15 +931,14 @@ fn negamax_inner(
         //   (b) Disturbs the opponent's shortest path (wall).
         // Tactical moves are NEVER reduced or pruned.
         let cat_cm = move_corridor_attention(board, mv, &cat);
-        let heat_ratio_hot = cat_max > 0
-            && (cat_cm.max(0) as u32) * 100 >= (cat_max as u32) * u32::from(profile.hot_ratio_pct);
+        let heat_ratio_hot = prune::is_lmr_heat_hot(
+            cat_cm,
+            cat_max,
+            profile.cold_cm,
+            profile.hot_ratio_pct,
+        );
         let corridor_relevant = cat_cm >= i32::from(profile.cold_cm);
-        let full_depth_slots = profile.move_window.max(profile.lmr_after_move);
-        let is_tactical = if moves_searched == 0
-            || depth < LMR_MIN_DEPTH
-            || (ply > 0 && moves_searched < full_depth_slots)
-            || heat_ratio_hot
-        {
+        let is_tactical = if moves_searched == 0 || depth < LMR_MIN_DEPTH {
             true
         } else if matches!(mv, Move::Wall { .. })
             && !prune::wall_intersects_path(mv, &opp_path, opp_path_len)
@@ -978,39 +962,35 @@ fn negamax_inner(
         }
 
         // [LMR_BLOCK_START]
-        // Adaptive LMR — profile rebuilt each ID depth. Root: only move 1 is
-        // always full-depth; cold root walls get reduced like internal nodes.
-        let in_full_window = moves_searched < full_depth_slots;
+        // CAT distributes search depth — every generated move is visited; cold
+        // slots search at 1–2 plies unless heatmap says otherwise.
+        let cat_child = prune::cat_heat_child_depth(
+            cat_cm,
+            prune::cat_heat_ref_max(mv, cat_refs),
+            profile.cold_cm,
+            depth.saturating_sub(1),
+        );
+        let in_full_window = cat_child >= depth.saturating_sub(1).saturating_sub(1);
         let reduction = if (ply == 0 && moves_searched == 0)
             || (ply > 0 && is_tactical)
             || depth < LMR_MIN_DEPTH
-            || heat_ratio_hot
         {
             0u32
         } else {
             let d = (depth as usize).min(63);
             let m = (i + 1).min(63);
             let base_r = state.lmr_table[d][m];
-            let gap = cat_max.saturating_sub(cat_cm.max(0) as u16);
-            let cat_extra = (gap as f32 * profile.cat_heat_lmr_slope).round() as u32;
-            // Extra reduction for pure quiet walls (not intersecting opp path at all).
-            let wall_extra = if matches!(mv, Move::Wall { .. }) && cat_cm == 0 {
-                4u32
-            } else if matches!(mv, Move::Wall { .. })
-                && !prune::wall_intersects_path(mv, &opp_path, opp_path_len)
-                && !corridor_relevant
-            {
-                3u32
-            } else if cat_cm < i32::from(profile.cold_cm) {
-                if profile.stage_t < 0.35 {
-                    3u32
-                } else {
-                    1u32
-                }
-            } else {
-                0u32
-            };
-            (base_r + wall_extra + cat_extra).min(depth.saturating_sub(1))
+            prune::cat_lmr_total_reduction(
+                mv,
+                cat_cm,
+                cat_refs,
+                profile.cold_cm,
+                depth,
+                base_r,
+                &opp_path,
+                opp_path_len,
+                corridor_relevant,
+            )
         };
         // [LMR_BLOCK_END]
 

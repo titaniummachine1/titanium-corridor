@@ -1,6 +1,7 @@
 import { playerColorName } from '../lib/playerColors.js';
 import { encodeReplayFromActions } from '../lib/replayCode.js';
 import { updateEngineThinkCards } from './engineThinkView.js';
+import { renderLmrDispersionPanelHtml } from './lmrDispersionView.js';
 
 export { updateEngineThinkCards };
 import './scrapedSlider.css';
@@ -42,6 +43,7 @@ export function renderControls(container, state, controller) {
       ${isReplay ? renderReplayPanel(replay) : ''}
       ${isAnalysis ? renderAnalysisPanel(state) : ''}
       ${!isReplay ? renderBoardToggles(settings, catStatus, lmrStatus) : ''}
+      ${!isReplay ? `<div data-lmr-dispersion-root>${renderLmrDispersionPanelHtml(state)}</div>` : ''}
 
       <div class="play-panel ${isPlay ? '' : 'play-panel--hidden'}">
       <div class="button-row">
@@ -164,6 +166,8 @@ export function updateLmrToggleStatus(container, state) {
   const line = renderLmrStatusLine(state);
   el.textContent = line;
 }
+
+export { updateLmrDispersionPanel } from './lmrDispersionView.js';
 
 function renderBoardToggles(settings, catStatus, lmrStatus) {
   const catNote = catStatus ? `<span class="toggle-group__cat-status">${escapeHtml(catStatus)}</span>` : '';

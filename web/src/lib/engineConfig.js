@@ -40,6 +40,7 @@ const TimeToMove = {
 const PlayerType = {
   Human: 'human',
   GorisansonMCTS: 'gorisanson-mcts',
+  QuoridorV3: 'quoridor-v3',
   Titanium: 'titanium',
   TitaniumMinimax: 'titanium-minimax',
   Pavlosdais: 'pavlosdais',

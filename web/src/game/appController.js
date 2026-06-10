@@ -6,6 +6,7 @@ import { buildLmrViz, fetchLmrSnapshot } from '../lib/lmrHeatmap.js';
 import { toAlgebraic } from '../lib/gameLogic.js';
 import { EngineClient } from '../lib/engineClient.js';
 import { GorisansonEngineClient, TitaniumEngineClient } from '../lib/localMctsEngine.js';
+import { QuoridorV3EngineClient } from '../lib/quoridorV3Engine.js';
 import { PlayerType, StrengthLevel, TimeToMove } from '../lib/engineConfig.js';
 import {
   STRENGTH_LEVEL_PRESETS,
@@ -105,6 +106,7 @@ import {
   isLocalMctsEngine,
   isRemoteEngine,
   isTitaniumEngine,
+  isQuoridorV3Engine,
   getEngineConfig,
 } from '../lib/timeControl.js';
 import { playerColorName } from '../lib/playerColors.js';
@@ -134,10 +136,10 @@ export class AppController {
     this.engineConfigs = getAllEngineConfigs();
 
     this.settings = {
-      players: [PlayerType.TitaniumMinimax, PlayerType.GorisansonMCTS],
+      players: [PlayerType.TitaniumMinimax, PlayerType.QuoridorV3],
       playerAiSettings: [
         defaultPlayerAiSettings(PlayerType.TitaniumMinimax, this.engineConfigs),
-        defaultPlayerAiSettings(PlayerType.GorisansonMCTS, this.engineConfigs),
+        defaultPlayerAiSettings(PlayerType.QuoridorV3, this.engineConfigs),
       ],
       playerAiSettingsMemory: [{}, {}],
       rotateBoard: false,
@@ -188,8 +190,8 @@ export class AppController {
 
     this.session.subscribe(() => this.onSessionChange());
     this.migrateLegacyPlayerTypes();
-    // First paint: Titanium vs Gorisanson AI should not always be White.
-    this.maybeRandomizeTitaniumGorisansonSeats();
+    // First paint: Titanium vs local αβ adversary should not always be White.
+    this.maybeRandomizeTitaniumAdversarySeats();
     this.initialBudgetHint = describeTimeBudget(
       this.settings.players,
       this.settings.playerAiSettings,
@@ -306,7 +308,11 @@ export class AppController {
     }
     this.ensurePlayerAiSettingsSlot(playerNum, playerType);
 
-    if (playerType !== PlayerType.Human && playerType !== PlayerType.GorisansonMCTS) {
+    if (
+      playerType !== PlayerType.Human &&
+      playerType !== PlayerType.GorisansonMCTS &&
+      playerType !== PlayerType.QuoridorV3
+    ) {
       this.syncRemoteEngine(playerType);
     }
     this.onChange?.();
@@ -377,6 +383,7 @@ export class AppController {
       isHuman: playerType === PlayerType.Human,
       isLocal: isLocalEngine(playerType, this.engineConfigs),
       isTitanium: isTitaniumEngine(playerType, this.engineConfigs),
+      isQuoridorV3: isQuoridorV3Engine(playerType, this.engineConfigs),
       isLocalMcts: isLocalMctsEngine(playerType, this.engineConfigs),
       isRemote: isRemoteEngine(playerType, this.engineConfigs),
       strengthLevel: current?.strengthLevel ?? StrengthLevel.Alpha,
@@ -754,20 +761,21 @@ export class AppController {
     this.refreshCatViz();
   }
 
-  /** Titanium vs Gorisanson AI-vs-AI: 50/50 White/Black on load and each new game. */
-  maybeRandomizeTitaniumGorisansonSeats() {
+  /** Titanium vs Quoridor v3 / Gorisanson: 50/50 White/Black on load and each new game. */
+  maybeRandomizeTitaniumAdversarySeats() {
     const { players, playerAiSettings, playerAiSettingsMemory } = this.settings;
     if (players.includes(PlayerType.Human)) {
       return;
     }
     const titaniumSeat = (i) => isTitaniumEngine(players[i], this.engineConfigs);
-    const gorisansonSeat = (i) => players[i] === PlayerType.GorisansonMCTS;
-    const isTiGo =
-      (titaniumSeat(0) && gorisansonSeat(1)) || (gorisansonSeat(0) && titaniumSeat(1));
-    if (!isTiGo) {
+    const localAdversarySeat = (i) =>
+      players[i] === PlayerType.QuoridorV3 || players[i] === PlayerType.GorisansonMCTS;
+    const isTiVsLocal =
+      (titaniumSeat(0) && localAdversarySeat(1)) ||
+      (localAdversarySeat(0) && titaniumSeat(1));
+    if (!isTiVsLocal) {
       return;
     }
-    // Pick Titanium on White or Black; Gorisanson takes the other seat.
     if (Math.random() >= 0.5) {
       return;
     }
@@ -786,7 +794,7 @@ export class AppController {
     this.thinkingSeatIndex = null;
     this.liveSearch = null;
     this.destroyAllEngines();
-    this.maybeRandomizeTitaniumGorisansonSeats();
+    this.maybeRandomizeTitaniumAdversarySeats();
     this.engineErrors = {};
     this.engineStatus = {};
     this.replay = null;
@@ -1019,10 +1027,32 @@ export class AppController {
     if (freePlay) {
       return;
     }
-    void this.syncRemoteEnginesAfterMove(action).then(() => {
-      this.maybeRequestAiMove();
-      this.maybePonderInactiveEngines();
-    });
+    this.continueAiAfterEngineSync(action);
+  }
+
+  /** After any ply, sync remote seats then request the next AI move (never stall on sync failure). */
+  continueAiAfterEngineSync(action) {
+    void this.syncRemoteEnginesAfterMove(action)
+      .catch((err) => {
+        console.error('Engine position sync failed after ply', err);
+        for (let seat = 0; seat < this.settings.players.length; seat++) {
+          if (!isTitaniumEngine(this.settings.players[seat], this.engineConfigs)) {
+            continue;
+          }
+          const message = err?.message ?? String(err);
+          this.engineErrors[seat] = message;
+          this.engineStatus[seat] = 'error';
+          const engine = this.getEngineForSeat(seat);
+          if (engine) {
+            engine.appliedPlies = 0;
+          }
+        }
+        this.onChange?.();
+      })
+      .finally(() => {
+        this.maybeRequestAiMove();
+        this.maybePonderInactiveEngines();
+      });
   }
 
   onSessionChange() {
@@ -1037,6 +1067,9 @@ export class AppController {
   createEngineClient(config, seatIndex = 0) {
     if (config.kind === 'local') {
       return new GorisansonEngineClient(config);
+    }
+    if (config.kind === 'quoridor-v3') {
+      return new QuoridorV3EngineClient(config);
     }
     if (config.kind === 'titanium') {
       return new TitaniumEngineClient(config, { seatId: this.engineSeatKey(seatIndex) });
@@ -1424,17 +1457,25 @@ export class AppController {
 
   recordEngineFailure(playerType, { ply, error, budget }) {
     const message = error?.message ?? String(error ?? 'Engine error');
+    const position = this.session.actions.map((a) => toAlgebraic(a)).join(' ') || '(start)';
+    const legal = this.session
+      .getSnapshot()
+      .validActions.map((mv) => this.session.actionToLabel(mv))
+      .slice(0, 24)
+      .join(' ');
+    const detail = `position="${position}" toMove=${this.session.playerToMove} legalSample=[${legal}]`;
+    const fullMessage = `${message} | ${detail}`;
     console.error('Engine search failed', {
       playerType,
       ply,
       engine: this.engineLabel(playerType),
-      message,
+      message: fullMessage,
       stack: error?.stack,
     });
 
     const failSeat = this.thinkingSeatIndex ?? this.seatIndexForPlayerType(playerType);
     if (failSeat >= 0) {
-      this.engineErrors[failSeat] = message;
+      this.engineErrors[failSeat] = fullMessage;
     }
     if (failSeat >= 0) {
       this.engineStatus[failSeat] = 'error';
@@ -1452,7 +1493,7 @@ export class AppController {
       live: false,
       ply,
       move: null,
-      error: message,
+      error: fullMessage,
       stoppedBy: 'error',
       engine: this.engineLabel(playerType),
       depthLog: si.depthLog,
@@ -1468,7 +1509,7 @@ export class AppController {
       move: null,
       engine: this.engineLabel(playerType),
       budget: budget ?? '',
-      error: message,
+      error: fullMessage,
       stoppedBy: 'error',
       nodes: si.nodes ?? si.simulations ?? 0,
       searchDepth: si.searchDepth,
@@ -1703,11 +1744,8 @@ export class AppController {
       this.engineErrors[seatIndex] = null;
       this.engineStatus[seatIndex] = 'idle';
 
-      void this.syncRemoteEnginesAfterMove(action).then(() => {
-        this.onChange?.();
-        this.maybeRequestAiMove();
-        this.maybePonderInactiveEngines();
-      });
+      this.onChange?.();
+      this.continueAiAfterEngineSync(action);
       return true;
     };
 

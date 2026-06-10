@@ -279,20 +279,9 @@ impl LmrProfile {
         self.lmr_after_move = self.lmr_after_move.min(self.move_window);
     }
 
-    /// CAT-ranked root wall cap — 2 walls at pierce peak in quiet races, up to relaxed mid cap.
+    /// Deprecated — search no longer drops walls at root; CAT scales depth instead.
     pub fn root_wall_cap(&self) -> usize {
-        let relaxed = if self.stage_t < 0.40 {
-            PIERCE_WALL_CAP_RELAXED_OPEN
-        } else {
-            PIERCE_WALL_CAP_RELAXED_MID
-        };
-        let spread = (1.0 - self.stage_t * 0.55).clamp(0.0, 1.0);
-        let tight = lerp(
-            PIERCE_WALL_CAP_PEAK as f32,
-            PIERCE_WALL_CAP_MIN as f32,
-            spread,
-        ) as usize;
-        lerp(relaxed as f32, tight as f32, self.pierce_t) as usize
+        usize::MAX / 4
     }
 
     /// Pierce strength after schedule (1 = full pierce, 0 = fully relaxed).
@@ -337,11 +326,9 @@ pub fn pierce_relax_start(time_ms: u64) -> f32 {
     from_remaining.max(tunables.relax_start).min(0.90)
 }
 
-/// Full-depth move window (pawn + CAT-hot) — 2 at pierce peak, ~20 when relaxed.
-pub fn pierce_move_window(stage_t: f32, pierce: f32) -> usize {
-    let relaxed = lerp(14.0, 20.0, stage_t);
-    let tight = lerp(2.0, 7.0, stage_t);
-    lerp(relaxed, tight, pierce).round().clamp(2.0, 20.0) as usize
+/// Full-depth move window — no hard cap; CAT LMR scales depth per move instead.
+pub fn pierce_move_window(_stage_t: f32, _pierce: f32) -> usize {
+    usize::MAX / 4
 }
 
 /// 0 = full 10s budget, 1 = severe crunch (~2s). Linear in budget fraction —

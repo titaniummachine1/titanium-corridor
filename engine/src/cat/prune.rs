@@ -567,6 +567,151 @@ pub fn collect_search_moves(
     n
 }
 
+/// Absolute CAT corridor floor — same threshold as `wall_should_search` / CAT viz.
+#[inline]
+pub fn is_cat_hot_corridor(cat_cm: i32) -> bool {
+    cat_cm >= i32::from(CAT_HOT_CM)
+}
+
+/// Normalized heat at this node: 0 = at/below `cold_cm`, 1 = `cat_max`.
+/// A move at 200 cm vs 100 cm with max 250 scales ~11× in fraction (proportional to hotspot).
+#[inline]
+pub fn cat_heat_fraction(cat_cm: i32, cat_max: u16, cold_cm: u16) -> f32 {
+    if cat_max <= cold_cm {
+        return if cat_cm > i32::from(cold_cm) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let h = cat_cm.max(0) as f32;
+    let cold = cold_cm as f32;
+    let max_h = cat_max as f32;
+    ((h - cold) / (max_h - cold)).clamp(0.0, 1.0)
+}
+
+/// Full-depth LMR when heat fraction reaches the profile hot-ratio gate.
+#[inline]
+pub fn cat_heat_skips_lmr(cat_cm: i32, cat_max: u16, cold_cm: u16, hot_ratio_pct: u16) -> bool {
+    if cat_max == 0 {
+        return is_cat_hot_corridor(cat_cm);
+    }
+    cat_heat_fraction(cat_cm, cat_max, cold_cm) * 100.0 >= hot_ratio_pct as f32
+}
+
+/// Skip LMR when move heat fraction clears the hot-ratio gate (replaces flat cm cutoff).
+#[inline]
+pub fn is_lmr_heat_hot(cat_cm: i32, cat_max: u16, cold_cm: u16, hot_ratio_pct: u16) -> bool {
+    cat_heat_skips_lmr(cat_cm, cat_max, cold_cm, hot_ratio_pct)
+}
+
+/// Per-node CAT ceilings — walls scale against wall hotspots, not the sprint pawn.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CatHeatRefs {
+    pub all: u16,
+    pub walls: u16,
+    pub pawns: u16,
+}
+
+pub fn cat_heat_refs(buf: &[Move], n: usize, board: &Board, cat: &CorridorAttention) -> CatHeatRefs {
+    let mut refs = CatHeatRefs::default();
+    for i in 0..n {
+        let cm = move_corridor_attention(board, buf[i], cat).max(0) as u16;
+        refs.all = refs.all.max(cm);
+        match buf[i] {
+            Move::Wall { .. } => refs.walls = refs.walls.max(cm),
+            Move::Pawn { .. } => refs.pawns = refs.pawns.max(cm),
+        }
+    }
+    refs
+}
+
+#[inline]
+pub fn cat_heat_ref_max(mv: Move, refs: CatHeatRefs) -> u16 {
+    match mv {
+        Move::Wall { .. } => refs.walls.max(refs.all),
+        Move::Pawn { .. } => refs.all,
+    }
+}
+
+/// Target child plies from CAT heat — cold fringe caps at 1–2, hotspots keep full depth.
+pub fn cat_heat_child_depth(
+    cat_cm: i32,
+    cat_ref_max: u16,
+    cold_cm: u16,
+    child_depth_full: u32,
+) -> u32 {
+    if child_depth_full == 0 {
+        return 0;
+    }
+    if cat_ref_max == 0 || cat_cm <= 0 {
+        return 1.min(child_depth_full);
+    }
+    let heat_t = cat_heat_fraction(cat_cm, cat_ref_max, cold_cm);
+    let mut used = (heat_t.powf(1.45) * child_depth_full as f32).round().max(1.0) as u32;
+    if heat_t < 0.12 {
+        used = used.min(2);
+    } else if heat_t < 0.30 {
+        used = used.min((child_depth_full / 2).max(2));
+    }
+    used.min(child_depth_full)
+}
+
+/// CAT-shaped LMR plies from heat fraction — scales child depth like the heatmap (245 ≫ 98).
+pub fn cat_heat_depth_reduction(
+    cat_cm: i32,
+    cat_ref_max: u16,
+    cold_cm: u16,
+    child_depth_full: u32,
+) -> u32 {
+    let used = cat_heat_child_depth(cat_cm, cat_ref_max, cold_cm, child_depth_full);
+    child_depth_full.saturating_sub(used)
+}
+
+/// CAT-proportional depth — no hard move-count cap; late-index table only stacks on cold moves.
+pub fn cat_lmr_total_reduction(
+    mv: Move,
+    cat_cm: i32,
+    refs: CatHeatRefs,
+    cold_cm: u16,
+    depth: u32,
+    base_r: u32,
+    opp_path: &[u8],
+    opp_path_len: usize,
+    corridor_relevant: bool,
+) -> u32 {
+    let child_full = depth.saturating_sub(1);
+    let cat_ref = cat_heat_ref_max(mv, refs);
+    let heat_t = if cat_ref > 0 && cat_cm > 0 {
+        cat_heat_fraction(cat_cm, cat_ref, cold_cm)
+    } else {
+        0.0
+    };
+    let mut reduction = cat_heat_depth_reduction(cat_cm, cat_ref, cold_cm, child_full);
+    // Stockfish LMR table only bites on cold late moves — never flatten CAT hotspots.
+    if heat_t < 0.22 {
+        reduction = reduction.saturating_add(base_r);
+    }
+    if matches!(mv, Move::Wall { .. }) && cat_cm == 0 {
+        reduction = reduction.saturating_add(2);
+    } else if matches!(mv, Move::Wall { .. })
+        && !wall_intersects_path(mv, opp_path, opp_path_len)
+        && !corridor_relevant
+        && heat_t < 0.35
+    {
+        reduction = reduction.saturating_add(1);
+    }
+    let min_used = 1u32;
+    let max_reduction = child_full.saturating_sub(min_used);
+    reduction.min(max_reduction).min(depth.saturating_sub(1))
+}
+
+/// Quiet-corridor ordering boost — hotter CAT slots sort before colder ones.
+#[inline]
+pub fn cat_corridor_order_boost(cat_cm: i32, cat_max: u16, cold_cm: u16) -> i32 {
+    (cat_heat_fraction(cat_cm, cat_max, cold_cm) * 16_000.0).round() as i32
+}
+
 fn cat_score_for_move(mv: Move, cat: &CorridorAttention) -> i32 {
     match mv {
         Move::Pawn { row, col } => i32::from(cat.square_heat(row, col)),
@@ -618,6 +763,8 @@ pub fn move_order_score(
     opp_path_len: usize,
     bfs: &mut BfsScratch,
     cat: &CorridorAttention,
+    cat_max: u16,
+    cold_cm: u16,
 ) -> i32 {
     if tt_best == Some(mv) {
         return 10_000;
@@ -637,18 +784,21 @@ pub fn move_order_score(
         // has opp_gain = 0, so net ≤ 0 < min_net — score it without any BFS.
         // Only walls that actually cut the path pay one make + two BFS.
         if !wall_intersects_path(mv, opp_path, opp_path_len) {
-            return -20_000 + move_corridor_attention(board, mv, cat);
+            let attn = move_corridor_attention(board, mv, cat);
+            // Proportional CAT hotspot boost — 200 cm sorts well above 100 cm at same node.
+            return -20_000 + cat_corridor_order_boost(attn, cat_max, cold_cm);
         }
         let (opp_gain, our_loss) = wall_race_swing(board, mv, our_dist, opp_dist, bfs);
         let net = opp_gain - our_loss;
         let min_net = min_wall_net_race(our_dist, opp_dist);
+        let attn = move_corridor_attention(board, mv, cat);
         if net < min_net {
-            return -20_000 + move_corridor_attention(board, mv, cat);
+            return -20_000 + cat_corridor_order_boost(attn, cat_max, cold_cm);
         }
         if race_pressure {
-            return 15_000 + net * 120 + move_corridor_attention(board, mv, cat) / 8;
+            return 15_000 + net * 120 + attn / 8;
         }
-        return 12_000 + net * 80;
+        return 12_000 + net * 80 + attn / 16;
     }
 
     let gain = our_path_gain(board, mv, our_dist, bfs);
@@ -663,8 +813,106 @@ pub fn move_order_score(
     if gain > 0 {
         1000 + gain * 100
     } else {
-        move_corridor_attention(board, mv, cat) + TEMPO_PENALTY
+        let attn = move_corridor_attention(board, mv, cat);
+        TEMPO_PENALTY + cat_corridor_order_boost(attn, cat_max, cold_cm)
     }
+}
+
+/// Score band for treating root/order candidates as tied (symmetry interleave).
+const ORDER_SCORE_TIE_BAND: i32 = 150;
+
+#[inline]
+fn move_col(mv: Move) -> u8 {
+    match mv {
+        Move::Pawn { col, .. } | Move::Wall { col, .. } => col,
+    }
+}
+
+#[inline]
+fn symmetry_side(col: u8) -> u8 {
+    if col < 4 {
+        0
+    } else if col > 4 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Mirror across the e-file — d↔f on a 9-wide board (cols 0..8).
+pub fn mirror_move(mv: Move) -> Move {
+    let mirrored = 8 - move_col(mv);
+    match mv {
+        Move::Pawn { row, .. } => Move::Pawn { row, col: mirrored },
+        Move::Wall {
+            row, orientation, ..
+        } => Move::Wall {
+            row,
+            col: mirrored,
+            orientation,
+        },
+    }
+}
+
+/// Within tied score bands, round-robin left / right / center so LMR does not
+/// always feast on the d-file before the f-file.
+fn rebalance_symmetric_order(moves: &mut [Move], scores: &mut [i32], n: usize) {
+    if n <= 1 {
+        return;
+    }
+    let mut out_moves = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let mut out_scores = [0i32; MAX_LEGAL_MOVES];
+    let mut out = 0usize;
+    let mut start = 0usize;
+    while start < n {
+        let top = scores[start];
+        let mut end = start + 1;
+        while end < n && scores[end] >= top - ORDER_SCORE_TIE_BAND {
+            end += 1;
+        }
+        let bucket_len = end - start;
+        if bucket_len <= 1 {
+            out_moves[out] = moves[start];
+            out_scores[out] = scores[start];
+            out += 1;
+            start = end;
+            continue;
+        }
+
+        let mut left = Vec::new();
+        let mut center = Vec::new();
+        let mut right = Vec::new();
+        for idx in start..end {
+            match symmetry_side(move_col(moves[idx])) {
+                0 => left.push(idx),
+                1 => center.push(idx),
+                _ => right.push(idx),
+            }
+        }
+
+        let mut merged = Vec::with_capacity(bucket_len);
+        let max_lr = left.len().max(right.len());
+        for k in 0..max_lr {
+            if k < left.len() {
+                merged.push(left[k]);
+            }
+            if k < right.len() {
+                merged.push(right[k]);
+            }
+        }
+        for &idx in &center {
+            merged.push(idx);
+        }
+
+        for &idx in &merged {
+            out_moves[out] = moves[idx];
+            out_scores[out] = scores[idx];
+            out += 1;
+        }
+        start = end;
+    }
+    moves[..n].copy_from_slice(&out_moves[..n]);
+    scores[..n].copy_from_slice(&out_scores[..n]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -684,8 +932,11 @@ pub fn order_moves(
     extras: &OrderExtras,
     history_bonus: impl Fn(Move) -> i32,
 ) {
+    let cold_cm = CAT_COLD_CM;
+    let refs = cat_heat_refs(moves, n, board, cat);
     for i in 0..n {
         let mv = moves[i];
+        let cat_ref = cat_heat_ref_max(mv, refs);
         let base = move_order_score(
             board,
             mv,
@@ -697,6 +948,8 @@ pub fn order_moves(
             opp_path_len,
             bfs,
             cat,
+            cat_ref,
+            cold_cm,
         );
         let mut score = apply_order_extras(base, mv, tt_best, extras);
         score += history_bonus(mv);
@@ -705,10 +958,14 @@ pub fn order_moves(
     let mut order: [usize; MAX_LEGAL_MOVES] = core::array::from_fn(|i| i);
     order[..n].sort_unstable_by(|&a, &b| scores[b].cmp(&scores[a]));
     let mut tmp = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let mut tmp_scores = [0i32; MAX_LEGAL_MOVES];
     tmp[..n].copy_from_slice(&moves[..n]);
     for i in 0..n {
         moves[i] = tmp[order[i]];
+        tmp_scores[i] = scores[order[i]];
     }
+    scores[..n].copy_from_slice(&tmp_scores[..n]);
+    rebalance_symmetric_order(moves, scores, n);
 }
 
 #[cfg(test)]
@@ -716,6 +973,85 @@ mod tests {
     use super::*;
     use crate::core::board::{Board, Player};
     use crate::util::grid::{set_wall, wall_touch_squares};
+
+    #[test]
+    fn cat_heat_fraction_and_lmr_scale_proportionally() {
+        let cold = 90u16;
+        let max = 250u16;
+        let f100 = cat_heat_fraction(100, max, cold);
+        let f200 = cat_heat_fraction(200, max, cold);
+        assert!(
+            f200 > f100 * 5.0,
+            "200cm should dominate 100cm: {f200} vs {f100}"
+        );
+        let r100 = cat_heat_depth_reduction(100, max, cold, 7);
+        let r200 = cat_heat_depth_reduction(200, max, cold, 7);
+        let r245 = cat_heat_depth_reduction(245, max, cold, 7);
+        assert!(
+            r100 > r200 && r200 > r245,
+            "colder walls should lose more depth: 100={r100} 200={r200} 245={r245}"
+        );
+        let boost100 = cat_corridor_order_boost(100, max, cold);
+        let boost200 = cat_corridor_order_boost(200, max, cold);
+        assert!(boost200 > boost100 * 5);
+    }
+
+    #[test]
+    fn symmetric_flank_pawns_interleave_in_tied_order_band() {
+        use crate::movegen::generate_legal_moves_slice;
+        use crate::util::perft::format_move;
+
+        let mut board = Board::new();
+        board.apply_algebraic("e2");
+        board.apply_algebraic("e8");
+        let mut bfs = BfsScratch::new();
+        let mut scratch = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let full = generate_legal_moves_slice(&mut board, &mut scratch, &mut bfs);
+        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let n = full.min(buf.len());
+        buf[..n].copy_from_slice(&scratch[..n]);
+        let mut scores = [0i32; MAX_LEGAL_MOVES];
+        let cat = bfs.build_corridor_attention(&board);
+        let mut opp_path = [0u8; 81];
+        let opp_len = get_shortest_path(&board, board.side().opposite(), &mut bfs, &mut opp_path);
+        let our_dist = bfs
+            .shortest_distance(&board, board.side())
+            .unwrap_or(DIST_PENALTY);
+        let opp_dist = path_distance(board.side().opposite(), &opp_path, opp_len);
+        order_moves(
+            &mut board,
+            &mut buf,
+            n,
+            None,
+            None,
+            &mut scores,
+            our_dist,
+            opp_dist,
+            &opp_path,
+            opp_len,
+            &mut bfs,
+            &cat,
+            &OrderExtras::default(),
+            |_| 0,
+        );
+        let d2 = buf[..n]
+            .iter()
+            .position(|&m| format_move(m) == "d2")
+            .expect("d2 legal");
+        let f2 = buf[..n]
+            .iter()
+            .position(|&m| format_move(m) == "f2")
+            .expect("f2 legal");
+        assert!(
+            d2.abs_diff(f2) <= 2,
+            "flank pawns should interleave (d2 @ {d2}, f2 @ {f2}); order: {}",
+            buf[..n]
+                .iter()
+                .map(|m| format_move(*m))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     #[test]
     fn blocks_cross_gap_detects_shifted_prevention() {

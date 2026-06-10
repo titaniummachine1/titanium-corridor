@@ -9,6 +9,7 @@ import {
 import {
   lmrDepthStyle,
   lmrDisplayText,
+  lmrEffortBarPct,
   lmrEntryWorthShowing,
   lmrSubLabel,
   lmrWallOutlineColor,
@@ -238,10 +239,17 @@ function renderBoardCell({
     if (lmrViz && lmrEntry?.kind === 'pawn' && lmrEntryWorthShowing(lmrEntry, lmrViz)) {
       square.classList.add('board-cell__square--lmr');
       const style = lmrDepthStyle(lmrEntry, lmrViz);
+      const effort = lmrEffortBarPct(lmrEntry, lmrViz);
       const tint = document.createElement('div');
       tint.className = 'board-cell__lmr-tint';
       tint.style.backgroundColor = style.fill;
       square.appendChild(tint);
+      if (effort > 0) {
+        const bar = document.createElement('div');
+        bar.className = 'board-cell__lmr-effort-bar';
+        bar.style.setProperty('--lmr-effort', `${effort}%`);
+        square.appendChild(bar);
+      }
       const val = document.createElement('span');
       val.className =
         'board-cell__lmr-val' + (style.textLight ? ' board-cell__lmr-val--light' : '');
@@ -350,6 +358,11 @@ function renderBoardCell({
       hint.style.setProperty('--lmr-wall-color', lmrWallOutlineColor(lmrWall, lmrViz));
       hint.style.backgroundColor = style.fill;
       hint.dataset.lmrMode = style.mode ?? '';
+      const wallEffort = lmrEffortBarPct(lmrWall, lmrViz);
+      if (wallEffort > 0) {
+        hint.style.setProperty('--lmr-effort', `${wallEffort}%`);
+        hint.classList.add('board-cell__lmr-wall-hint--bar');
+      }
       const tag = document.createElement('span');
       tag.className = 'board-cell__lmr-wall-tag';
       tag.textContent = lmrDisplayText(lmrWall, lmrViz);

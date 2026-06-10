@@ -82,8 +82,13 @@ pub fn run_session_stdio() {
             }
             "position" => {
                 let moves: Vec<String> = parts[1..].iter().map(|s| (*s).to_string()).collect();
-                session.set_position(&moves);
-                reply_ready(&mut stdout);
+                match session.set_position(&moves) {
+                    Ok(applied) => {
+                        let _ = writeln!(stdout, "ready {applied}");
+                        let _ = stdout.flush();
+                    }
+                    Err(msg) => reply_error(&mut stdout, &msg),
+                }
             }
             "makemove" => {
                 let Some(mv) = parts.get(1) else {
@@ -118,7 +123,9 @@ mod tests {
     fn session_reset_startpos() {
         let mut session = GameSearchSession::new();
         assert_eq!(session.board, Board::new());
-        session.set_position(&["e2".to_string(), "e8".to_string()]);
+        session
+            .set_position(&["e2".to_string(), "e8".to_string()])
+            .expect("e2 e8");
         assert_ne!(session.board, Board::new());
         session.reset();
         assert_eq!(session.board, Board::new());
