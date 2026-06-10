@@ -53,6 +53,8 @@ pub struct AceParams {
     pub max_depth: i32,
     /// Disable the easy-move early stop (search the full time budget).
     pub full: bool,
+    /// Hybrid: CAT-filter wall moves at inner nodes.
+    pub cat: bool,
 }
 
 impl Default for AceParams {
@@ -61,6 +63,7 @@ impl Default for AceParams {
             time_ms: 4000,
             max_depth: 30,
             full: false,
+            cat: false,
         }
     }
 }
@@ -74,7 +77,11 @@ pub fn ace_genmove(moves: &[String], params: AceParams) -> Option<(String, Think
     if g.winner() >= 0 {
         return None;
     }
-    let mut search = AceSearch::new(g);
+    let mut search = if params.cat {
+        AceSearch::with_cat(g)
+    } else {
+        AceSearch::new(g)
+    };
     let result = search.think(params.time_ms, params.max_depth, params.full);
     if result.mv == 0 && search.g.winner() >= 0 {
         return None;

@@ -414,11 +414,19 @@ fn run_genmove(args: &[String]) {
 
 fn is_ace_engine(args: &[String]) -> bool {
     args.windows(2)
-        .any(|w| w[0] == "--engine" && w[1] == "ace")
+        .any(|w| w[0] == "--engine" && (w[1] == "ace" || w[1] == "ace-cat"))
+}
+
+fn is_ace_cat_engine(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|w| w[0] == "--engine" && w[1] == "ace-cat")
 }
 
 fn run_genmove_ace(args: &[String]) {
-    let mut params = titanium::ace::AceParams::default();
+    let mut params = titanium::ace::AceParams {
+        cat: is_ace_cat_engine(args),
+        ..Default::default()
+    };
     let mut moves = Vec::new();
     let mut i = 2usize;
     while i < args.len() {
@@ -460,9 +468,10 @@ fn run_genmove_ace(args: &[String]) {
 
     match titanium::ace::ace_genmove(&moves, params) {
         Some((algebraic, info)) => {
+            let name = if params.cat { "ace-cat" } else { "ace" };
             eprintln!(
-                "info json {{\"engine\":\"ace\",\"rootScore\":{},\"searchDepth\":{},\"nodes\":{},\"elapsedMs\":{}}}",
-                info.score, info.depth, info.nodes, info.ms
+                "info json {{\"engine\":\"{}\",\"rootScore\":{},\"searchDepth\":{},\"nodes\":{},\"elapsedMs\":{}}}",
+                name, info.score, info.depth, info.nodes, info.ms
             );
             println!("bestmove {}", algebraic);
         }
@@ -471,7 +480,9 @@ fn run_genmove_ace(args: &[String]) {
 }
 
 /// Parity harness vs the JS reference — fixed depth, ACE numeric moves.
+/// `--cat` switches to the hybrid wall filter.
 fn run_ace_bench(args: &[String]) {
+    let use_cat = args.iter().any(|a| a == "--cat");
     let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let mut g = titanium::ace::AceGame::new();
     for arg in args.iter().skip(3) {
@@ -480,7 +491,11 @@ fn run_ace_bench(args: &[String]) {
         }
     }
     println!("hash {} {}", g.hash_lo, g.hash_hi);
-    let mut search = titanium::ace::AceSearch::new(g);
+    let mut search = if use_cat {
+        titanium::ace::AceSearch::with_cat(g)
+    } else {
+        titanium::ace::AceSearch::new(g)
+    };
     let r = search.think(1_000_000_000, depth, true);
     println!(
         "{{\"move\":{},\"score\":{},\"depth\":{},\"nodes\":{},\"ms\":{}}}",
