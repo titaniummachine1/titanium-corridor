@@ -179,8 +179,15 @@ function formatThinkEntry(entry) {
       : '';
   const think = formatThinkDuration(entry);
 
+  if (entry.note) {
+    return `ply${entry.ply} ${who}${engine} NOTE: ${entry.note}${budget}`;
+  }
+
   if (entry.error) {
-    return `ply${entry.ply} ${who}${engine} ERROR: ${entry.error}${budget}${dist}${think}`;
+    const rejected = entry.rejected ? ' [board unchanged]' : '';
+    const legal =
+      entry.legalSample ? ` legal⊂ ${entry.legalSample}` : '';
+    return `ply${entry.ply} ${who}${engine} ERROR: ${entry.error}${rejected}${legal}${budget}${dist}${think}`;
   }
 
   const isMcts =
@@ -368,10 +375,10 @@ function formatEngineErrorsBlock(state) {
   const players = state.settings?.players ?? [];
 
   for (let i = 0; i < players.length; i++) {
-    const msg = errors[players[i]];
+    const msg = errors[i] ?? errors[players[i]];
     if (msg) {
       lines.push(
-        `${engineLabelForSlot(state, i + 1)}: ${msg} (status=${status[players[i]] ?? 'error'})`,
+        `${engineLabelForSlot(state, i + 1)}: ${msg} (status=${status[i] ?? status[players[i]] ?? 'error'})`,
       );
     }
   }

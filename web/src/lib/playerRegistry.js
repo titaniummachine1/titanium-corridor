@@ -8,6 +8,7 @@ import {
   TIME_TO_MOVE_PRESETS,
   describeAiSettingsForPlayers,
   formatWallClock,
+  getEngineConfig,
 } from './timeControl.js';
 
 export { STRENGTH_LEVEL_PRESETS, TIME_TO_MOVE_PRESETS };
@@ -25,19 +26,10 @@ const GORISANSON_ENGINE = {
 const TITANIUM_ENGINE = {
   kind: 'titanium',
   name: 'Titanium αβ + CAT',
-  key: PlayerType.Titanium,
-  engineMode: 'minimax',
-  tooltip:
-    'Iterative-deepening negamax with corridor attention — `titanium genmove` (cargo build --release in engine/)',
-};
-
-const TITANIUM_MINIMAX_ENGINE = {
-  kind: 'titanium',
-  name: 'Titanium αβ + CAT',
   key: PlayerType.TitaniumMinimax,
   engineMode: 'minimax',
   tooltip:
-    'Iterative-deepening negamax with adaptive LMR and CAT v3 (`cargo build --release` in engine/)',
+    'Iterative-deepening negamax with adaptive LMR and CAT (`cargo build --release` in engine/)',
 };
 
 const PLACEHOLDER_ENGINES = [
@@ -55,7 +47,7 @@ export function getAllEngineConfigs() {
     ...entry,
     kind: 'remote',
   }));
-  return [GORISANSON_ENGINE, TITANIUM_ENGINE, TITANIUM_MINIMAX_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
+  return [GORISANSON_ENGINE, TITANIUM_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
 }
 
 export function getPlayerOptionGroups() {
@@ -74,16 +66,10 @@ export function getPlayerOptionGroups() {
           tooltip: GORISANSON_ENGINE.tooltip,
         },
         {
-          value: PlayerType.Titanium,
+          value: PlayerType.TitaniumMinimax,
           label: TITANIUM_ENGINE.name,
           disabled: false,
           tooltip: TITANIUM_ENGINE.tooltip,
-        },
-        {
-          value: PlayerType.TitaniumMinimax,
-          label: TITANIUM_MINIMAX_ENGINE.name,
-          disabled: false,
-          tooltip: TITANIUM_MINIMAX_ENGINE.tooltip,
         },
       ],
     },
@@ -295,7 +281,7 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
   if (!searchInfo || playerType === PlayerType.Human) {
     return '';
   }
-  const config = engineConfigs.find((entry) => entry.key === playerType);
+  const config = getEngineConfig(playerType, engineConfigs);
   if ((config?.kind === 'local' || config?.kind === 'titanium') && searchInfo.time != null) {
     const isMinimax =
       searchInfo.stoppedBy === 'minimax' ||

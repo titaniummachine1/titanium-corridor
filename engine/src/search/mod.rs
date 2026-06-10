@@ -2,6 +2,10 @@
 
 pub mod alphabeta;
 pub mod context;
+pub mod move_pack;
+pub mod search_tt;
+pub mod session;
+pub mod session_stdio;
 pub mod deprecated;
 pub mod genmove;
 pub mod greedy;
@@ -12,9 +16,10 @@ pub mod runtime;
 pub mod tt;
 
 pub use alphabeta::{
-    search_best_move, SearchConfig, SearchReport, DEFAULT_MAX_ID_DEPTH, DEFAULT_MAX_NODES,
-    DEFAULT_TIME_MS,
+    run_search, search_best_move, SearchConfig, SearchReport, DEFAULT_MAX_ID_DEPTH,
+    DEFAULT_MAX_NODES, DEFAULT_TIME_MS,
 };
+pub use session::GameSearchSession;
 pub use context::{EngineLimits, SharedState, ThreadBenchResult, WorkerContext};
 pub use genmove::{
     genmove_algebraic, GenmoveConfig, GenmoveEngine, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,

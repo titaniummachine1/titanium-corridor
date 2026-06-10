@@ -583,6 +583,30 @@ pub fn move_corridor_attention(board: &Board, mv: Move, cat: &CorridorAttention)
     cat_score_for_move(mv, cat) + wall_shape_attention_bonus(board, mv, cat)
 }
 
+/// Stockfish-style extras layered on top of tactical ordering.
+#[derive(Clone, Copy, Default)]
+pub struct OrderExtras {
+    pub pv_move: Option<Move>,
+    pub killers: [Option<Move>; 2],
+}
+
+#[inline]
+fn apply_order_extras(base: i32, mv: Move, tt_best: Option<Move>, extras: &OrderExtras) -> i32 {
+    let mut score = base;
+    if tt_best == Some(mv) {
+        return score;
+    }
+    if extras.pv_move == Some(mv) {
+        score = score.max(9_500);
+    }
+    for killer in extras.killers {
+        if killer == Some(mv) {
+            score = score.max(8_500);
+        }
+    }
+    score
+}
+
 pub fn move_order_score(
     board: &mut Board,
     mv: Move,
@@ -657,11 +681,14 @@ pub fn order_moves(
     opp_path_len: usize,
     bfs: &mut BfsScratch,
     cat: &CorridorAttention,
+    extras: &OrderExtras,
+    history_bonus: impl Fn(Move) -> i32,
 ) {
     for i in 0..n {
-        scores[i] = move_order_score(
+        let mv = moves[i];
+        let base = move_order_score(
             board,
-            moves[i],
+            mv,
             tt_best,
             book_hint,
             our_dist,
@@ -671,6 +698,9 @@ pub fn order_moves(
             bfs,
             cat,
         );
+        let mut score = apply_order_extras(base, mv, tt_best, extras);
+        score += history_bonus(mv);
+        scores[i] = score;
     }
     let mut order: [usize; MAX_LEGAL_MOVES] = core::array::from_fn(|i| i);
     order[..n].sort_unstable_by(|&a, &b| scores[b].cmp(&scores[a]));
@@ -1133,6 +1163,8 @@ mod tests {
             opp_path_len,
             &mut bfs,
             &cat,
+            &OrderExtras::default(),
+            |_| 0,
         );
         let mut ranked: Vec<_> = (0..n).map(|i| (scores[i], format_move(buf[i]))).collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0));

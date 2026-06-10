@@ -114,6 +114,10 @@ export class LocalMctsEngineClient {
     this.setStatus('idle');
   }
 
+  clearQueuedSearches() {
+    this.queuedRequest = null;
+  }
+
   destroy() {
     this.cancelSearch();
     this.algebraicMoves = [];
@@ -126,7 +130,10 @@ export class LocalMctsEngineClient {
 
   makeMoves(actions) {
     for (const action of actions) {
-      this.algebraicMoves.push(toAlgebraic(action));
+      const alg = toAlgebraic(action);
+      if (this.algebraicMoves[this.algebraicMoves.length - 1] !== alg) {
+        this.algebraicMoves.push(alg);
+      }
     }
     this.setStatus('idle');
   }
@@ -188,8 +195,16 @@ export class LocalMctsEngineClient {
       onInfo: (info) => this.onInfo?.(info),
       onBestMove: (action) => {
         this.pendingRequest = null;
-        this.onBestMove?.(action);
-        this.drainQueuedRequest();
+        const result = this.onBestMove?.(action);
+        if (result === 'stale') {
+          this.clearQueuedSearches();
+          return;
+        }
+        if (result === false) {
+          this.clearQueuedSearches();
+        } else {
+          this.drainQueuedRequest();
+        }
       },
       onError: (err) => {
         this.pendingRequest = null;

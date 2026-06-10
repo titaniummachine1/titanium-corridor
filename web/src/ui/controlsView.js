@@ -12,9 +12,16 @@ export function renderControls(container, state, controller) {
     uiMode,
     replay,
   } = state;
-  const engineErrorLines = Object.entries(state.engineErrors ?? {})
-    .filter(([, message]) => Boolean(message))
-    .map(([playerType, message]) => `${playerType}: ${message}`)
+  const engineErrorLines = (state.settings?.players ?? [])
+    .map((playerType, seat) => {
+      const message = state.engineErrors?.[seat];
+      if (!message) {
+        return '';
+      }
+      const seatLabel = seat === 0 ? 'White' : 'Black';
+      return `${seatLabel}: ${message}`;
+    })
+    .filter(Boolean)
     .join(' | ');
   const isReplay = uiMode === 'replay';
   const isAnalysis = uiMode === 'analysis';
@@ -136,8 +143,11 @@ export function renderLmrStatusLine(state) {
     return '';
   }
   if (state.settings.lmrVisionShallow) {
-    const n = viz.moves?.length ?? 0;
-    return n ? `${viz.label ?? 'pre-search'} · ${n} mv` : (viz.label ?? 'pre-search');
+    const n = viz.visibleCount ?? viz.moveIndex?.size ?? 0;
+    const depth = viz.searchDepth ?? viz.idDepth ?? '?';
+    return n
+      ? `plan d${depth} · ${n} shown`
+      : `plan d${depth}`;
   }
   const searched = viz.searchedCount ?? viz.moves?.filter((m) => m.searched).length ?? 0;
   const total = viz.moves?.length ?? 0;

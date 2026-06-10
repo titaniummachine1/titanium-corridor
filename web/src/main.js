@@ -9,6 +9,9 @@ import { renderPlayersPanel } from './ui/playerSetupView.js';
 
 const appRoot = document.getElementById('app');
 const controller = new AppController();
+if (import.meta.env.DEV) {
+  window.__controller = controller;
+}
 
 appRoot.innerHTML = `
   <div class="layout">

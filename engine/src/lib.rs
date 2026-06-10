@@ -40,11 +40,13 @@ pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsS
 pub use search::greedy::choose_greedy_move;
 #[allow(deprecated)]
 pub use search::lmr_viz::lmr_snapshot_json;
+pub use search::session_stdio::run_session_stdio;
 pub use search::{
-    genmove_algebraic, search_best_move, search_mcts, search_phase, walls_placed, Engine,
-    GenmoveConfig, GenmoveEngine, MctsConfig, MctsReport, SearchConfig, SearchPhase, SearchReport,
-    TranspositionTable, DEFAULT_MAX_NODES, DEFAULT_TIME_MS, EngineLimits, MCTS_DEFAULT_MAX_SIMULATIONS,
-    MCTS_DEFAULT_UCT, SharedState, ThreadBenchResult, WorkerContext,
+    genmove_algebraic, run_search, search_best_move, search_mcts, search_phase, walls_placed,
+    Engine, EngineLimits, GameSearchSession, GenmoveConfig, GenmoveEngine, MctsConfig, MctsReport,
+    SearchConfig, SearchPhase, SearchReport, SharedState, ThreadBenchResult, TranspositionTable,
+    WorkerContext, DEFAULT_MAX_NODES, DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS,
+    MCTS_DEFAULT_UCT,
 };
 pub use util::perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_iterative, perft_naive,

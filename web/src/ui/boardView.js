@@ -9,6 +9,7 @@ import {
 import {
   lmrDepthStyle,
   lmrDisplayText,
+  lmrEntryWorthShowing,
   lmrSubLabel,
   lmrWallOutlineColor,
 } from '../lib/lmrHeatmap.js';
@@ -234,7 +235,7 @@ function renderBoardCell({
     square.classList.toggle('board-cell__square--prev', isPrev);
     square.classList.toggle('board-cell__square--valid', isValid);
     const lmrEntry = lmrViz?.moveIndex?.get(key);
-    if (lmrViz && lmrEntry?.kind === 'pawn') {
+    if (lmrViz && lmrEntry?.kind === 'pawn' && lmrEntryWorthShowing(lmrEntry, lmrViz)) {
       square.classList.add('board-cell__square--lmr');
       const style = lmrDepthStyle(lmrEntry, lmrViz);
       const tint = document.createElement('div');
@@ -242,7 +243,8 @@ function renderBoardCell({
       tint.style.backgroundColor = style.fill;
       square.appendChild(tint);
       const val = document.createElement('span');
-      val.className = 'board-cell__lmr-val';
+      val.className =
+        'board-cell__lmr-val' + (style.textLight ? ' board-cell__lmr-val--light' : '');
       val.textContent = lmrDisplayText(lmrEntry, lmrViz);
       square.appendChild(val);
       const sub = lmrSubLabel(lmrEntry, lmrViz);
@@ -341,12 +343,13 @@ function renderBoardCell({
     cell.appendChild(wall);
 
     const lmrWall = lmrViz?.moveIndex?.get(key);
-    if (lmrViz && lmrWall?.kind === 'wall' && !owner) {
+    if (lmrViz && lmrWall?.kind === 'wall' && !owner && lmrEntryWorthShowing(lmrWall, lmrViz)) {
       const hint = document.createElement('div');
       hint.className = 'board-cell__lmr-wall-hint';
       const style = lmrDepthStyle(lmrWall, lmrViz);
       hint.style.setProperty('--lmr-wall-color', lmrWallOutlineColor(lmrWall, lmrViz));
       hint.style.backgroundColor = style.fill;
+      hint.dataset.lmrMode = style.mode ?? '';
       const tag = document.createElement('span');
       tag.className = 'board-cell__lmr-wall-tag';
       tag.textContent = lmrDisplayText(lmrWall, lmrViz);
@@ -358,7 +361,8 @@ function renderBoardCell({
         subTag.textContent = sub;
         hint.appendChild(subTag);
       }
-      hint.title = `LMR ${style.label} · order ${lmrWall.order}`;
+      const mode = lmrViz.shallow ? 'pre-search plan' : 'searched';
+      hint.title = `LMR ${mode}: ${style.label} · order ${lmrWall.order + 1}${lmrWall.reSearched ? ' · re-search' : ''}`;
       cell.appendChild(hint);
     } else if (catViz && wallCat && !owner) {
       const hint = document.createElement('div');
@@ -468,14 +472,15 @@ function renderTurnIndicator(playerNum, playerToMove, playerType, engineStatus, 
     return wrap;
   }
 
-  const status = engineStatus[playerType] ?? 'idle';
+  const seatIndex = playerNum - 1;
+  const status = engineStatus[seatIndex] ?? engineStatus[playerType] ?? 'idle';
   const spinner = document.createElement('div');
   spinner.className = 'engine-spinner';
   if (status === 'error') {
     spinner.classList.add('engine-spinner--error');
     spinner.textContent = '!';
-    spinner.title = engineErrors?.[playerType]
-      ? `Engine error: ${engineErrors[playerType]}`
+    spinner.title = engineErrors?.[seatIndex]
+      ? `Engine error: ${engineErrors[seatIndex]}`
       : 'Engine error — try New game or pick another opponent';
   } else if (status === 'pondering') {
     spinner.title = 'Pondering on opponent time...';

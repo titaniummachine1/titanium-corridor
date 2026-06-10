@@ -24,6 +24,11 @@ export class GameSession {
     this.futureActions = [];
   }
 
+  /** 1 = White, 2 = Black — mirrors `getSnapshot().playerToMove`. */
+  get playerToMove() {
+    return this.board.playerToMove();
+  }
+
   subscribe(listener) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

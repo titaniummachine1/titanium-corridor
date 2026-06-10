@@ -77,7 +77,15 @@ export function sliderPositionFromVisits(visits) {
 }
 
 export function getEngineConfig(playerType, engineConfigs) {
-  return engineConfigs.find((entry) => entry.key === playerType);
+  const direct = engineConfigs.find((entry) => entry.key === playerType);
+  if (direct) {
+    return direct;
+  }
+  // Legacy UI key — merged into titanium-minimax
+  if (playerType === PlayerType.Titanium) {
+    return engineConfigs.find((entry) => entry.key === PlayerType.TitaniumMinimax);
+  }
+  return undefined;
 }
 
 export function isRemoteEngine(playerType, engineConfigs) {
@@ -89,7 +97,11 @@ export function isLocalEngine(playerType, engineConfigs) {
 }
 
 export function isTitaniumEngine(playerType, engineConfigs) {
-  return getEngineConfig(playerType, engineConfigs)?.kind === 'titanium';
+  return (
+    playerType === PlayerType.Titanium ||
+    playerType === PlayerType.TitaniumMinimax ||
+    getEngineConfig(playerType, engineConfigs)?.kind === 'titanium'
+  );
 }
 
 export function isLocalMctsEngine(playerType, engineConfigs) {

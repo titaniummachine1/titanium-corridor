@@ -10,16 +10,51 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const binName = process.platform === 'win32' ? 'titanium.exe' : 'titanium';
-const defaultBin = path.join(repoRoot, 'engine', 'target', 'release', binName);
+const releaseBin = path.join(repoRoot, 'engine', 'target', 'release', binName);
+const debugBin = path.join(repoRoot, 'engine', 'target', 'debug', binName);
+
+/** Cached after first successful smoke test — avoids stale release exe panicking on `--depth`. */
+let resolvedBin = null;
+
+function titaniumSmokeOk(bin) {
+  const result = spawnSync(bin, ['lmr', '--time', '0.1', '--depth', '8'], {
+    encoding: 'utf8',
+    cwd: repoRoot,
+    timeout: 15_000,
+  });
+  return (
+    result.status === 0 &&
+    String(result.stdout ?? '').includes('"source":"shallow"')
+  );
+}
 
 function resolveBinary() {
-  const bin = process.env.TITANIUM_BIN ?? defaultBin;
-  if (!existsSync(bin)) {
+  if (resolvedBin && existsSync(resolvedBin)) {
+    return resolvedBin;
+  }
+  if (process.env.TITANIUM_BIN) {
+    const bin = process.env.TITANIUM_BIN;
+    if (!existsSync(bin)) {
+      throw new Error(`Titanium binary missing at ${bin}`);
+    }
+    resolvedBin = bin;
+    return bin;
+  }
+  const candidates = [releaseBin, debugBin].filter((p) => existsSync(p));
+  for (const bin of candidates) {
+    if (titaniumSmokeOk(bin)) {
+      resolvedBin = bin;
+      return bin;
+    }
+  }
+  if (candidates.length) {
     throw new Error(
-      `Titanium binary missing at ${bin} — run: cd engine && cargo build --release`,
+      `Titanium binary failed lmr smoke test — rebuild: cd engine && cargo build (release locked? stop dev server first)`,
     );
   }
-  return bin;
+  throw new Error(
+    `Titanium binary missing — run: cd engine && cargo build`,
+  );
 }
 
 function parseProgressLine(line) {
@@ -193,9 +228,9 @@ function runGenmoveSync(moves, options) {
   return { algebraic: match[1], ...meta };
 }
 
-function runLmrSync(moves, timeSec = 10) {
+function runLmrSync(moves, timeSec = 10, idDepth = 8) {
   const bin = resolveBinary();
-  const args = ['lmr', ...moves, '--time', String(timeSec)];
+  const args = ['lmr', ...moves, '--time', String(timeSec), '--depth', String(idDepth)];
   const result = spawnSync(bin, args, {
     encoding: 'utf8',
     cwd: repoRoot,
@@ -211,6 +246,234 @@ function runLmrSync(moves, timeSec = 10) {
 
   const line = (result.stdout || '').trim();
   return JSON.parse(line);
+}
+
+/** One long-lived `titanium session` per UI engine seat — TT / killers / history persist. */
+const seatSessions = new Map();
+
+class TitaniumSeatSession {
+  constructor(seatId) {
+    this.seatId = seatId;
+    this.stdoutBuf = '';
+    this.stderrBuf = '';
+    this.chain = Promise.resolve();
+    this.pending = null;
+    this.child = null;
+    this.spawn();
+  }
+
+  spawn() {
+    const bin = resolveBinary();
+    const childEnv = { ...process.env };
+    delete childEnv.TITANIUM_DISABLE_BOOK;
+    delete childEnv.TITANIUM_BRIDGE;
+
+    this.child = spawn(bin, ['session'], { cwd: repoRoot, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    this.stdoutBuf = '';
+    this.stderrBuf = '';
+
+    this.child.stdout.on('data', (chunk) => {
+      this.stdoutBuf += chunk.toString();
+      const lines = this.stdoutBuf.split(/\r?\n/);
+      this.stdoutBuf = lines.pop() ?? '';
+      for (const line of lines) {
+        this.onStdoutLine(line.trim());
+      }
+    });
+
+    this.child.stderr.on('data', (chunk) => {
+      this.stderrBuf += chunk.toString();
+      const lines = this.stderrBuf.split(/\r?\n/);
+      this.stderrBuf = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (this.onStderrLine) {
+          this.onStderrLine(trimmed);
+        }
+      }
+    });
+
+    this.child.on('close', () => {
+      if (this.pending) {
+        this.pending.reject(new Error(`titanium session ${this.seatId} exited`));
+        this.pending = null;
+      }
+      this.child = null;
+      seatSessions.delete(this.seatId);
+    });
+  }
+
+  onStdoutLine(line) {
+    if (!line || !this.pending) {
+      return;
+    }
+    if (line === 'ready' || line.startsWith('bestmove ') || line.startsWith('error ')) {
+      const { resolve, reject } = this.pending;
+      this.pending = null;
+      if (line.startsWith('error ')) {
+        reject(new Error(line.slice(6)));
+      } else {
+        resolve(line);
+      }
+    }
+  }
+
+  enqueue(line) {
+    this.chain = this.chain.then(() => {
+      if (!this.child) {
+        this.spawn();
+      }
+      return new Promise((resolve, reject) => {
+        this.pending = { resolve, reject };
+        this.child.stdin.write(`${line}\n`);
+      });
+    });
+    return this.chain;
+  }
+
+  reset() {
+    return this.enqueue('reset');
+  }
+
+  position(moves) {
+    const tail = moves.length ? ` ${moves.join(' ')}` : '';
+    return this.enqueue(`position${tail}`);
+  }
+
+  makemove(move) {
+    return this.enqueue(`makemove ${move}`);
+  }
+
+  go(timeSec, maxNodes, onStderrLine) {
+    this.onStderrLine = onStderrLine ?? null;
+    return this.enqueue(`go ${timeSec} ${maxNodes}`);
+  }
+
+  destroy() {
+    seatSessions.delete(this.seatId);
+    if (this.child) {
+      try {
+        this.child.stdin.write('quit\n');
+      } catch {
+        /* ignore */
+      }
+      this.child.kill();
+      this.child = null;
+    }
+  }
+}
+
+function getSeatSession(seatId) {
+  if (!seatId) {
+    throw new Error('session seatId required');
+  }
+  if (!seatSessions.has(seatId)) {
+    seatSessions.set(seatId, new TitaniumSeatSession(seatId));
+  }
+  return seatSessions.get(seatId);
+}
+
+function destroySeatSession(seatId) {
+  const session = seatSessions.get(seatId);
+  if (session) {
+    session.destroy();
+  }
+}
+
+async function handleSessionOp(payload, res, wantsStream) {
+  const seatId = String(payload.seatId ?? '');
+  const op = String(payload.op ?? '');
+  const session = getSeatSession(seatId);
+
+  if (op === 'reset') {
+    await session.reset();
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (op === 'position') {
+    const moves = Array.isArray(payload.moves) ? payload.moves.map(String) : [];
+    await session.position(moves);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true, plies: moves.length }));
+    return;
+  }
+
+  if (op === 'makemove') {
+    const move = String(payload.move ?? '');
+    await session.makemove(move);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true, move }));
+    return;
+  }
+
+  if (op === 'destroy') {
+    destroySeatSession(seatId);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (op === 'go') {
+    const timeSec = Math.max(0.1, Number(payload.timeSec ?? payload.timeMs / 1000) || 10);
+    const maxNodes = Math.max(1, Number(payload.maxNodes ?? payload.maxSimulations) || 2_000_000_000);
+
+    const writeEvent = wantsStream
+      ? (event) => {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+      : null;
+
+    if (wantsStream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+    }
+
+    const onStderr = (line) => {
+      const parsed = parseProgressLine(line);
+      if (parsed && writeEvent) {
+        writeEvent(parsed);
+      }
+    };
+
+    const line = await session.go(timeSec, maxNodes, onStderr);
+    const match = /^bestmove\s+(\S+)/.exec(line);
+    if (!match || match[1] === '(none)') {
+      if (wantsStream) {
+        writeEvent({ type: 'error', error: `no legal move: ${line}` });
+        res.end();
+      } else {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: `no legal move: ${line}` }));
+      }
+      return;
+    }
+
+    const payloadOut = {
+      type: 'bestmove',
+      algebraic: match[1],
+      stoppedBy: 'minimax',
+    };
+
+    if (wantsStream) {
+      writeEvent(payloadOut);
+      res.end();
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ algebraic: match[1], stoppedBy: 'minimax' }));
+    return;
+  }
+
+  res.statusCode = 400;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ error: `unknown session op: ${op}` }));
 }
 
 function runCatSync(moves) {
@@ -253,7 +516,8 @@ export function titaniumProxyPlugin() {
             const payload = JSON.parse(body || '{}');
             const moves = Array.isArray(payload.moves) ? payload.moves.map(String) : [];
             const timeSec = Number(payload.timeSec) || 10;
-            const result = runLmrSync(moves, timeSec);
+            const idDepth = Number(payload.idDepth ?? payload.searchDepth) || 8;
+            const result = runLmrSync(moves, timeSec, idDepth);
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify(result));
           } catch (err) {
@@ -286,6 +550,33 @@ export function titaniumProxyPlugin() {
             res.statusCode = 500;
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ error: err.message ?? String(err) }));
+          }
+        });
+      });
+
+      server.middlewares.use('/api/titanium/session', (req, res) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end('POST only');
+          return;
+        }
+
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const wantsStream =
+              req.headers.accept?.includes('text/event-stream') || payload.stream === true;
+            await handleSessionOp(payload, res, wantsStream);
+          } catch (err) {
+            if (!res.headersSent) {
+              res.statusCode = 500;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: err.message ?? String(err) }));
+            }
           }
         });
       });

@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use titanium::{
     cat_snapshot_json, generate_legal_moves, genmove_algebraic, lmr_snapshot_json, perft_divide,
-    Board, Engine, GenmoveConfig, GenmoveEngine, MctsConfig, SearchConfig, DEFAULT_MAX_NODES,
-    DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,
+    run_session_stdio, Board, Engine, GenmoveConfig, GenmoveEngine, MctsConfig, SearchConfig,
+    DEFAULT_MAX_NODES, DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,
 };
 
 fn main() {
@@ -27,6 +27,7 @@ fn main() {
         "genmove" => run_genmove(&args),
         "cat" => run_cat(&args),
         "lmr" => run_lmr(&args),
+        "session" => run_session_stdio(),
         _ => print_usage(),
     }
 }
@@ -44,7 +45,12 @@ fn print_usage() {
     println!("              [--time SEC] [--sims N] [--uct F] [--nodes N] [--log]");
     println!("              — default: Gorisanson-style MCTS in Rust");
     println!("  titanium cat [moves...]                — CAT v3 heatmap JSON for current position");
-    println!("  titanium lmr [moves...] [--time SEC]   — root LMR plan JSON (shallow, pre-search)");
+    println!(
+        "  titanium lmr [moves...] [--time SEC] [--depth N] — root LMR plan JSON (default depth 8)"
+    );
+    println!(
+        "  titanium session                       — long-lived REPL (TT persists between plies)"
+    );
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
@@ -344,9 +350,15 @@ fn run_cat(args: &[String]) {
     println!("{}", cat_snapshot_json(&mut board));
 }
 
+fn looks_like_algebraic_move(arg: &str) -> bool {
+    let b = arg.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_lowercase() && b[1].is_ascii_digit()
+}
+
 fn run_lmr(args: &[String]) {
     let mut board = Board::new();
     let mut time_ms = DEFAULT_TIME_MS;
+    let mut id_depth = 8u32;
     let mut i = 2usize;
     while i < args.len() {
         let arg = &args[i];
@@ -356,15 +368,28 @@ fn run_lmr(args: &[String]) {
                 i += 2;
                 continue;
             }
+        } else if arg == "--depth" {
+            if let Some(d) = args.get(i + 1).and_then(|s| s.parse::<u32>().ok()) {
+                id_depth = d;
+                i += 2;
+                continue;
+            }
         } else if arg.starts_with("--") {
+            // Unknown flag — consume a numeric/value token so `8` is not parsed as a move.
+            if let Some(next) = args.get(i + 1) {
+                if !next.starts_with("--") && !looks_like_algebraic_move(next) {
+                    i += 2;
+                    continue;
+                }
+            }
             i += 1;
             continue;
-        } else {
+        } else if looks_like_algebraic_move(arg) {
             board.apply_algebraic(arg);
         }
         i += 1;
     }
-    println!("{}", lmr_snapshot_json(&mut board, time_ms));
+    println!("{}", lmr_snapshot_json(&mut board, time_ms, id_depth));
 }
 
 fn run_genmove(args: &[String]) {

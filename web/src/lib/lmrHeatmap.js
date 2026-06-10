@@ -4,11 +4,11 @@
  * @param {string[]} algebraicMoves
  * @param {number} [timeSec]
  */
-export async function fetchLmrSnapshot(algebraicMoves, timeSec = 10) {
+export async function fetchLmrSnapshot(algebraicMoves, timeSec = 10, idDepth = 8) {
   const res = await fetch('/api/titanium/lmr', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ moves: algebraicMoves, timeSec }),
+    body: JSON.stringify({ moves: algebraicMoves, timeSec, idDepth }),
   });
   const data = await res.json();
   if (!res.ok || data.error) {
@@ -112,46 +112,138 @@ export function indexLmrMoves(moves) {
   return map;
 }
 
-function maxReduction(moves, searchDepth) {
-  let max = 1;
-  for (const m of moves ?? []) {
-    const full = m.childDepthFull || Math.max(0, searchDepth - 1);
-    max = Math.max(max, m.reduction, full);
-  }
-  return max;
+function coldCmThreshold(viz) {
+  return Number(viz?.lmrProfile?.coldCm ?? 60);
 }
 
-/** 0 = full depth (green), 1 = deepest cut (red). */
-function reductionRatio(entry, viz) {
-  const searchDepth = viz?.searchDepth ?? viz?.idDepth ?? 1;
-  const full = entry.childDepthFull || Math.max(0, searchDepth - 1);
-  if (full <= 0) {
+function fmtDepth(used) {
+  const d = Number(used ?? 0);
+  return d > 0 ? `d${d}` : '';
+}
+
+/** Minimum ply reduction before we paint a slot in live search (shallow is sparser). */
+function minCutToShow(viz) {
+  return viz?.shallow ? 1 : 2;
+}
+
+/**
+ * Skip pruned / noise — only draw moves with a meaningful cut, corridor heat, or search share.
+ * `−1` in the UI means "1 ply LMR cut", not a leaf-node flag; we hide lone 1-ply plan noise.
+ */
+export function lmrEntryWorthShowing(entry, viz) {
+  if (!entry || entry.pruned) {
+    return false;
+  }
+  const cold = coldCmThreshold(viz);
+  const minCut = minCutToShow(viz);
+
+  if (entry.reSearched) {
+    return true;
+  }
+
+  // Actually searched at root — always interesting.
+  if (!viz?.shallow && entry.searched && (entry.nodes > 0 || entry.sharePct > 0)) {
+    return true;
+  }
+
+  // Significant planned or actual cut.
+  if (entry.reduction >= minCut) {
+    return true;
+  }
+
+  // Corridor-hot — LMR treats as tactical.
+  if (entry.catCm >= cold) {
+    return true;
+  }
+
+  // First root slot with a real signal only.
+  if (entry.order === 0 && (entry.tactical || entry.inFullWindow)) {
+    return (
+      entry.catCm > 0 ||
+      entry.reduction >= minCut ||
+      (!viz?.shallow && entry.searched && entry.nodes > 0)
+    );
+  }
+
+  // Pre-search plan slots.
+  if (viz?.shallow) {
+    if (entry.reduction >= minCut) {
+      return true;
+    }
+    if (entry.inFullWindow || entry.tactical) {
+      return true;
+    }
+    if (entry.catCm > 0) {
+      return true;
+    }
+    return false;
+  }
+
+  if (entry.unsearched && entry.reduction >= minCut) {
+    return true;
+  }
+
+  return false;
+}
+
+/** Map value into 0..1 using this view's min–max (zeros are not drawn). */
+function proportionalT(value, min, max) {
+  const v = Number(value);
+  if (!Number.isFinite(v) || v <= 0) {
     return 0;
   }
-  return Math.min(1, Math.max(0, entry.reduction / full));
-}
-
-function lerp(a, b, t) {
-  return Math.round(a + (b - a) * t);
-}
-
-function heatFill(ratio, alpha = 0.72) {
-  const t = Math.min(1, Math.max(0, ratio));
-  let r;
-  let g;
-  let b;
-  if (t < 0.5) {
-    const u = t / 0.5;
-    r = lerp(72, 230, u);
-    g = lerp(200, 180, u);
-    b = lerp(120, 60, u);
-  } else {
-    const u = (t - 0.5) / 0.5;
-    r = lerp(230, 230, u);
-    g = lerp(180, 90, u);
-    b = lerp(60, 70, u);
+  if (max <= min) {
+    return 1;
   }
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  return Math.min(1, Math.max(0, (v - min) / (max - min)));
+}
+
+function computeLmrRanges(visibleMoves) {
+  const catValues = visibleMoves.map((m) => Number(m.catCm) || 0).filter((v) => v > 0);
+  const cutValues = visibleMoves.map((m) => Number(m.reduction) || 0).filter((v) => v > 0);
+  const shareValues = visibleMoves.map((m) => Number(m.sharePct) || 0).filter((v) => v > 0);
+  const minCat = catValues.length ? Math.min(...catValues) : 0;
+  const maxCat = catValues.length ? Math.max(...catValues) : 1;
+  const maxCut = cutValues.length ? Math.max(...cutValues) : 1;
+  const maxShare = shareValues.length ? Math.max(...shareValues) : 1;
+  return {
+    catCm: { min: minCat, max: maxCat },
+    reduction: { min: 0, max: maxCut },
+    sharePct: { min: 0, max: maxShare },
+  };
+}
+
+/** Corridor cm — yellow → orange → red, scaled to visible min..max. */
+function corridorFill(t, alpha = 0.8) {
+  const hue = Math.round(52 * (1 - t));
+  const sat = Math.round(86 + 10 * t);
+  const light = Math.round(58 - 12 * t);
+  return {
+    fill: `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`,
+    textLight: light < 48 || t > 0.72,
+  };
+}
+
+/** Ply reduction — teal → amber → crimson, scaled to visible max cut. */
+function cutFill(t, alpha = 0.82) {
+  const hue = Math.round(168 * (1 - t));
+  const sat = Math.round(62 + 30 * t);
+  const light = Math.round(54 - 14 * t);
+  return {
+    fill: `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`,
+    textLight: t > 0.55,
+  };
+}
+
+/** Search node share — slate → indigo → violet, scaled to visible max %. */
+function shareFill(t, alpha = 0.82) {
+  const hue = Math.round(215 - 55 * t);
+  const sat = Math.round(42 + 38 * t);
+  const light = Math.round(64 - 20 * t);
+  return {
+    fill: `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`,
+    textLight: t > 0.45,
+  };
 }
 
 /**
@@ -186,98 +278,125 @@ export function buildLmrViz(payload) {
   if (!shallow) {
     moves = attachNodeShares(moves);
   }
-  const moveIndex = indexLmrMoves(moves);
-  const maxR = maxReduction(moves, searchDepth);
+  const vizDraft = { shallow, searchDepth, lmrProfile: profile };
+  let visibleMoves = moves.filter((m) => lmrEntryWorthShowing(m, vizDraft));
+  if (shallow && visibleMoves.length === 0 && moves.length > 0) {
+    visibleMoves = moves.filter((m) => !m.pruned).slice(0, 48);
+  }
+  const moveIndex = indexLmrMoves(visibleMoves);
+  const ranges = computeLmrRanges(visibleMoves);
   return {
     source: payload.source ?? 'search',
     shallow,
     idDepth: searchDepth,
     searchDepth,
-    maxReduction: maxR,
+    ranges,
+    maxCatCm: ranges.catCm.max,
+    maxSharePct: ranges.sharePct.max,
+    maxReduction: ranges.reduction.max,
     lmrProfile: profile,
     lmrReSearches: payload.lmrReSearches ?? null,
     totalNodes: moves.reduce((s, m) => s + m.nodes, 0),
     searchedCount: moves.filter((m) => m.searched).length,
+    visibleCount: visibleMoves.length,
     moveIndex,
     moves,
+    visibleMoves,
     label: shallow ? 'pre-search plan' : `search d${searchDepth}`,
   };
 }
 
 /**
- * @returns {{ fill: string, label: string }}
+ * @returns {{ fill: string, label: string, mode: string, textLight: boolean }}
  */
 export function lmrDepthStyle(entry, viz) {
   if (!entry) {
-    return { fill: 'transparent', label: '' };
+    return { fill: 'transparent', label: '', mode: '', textLight: false };
   }
-  const ratio = reductionRatio(entry, viz);
-  const alpha = entry.unsearched ? 0.38 : entry.pruned ? 0.42 : 0.72;
-  const fill = heatFill(ratio, alpha);
+  const alpha = entry.unsearched ? 0.42 : 0.84;
   const used = entry.childDepthUsed;
+  const ranges = viz?.ranges ?? computeLmrRanges([entry]);
+  let painted;
+  let mode;
+  if (entry.reduction > 0) {
+    painted = cutFill(
+      proportionalT(entry.reduction, ranges.reduction.min, ranges.reduction.max),
+      alpha,
+    );
+    mode = 'cut';
+  } else if (!viz?.shallow && entry.searched && entry.sharePct > 0) {
+    painted = shareFill(
+      proportionalT(entry.sharePct, ranges.sharePct.min, ranges.sharePct.max),
+      alpha,
+    );
+    mode = 'share';
+  } else if (entry.catCm > 0) {
+    painted = corridorFill(
+      proportionalT(entry.catCm, ranges.catCm.min, ranges.catCm.max),
+      alpha,
+    );
+    mode = 'corridor';
+  } else {
+    painted = cutFill(0, alpha * 0.75);
+    mode = 'full';
+  }
   const label = entry.unsearched
-    ? `not searched · plan −${entry.reduction} · d${used}`
+    ? `plan only · −${entry.reduction} ply${used > 0 ? ` · child d${used}` : ''}`
     : entry.reduction > 0
-      ? `d${used} (−${entry.reduction})`
-      : `d${used} full`;
-  return { fill, label };
+      ? `LMR cut −${entry.reduction} ply${used > 0 ? ` · searched d${used}` : ''}`
+      : mode === 'share'
+        ? `${entry.sharePct}% nodes`
+        : entry.catCm > 0
+          ? `corridor ${entry.catCm}cm`
+          : used > 0
+            ? `d${used} full`
+            : 'full depth';
+  return { fill: painted.fill, label, mode, textLight: painted.textLight };
 }
 
 export function lmrWallOutlineColor(entry, viz) {
   const style = lmrDepthStyle(entry, viz);
-  return style.fill.replace(/,\s*[\d.]+\)$/, ', 0.92)');
+  return style.fill.replace(/,\s*[\d.]+%?\)$/, ', 0.95)');
 }
 
 export function lmrDisplayText(entry, viz) {
-  if (!entry) {
+  if (!entry || !lmrEntryWorthShowing(entry, viz)) {
     return '';
   }
-  const used = entry.childDepthUsed;
-  if (viz?.shallow) {
-    if (entry.reduction > 0) {
-      return `−${entry.reduction}`;
-    }
-    if (entry.catCm > 0) {
-      return String(entry.catCm);
-    }
-    return `d${used}`;
-  }
-  if (entry.searched && entry.sharePct > 0) {
+  if (!viz?.shallow && entry.searched && entry.sharePct > 0) {
     return `${entry.sharePct}%`;
   }
-  if (entry.reduction > 0) {
+  if (entry.reduction >= 2) {
     return `−${entry.reduction}`;
   }
   if (entry.catCm > 0) {
     return String(entry.catCm);
   }
-  return `d${used}`;
+  const depth = fmtDepth(entry.childDepthUsed);
+  if (depth) {
+    return depth;
+  }
+  if (entry.reduction === 1) {
+    return '−1';
+  }
+  return '';
 }
 
 export function lmrSubLabel(entry, viz) {
-  if (!entry) {
+  if (!entry || !lmrEntryWorthShowing(entry, viz)) {
     return '';
   }
   const parts = [];
-  if (viz?.shallow) {
-    if (entry.reduction > 0 && entry.catCm > 0) {
-      parts.push(String(entry.catCm));
-    } else if (entry.reduction === 0) {
-      parts.push(`d${entry.childDepthUsed}`);
-    }
-  } else {
-    if (entry.reduction > 0 || entry.catCm > 0) {
-      parts.push(`d${entry.childDepthUsed}`);
-    }
-    if (entry.catCm > 0 && entry.reduction > 0) {
-      parts.push(String(entry.catCm));
-    }
+  const depth = fmtDepth(entry.childDepthUsed);
+  if (entry.reduction > 0 && entry.catCm > 0) {
+    parts.push(String(entry.catCm));
+  } else if (depth && entry.reduction > 0) {
+    parts.push(depth);
+  } else if (!viz?.shallow && depth && entry.searched) {
+    parts.push(depth);
   }
   if (entry.reSearched) {
     parts.push('↺');
-  }
-  if (entry.unsearched) {
-    parts.push('·');
   }
   return parts.join(' ');
 }

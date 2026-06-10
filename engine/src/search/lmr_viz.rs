@@ -121,6 +121,8 @@ pub fn plan_root_lmr(
         opp_path_len,
         bfs,
         &cat,
+        &crate::cat::prune::OrderExtras::default(),
+        |_| 0,
     );
 
     let lmr_table = build_lmr_table(profile.aggression);
@@ -244,17 +246,17 @@ pub fn format_lmr_plans_json(plans: &[RootLmrPlan]) -> String {
     out
 }
 
-/// Pre-search LMR plan — static profile at pierce peak, depth 2 (first ply reductions apply).
-/// No negamax run; mirrors what the first real ID iterations will slice.
-pub fn lmr_snapshot_json(board: &mut Board, time_ms: u64) -> String {
+/// Pre-search LMR plan — static profile at pierce peak.
+/// `id_depth` should match the ID depth you care about (≥4); depth 2 caps every cut at 1 ply.
+pub fn lmr_snapshot_json(board: &mut Board, time_ms: u64, id_depth: u32) -> String {
     let mut bfs = BfsScratch::new();
-    const SHALLOW_PLAN_DEPTH: u32 = 2;
-    let (profile, plans) = plan_root_lmr(board, &mut bfs, SHALLOW_PLAN_DEPTH, time_ms, 0.0);
+    let depth = id_depth.clamp(4, 32);
+    let (profile, plans) = plan_root_lmr(board, &mut bfs, depth, time_ms, 0.0);
     format!(
         "{{\"source\":\"shallow\",\"idDepth\":{},\"timeMs\":{},\"lmrProfile\":{},\"moves\":[{}]}}",
-        SHALLOW_PLAN_DEPTH,
+        depth,
         time_ms,
-        lmr_profile_fields(&profile, SHALLOW_PLAN_DEPTH),
+        lmr_profile_fields(&profile, depth),
         format_lmr_plans_json(&plans),
     )
 }

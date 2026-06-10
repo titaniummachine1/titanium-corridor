@@ -4,12 +4,13 @@ use std::io::Write;
 use std::time::Instant;
 
 use crate::cat::constants::DIST_PENALTY;
+use crate::cat::prune::OrderExtras;
 use crate::cat::prune::{
     self, collect_search_moves, get_shortest_path, is_tactical_move, move_corridor_attention,
     move_immediate_gain, order_moves, our_path_gain, path_distance,
 };
 use crate::cat::CorridorAttention;
-use crate::core::board::{Board, Move, Player, WallOrientation};
+use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
 use crate::path::BfsScratch;
@@ -17,6 +18,9 @@ use crate::search::lmr_profile::{
     apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
     MateStopReason, MateZoneState,
 };
+use crate::search::move_pack::{pack_move, unpack_move};
+use crate::search::search_tt::{SearchTt, TtBound};
+use crate::search::session::GameSearchSession;
 use crate::util::grid::is_goal;
 use crate::util::perft::format_move;
 
@@ -41,64 +45,9 @@ const ASPIRATION_DELTA: i32 = 200;
 // Futility margin per depth ply in centi-squares.
 // At depth 1 we allow 2.5 squares slack, at depth 2 we allow 5.0 — beyond that no futility.
 const FUTILITY_MARGIN: [i32; 3] = [0, 250, 500];
-const SEARCH_TT_BITS: usize = 20;
-const SEARCH_TT_SIZE: usize = 1 << SEARCH_TT_BITS;
-const SEARCH_TT_MASK: usize = SEARCH_TT_SIZE - 1;
 
 pub const DEFAULT_TIME_MS: u64 = 10_000;
 pub const DEFAULT_MAX_NODES: u64 = 2_000_000_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TtBound {
-    Exact,
-    Lower,
-    Upper,
-}
-
-#[derive(Clone, Copy, Default)]
-struct SearchTtEntry {
-    key: u64,
-    depth: i8,
-    score: i32,
-    bound: u8,
-    best: u32,
-}
-
-#[derive(Default)]
-struct SearchTt {
-    entries: Vec<SearchTtEntry>,
-}
-
-impl SearchTt {
-    fn new() -> Self {
-        Self {
-            entries: vec![SearchTtEntry::default(); SEARCH_TT_SIZE],
-        }
-    }
-
-    fn probe(&self, key: u64) -> Option<SearchTtEntry> {
-        let e = &self.entries[key as usize & SEARCH_TT_MASK];
-        if e.key == key {
-            Some(*e)
-        } else {
-            None
-        }
-    }
-
-    fn store(&mut self, key: u64, depth: i8, score: i32, bound: TtBound, best: u32) {
-        let slot = &mut self.entries[key as usize & SEARCH_TT_MASK];
-        if slot.key != 0 && slot.key != key && slot.depth > depth {
-            return;
-        }
-        *slot = SearchTtEntry {
-            key,
-            depth,
-            score,
-            bound: bound as u8,
-            best,
-        };
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct DepthLogEntry {
@@ -195,6 +144,9 @@ fn effective_max_id_depth(config: &SearchConfig) -> u32 {
 struct SearchState<'a> {
     config: SearchConfig,
     tt: &'a mut SearchTt,
+    killers: &'a mut [[u32; 2]; crate::search::session::MAX_KILLER_PLY],
+    history: &'a mut [i16; crate::search::session::HISTORY_SIZE],
+    pv_hint: Option<Move>,
     bfs: &'a mut BfsScratch,
     nodes: u64,
     deadline: Instant,
@@ -465,41 +417,43 @@ fn score_from_tt(score: i32, ply: u32) -> i32 {
     }
 }
 
-fn pack_move(mv: Move) -> u32 {
-    match mv {
-        Move::Pawn { row, col } => 1 | (u32::from(row) << 8) | (u32::from(col) << 16),
-        Move::Wall {
-            row,
-            col,
-            orientation,
-        } => {
-            let o = match orientation {
-                WallOrientation::Horizontal => 0u32,
-                WallOrientation::Vertical => 1,
-            };
-            2 | (u32::from(row) << 8) | (u32::from(col) << 16) | (o << 24)
-        }
+fn record_killer(
+    killers: &mut [[u32; 2]; crate::search::session::MAX_KILLER_PLY],
+    ply: usize,
+    mv: Move,
+) {
+    if ply >= killers.len() {
+        return;
+    }
+    let packed = pack_move(mv);
+    if packed == 0 {
+        return;
+    }
+    let slot = &mut killers[ply];
+    if slot[0] == packed {
+        return;
+    }
+    slot[1] = slot[0];
+    slot[0] = packed;
+}
+
+fn history_bonus(history: &[i16; crate::search::session::HISTORY_SIZE], mv: Move) -> i32 {
+    let packed = pack_move(mv);
+    if packed == 0 {
+        0
+    } else {
+        i32::from(history[packed as usize % history.len()])
     }
 }
 
-fn unpack_move(packed: u32) -> Option<Move> {
-    match packed & 0xFF {
-        0 => None,
-        1 => Some(Move::Pawn {
-            row: ((packed >> 8) & 0xFF) as u8,
-            col: ((packed >> 16) & 0xFF) as u8,
-        }),
-        2 => Some(Move::Wall {
-            row: ((packed >> 8) & 0xFF) as u8,
-            col: ((packed >> 16) & 0xFF) as u8,
-            orientation: if (packed >> 24) & 1 == 0 {
-                WallOrientation::Horizontal
-            } else {
-                WallOrientation::Vertical
-            },
-        }),
-        _ => None,
+fn bump_history(history: &mut [i16; crate::search::session::HISTORY_SIZE], mv: Move, depth: u32) {
+    let packed = pack_move(mv);
+    if packed == 0 {
+        return;
     }
+    let idx = packed as usize % history.len();
+    let bonus = (depth * depth).min(i16::MAX as u32) as i16;
+    history[idx] = history[idx].saturating_add(bonus);
 }
 
 fn distance_cm(d: Option<u8>) -> i32 {
@@ -925,6 +879,18 @@ fn negamax_inner(
     }
 
     let mut scores = [0i32; MAX_LEGAL_MOVES];
+    let killers = if (ply as usize) < state.killers.len() {
+        [
+            unpack_move(state.killers[ply as usize][0]),
+            unpack_move(state.killers[ply as usize][1]),
+        ]
+    } else {
+        [None, None]
+    };
+    let extras = OrderExtras {
+        pv_move: if ply == 0 { state.pv_hint } else { None },
+        killers,
+    };
     order_moves(
         board,
         &mut buf,
@@ -938,6 +904,8 @@ fn negamax_inner(
         opp_path_len,
         state.bfs,
         &cat,
+        &extras,
+        |mv| history_bonus(state.history, mv),
     );
 
     // ── Forcing extension ─────────────────────────────────────────────────
@@ -1212,6 +1180,8 @@ fn negamax_inner(
             alpha = score;
         }
         if alpha >= beta {
+            record_killer(state.killers, ply as usize, mv);
+            bump_history(state.history, mv, depth);
             break;
         }
     }
@@ -1455,10 +1425,8 @@ fn emit_search_progress(
     let depth_json = format_depth_log_json(&state.depth_log);
     let root_score = state.depth_log.last().map(|e| e.score).unwrap_or(0);
     let root_json = format_root_moves_json(&state.root_moves);
-    let profile_json = crate::search::lmr_viz::lmr_profile_fields(
-        &state.lmr_profile,
-        state.search_depth,
-    );
+    let profile_json =
+        crate::search::lmr_viz::lmr_profile_fields(&state.lmr_profile, state.search_depth);
     eprintln!(
         "info json {{\"stoppedBy\":\"minimax\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"lmrReSearches\":{},\"lmrProfile\":{},\"depthLog\":[{}],\"rootMoves\":[{}]}}",
         state.search_depth,
@@ -1480,8 +1448,7 @@ fn emit_json_report(report: &SearchReport, profile: &LmrProfile, log: bool) {
     }
     let depth_json = format_depth_log_json(&report.depth_log);
     let root_json = format_root_moves_json(&report.root_moves);
-    let profile_json =
-        crate::search::lmr_viz::lmr_profile_fields(profile, report.search_depth);
+    let profile_json = crate::search::lmr_viz::lmr_profile_fields(profile, report.search_depth);
     eprintln!(
         "info json {{\"stoppedBy\":\"minimax\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"aspirationFails\":{},\"lmrReSearches\":{},\"mateExtensions\":{},\"pvMateFailures\":{},\"elapsedMs\":{},\"lmrProfile\":{},\"depthLog\":[{}],\"rootMoves\":[{}]}}",
         report.search_depth,
@@ -1500,8 +1467,18 @@ fn emit_json_report(report: &SearchReport, profile: &LmrProfile, log: bool) {
     );
 }
 
-/// Full-strength search from `board` — returns best move + diagnostics.
+/// One-shot search (CLI `genmove`) — ephemeral session, no cross-ply memory.
 pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<SearchReport> {
+    let mut session = GameSearchSession::new();
+    session.board = board.clone();
+    let report = run_search(&mut session, config)?;
+    *board = session.board;
+    Some(report)
+}
+
+/// Full-strength search on a persistent session — TT / killers / history / PV carry over.
+pub fn run_search(session: &mut GameSearchSession, config: SearchConfig) -> Option<SearchReport> {
+    let board = &mut session.board;
     let mut bfs = BfsScratch::new();
     let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
     let n = generate_legal_moves_slice(board, &mut buf, &mut bfs);
@@ -1589,7 +1566,6 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
 
     let started = Instant::now();
     let deadline = started + std::time::Duration::from_millis(config.time_ms);
-    let mut tt = SearchTt::new();
 
     let white_dist = bfs
         .shortest_distance(board, Player::One)
@@ -1601,7 +1577,9 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
     let our_root_dist = bfs
         .shortest_distance(board, root_side)
         .unwrap_or(DIST_PENALTY);
-    let mut pv_move = buf[0];
+    let pv_hint = session.pv_move;
+    let cached_prev_score = session.prev_score;
+    let mut pv_move = pv_hint.unwrap_or(buf[0]);
     if let Some(hint) = config.book_hint {
         if buf[..n].contains(&hint.mv) {
             pv_move = hint.mv;
@@ -1610,7 +1588,10 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
 
     let mut state = SearchState {
         config,
-        tt: &mut tt,
+        tt: &mut session.tt,
+        killers: &mut session.killers,
+        history: &mut session.history,
+        pv_hint,
         bfs: &mut bfs,
         nodes: 0,
         deadline,
@@ -1650,6 +1631,13 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
             i32::from(hint.stm_bias) / 4
         };
         static_eval.saturating_add(book_pull)
+    } else if let Some(cached) = cached_prev_score {
+        let delta = (cached - static_eval).abs();
+        if delta <= ASPIRATION_DELTA * 4 {
+            cached
+        } else {
+            static_eval
+        }
     } else {
         static_eval
     };
@@ -1810,6 +1798,8 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         root_moves: committed_root_moves,
     };
     emit_json_report(&report, &state.lmr_profile, config.log);
+    session.pv_move = Some(report.best_move);
+    session.prev_score = Some(report.root_score);
     Some(report)
 }
 
