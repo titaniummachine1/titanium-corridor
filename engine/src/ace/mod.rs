@@ -62,6 +62,8 @@ pub struct AceParams {
     pub cat: bool,
     /// Titanium `movegen` on mirrored board (fast full-legal generation).
     pub ti_movegen: bool,
+    /// Stream iterative-deepening progress on stderr (`info json`).
+    pub log: bool,
 }
 
 impl Default for AceParams {
@@ -72,12 +74,17 @@ impl Default for AceParams {
             full: false,
             cat: false,
             ti_movegen: false,
+            log: false,
         }
     }
 }
 
 /// CLI entry — plays `moves` (algebraic) from startpos, thinks, returns best move.
-pub fn ace_genmove(moves: &[String], params: AceParams) -> Option<(String, ThinkResult)> {
+pub fn ace_genmove(
+    moves: &[String],
+    params: AceParams,
+    engine_label: &str,
+) -> Option<(String, ThinkResult)> {
     let mut g = AceGame::new();
     for text in moves {
         g.make_move(algebraic_to_ace(text));
@@ -94,7 +101,13 @@ pub fn ace_genmove(moves: &[String], params: AceParams) -> Option<(String, Think
     } else {
         AceSearch::new(g)
     };
-    let result = search.think(params.time_ms, params.max_depth, params.full);
+    let result = search.think(
+        params.time_ms,
+        params.max_depth,
+        params.full,
+        params.log,
+        engine_label,
+    );
     if result.mv == 0 && search.g.winner() >= 0 {
         return None;
     }

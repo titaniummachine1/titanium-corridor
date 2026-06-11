@@ -1,18 +1,29 @@
 import { PlayerType } from '../lib/engineConfig.js';
-import { formatEngineScore } from '../lib/playerRegistry.js';
+import { formatEngineScore, isMateScore } from '../lib/engineScore.js';
 import { playerColorName } from '../lib/playerColors.js';
 
 const MCTS_MODES = new Set(['mcts', 'opening', 'visits', 'bridge', 'bridge-visits', 'forced']);
+const ACE_MODES = new Set(['ace', 'ace-v8-js', 'ace-v8', 'ace-ti', 'ace-v8-ti', 'ace-cat']);
 
 function isTitaniumAb(payload) {
   const eng = String(payload.engine ?? '');
   return eng.includes('Titanium') || eng.includes('αβ');
 }
 
+function isAcePayload(payload) {
+  return (
+    ACE_MODES.has(payload.stoppedBy) ||
+    ACE_MODES.has(payload.mode) ||
+    String(payload.engine ?? '').includes('ACE v8') ||
+    String(payload.engine ?? '').includes('ACE v8 (JS')
+  );
+}
+
 function isNegamaxPayload(payload) {
   return (
     payload.stoppedBy === 'minimax' ||
     payload.mode === 'minimax' ||
+    isAcePayload(payload) ||
     isTitaniumAb(payload)
   );
 }
@@ -106,6 +117,48 @@ function lastThinkForSeat(state, seatIndex) {
   return null;
 }
 
+/** Last finished think for this seat — kept visible while the opponent searches. */
+function resolveCompletedThink(state, seatIndex) {
+  const frozen = state.lastCompletedThinkBySeat?.[seatIndex];
+  if (frozen && (frozen.move || frozen.depthLog?.length > 0 || frozen.score != null)) {
+    return frozen;
+  }
+  const snap = state.lastThinkBySeat?.[seatIndex];
+  if (snap && !snap.live && (snap.move || snap.depthLog?.length > 0 || snap.score != null)) {
+    return snap;
+  }
+  const entry = lastThinkForSeat(state, seatIndex);
+  if (!entry) {
+    return null;
+  }
+  const deep = deepestEntry(entry.depthLog);
+  return {
+    live: false,
+    engine: entry.engine,
+    move: entry.move,
+    ply: entry.ply,
+    whiteDist: entry.whiteDist,
+    blackDist: entry.blackDist,
+    score: deep?.score ?? entry.rootScore,
+    depth: deep?.depth ?? entry.searchDepth,
+    depthLog: entry.depthLog ?? [],
+    pv: deep?.pv ?? '',
+    nodes: entry.nodes,
+    simulations: entry.simulations ?? entry.nodes ?? 0,
+    rootWinRate: entry.rootWinRate,
+    stoppedBy: entry.stoppedBy,
+    rootMoves: entry.rootMoves,
+  };
+}
+
+function payloadFromCompleted(completed) {
+  return {
+    ...payloadFromSnapshot(completed),
+    live: false,
+    cached: true,
+  };
+}
+
 function payloadFromSnapshot(snap) {
   return {
     live: !!snap.live,
@@ -175,7 +228,7 @@ function thinkPayloadForSeat(state, seatIndex) {
     return idlePayload(seatIndex);
   }
 
-  const saved = state.lastThinkBySeat?.[seatIndex];
+  const completed = resolveCompletedThink(state, seatIndex);
   const isLive =
     state.aiThinking &&
     state.thinkingPlayerType === playerType &&
@@ -191,39 +244,28 @@ function thinkPayloadForSeat(state, seatIndex) {
       livePayload.nodes > 0 ||
       livePayload.rootWinRate != null ||
       livePayload.pv;
-    if (!hasFresh && saved) {
-      return { ...payloadFromSnapshot(saved), live: true, move: saved.move ?? null, ply, stoppedBy: 'searching' };
+    if (!hasFresh && completed) {
+      return {
+        ...payloadFromCompleted(completed),
+        live: true,
+        engine: ls.playerLabel ?? completed.engine,
+        ply,
+        stoppedBy: 'searching',
+      };
     }
-    return { ...livePayload, move: saved?.move ?? null, ply: saved?.ply ?? ply };
+    return {
+      ...livePayload,
+      engine: ls.playerLabel ?? completed?.engine ?? '?',
+      ply,
+      move: null,
+    };
   }
 
-  if (saved) {
-    return payloadFromSnapshot(saved);
+  if (completed) {
+    return payloadFromCompleted(completed);
   }
 
-  const entry = lastThinkForSeat(state, seatIndex);
-  if (!entry) {
-    return idlePayload(seatIndex);
-  }
-
-  const deep = deepestEntry(entry.depthLog);
-  return {
-    live: false,
-    engine: entry.engine,
-    move: entry.move,
-    ply: entry.ply,
-    whiteDist: entry.whiteDist,
-    blackDist: entry.blackDist,
-    score: deep?.score ?? entry.rootScore,
-    depth: deep?.depth ?? entry.searchDepth,
-    depthLog: entry.depthLog ?? [],
-    pv: deep?.pv ?? '',
-    nodes: entry.nodes,
-    simulations: entry.simulations ?? entry.nodes ?? 0,
-    rootWinRate: entry.rootWinRate,
-    stoppedBy: entry.stoppedBy,
-    rootMoves: entry.rootMoves,
-  };
+  return idlePayload(seatIndex);
 }
 
 function prefersWinRate(payload) {
@@ -266,12 +308,13 @@ function heroMetric(payload) {
 
   if (payload.score != null && Number.isFinite(Number(payload.score))) {
     const n = Number(payload.score);
+    const mate = isMateScore(n);
     return {
       left: formatEngineScore(n),
       right: right.value,
       rightLabel: right.label,
-      tone: n > 50 ? 'good' : n < -50 ? 'bad' : 'even',
-      mode: 'eval',
+      tone: mate ? (n > 0 ? 'good' : 'bad') : n > 50 ? 'good' : n < -50 ? 'bad' : 'even',
+      mode: mate ? 'mate' : 'eval',
     };
   }
 
@@ -471,11 +514,13 @@ function patchDepthFeed(card, payload) {
     .slice(0, 6)
     .map((entry) => {
       const score = entry.score != null ? formatEngineScore(entry.score) : '—';
+      const mateClass =
+        entry.score != null && isMateScore(entry.score) ? ' think-card__depth-score--mate' : '';
       const nodes = entry.nodes > 0 ? ` · ${Number(entry.nodes).toLocaleString()}n` : '';
       return `
         <li class="think-card__depth-row">
           <span class="think-card__depth-num">d${entry.depth}</span>
-          <span class="think-card__depth-score">${escapeHtml(score)}</span>
+          <span class="think-card__depth-score${mateClass}">${escapeHtml(score)}</span>
           <span class="think-card__depth-nodes">${escapeHtml(nodes)}</span>
         </li>`;
     })
@@ -530,6 +575,7 @@ function patchThinkCard(card, seatIndex, payload) {
   const pvLead = payload.live ? pvHeadline(payload.pv) : '';
 
   card.classList.toggle('think-card--live', !!payload.live);
+  card.classList.toggle('think-card--cached', !!payload.cached && !payload.live);
   card.classList.toggle('think-card--idle', !!payload.idle);
 
   const pulse = card.querySelector('[data-field="pulse"]');
@@ -555,11 +601,23 @@ function patchThinkCard(card, seatIndex, payload) {
     heroEl.classList.remove('think-card__hero--good', 'think-card__hero--bad', 'think-card__hero--even');
     heroEl.classList.add(`think-card__hero--${hero.tone}`);
   }
-  setText(card.querySelector('[data-field="hero-left"]'), hero.left);
+  const heroLeft = card.querySelector('[data-field="hero-left"]');
+  if (heroLeft) {
+    heroLeft.classList.toggle('think-card__hero-value--mate', hero.mode === 'mate');
+  }
+  setText(heroLeft, hero.left);
   setText(card.querySelector('[data-field="hero-right"]'), hero.right);
   setText(
     card.querySelector('[data-field="hero-left-label"]'),
-    hero.mode === 'winrate' ? 'win rate' : hero.mode === 'eval' ? 'eval (sq)' : hero.mode === 'searching' ? 'searching' : '—',
+    hero.mode === 'winrate'
+      ? 'win rate'
+      : hero.mode === 'mate'
+        ? 'mate'
+        : hero.mode === 'eval'
+          ? 'eval (sq)'
+          : hero.mode === 'searching'
+            ? 'searching'
+            : '—',
   );
   setText(card.querySelector('[data-field="hero-right-label"]'), hero.rightLabel);
 

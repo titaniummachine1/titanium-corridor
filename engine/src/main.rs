@@ -468,6 +468,10 @@ fn run_genmove_ace(args: &[String]) {
             params.full = true;
             i += 1;
             continue;
+        } else if arg == "--log" {
+            params.log = true;
+            i += 1;
+            continue;
         } else if arg == "--engine" {
             i += 2;
             continue;
@@ -487,12 +491,33 @@ fn run_genmove_ace(args: &[String]) {
         i += 1;
     }
 
-    match titanium::ace::ace_genmove(&moves, params) {
+    match titanium::ace::ace_genmove(&moves, params, label) {
         Some((algebraic, info)) => {
-            eprintln!(
-                "info json {{\"engine\":\"{}\",\"rootScore\":{},\"searchDepth\":{},\"nodes\":{},\"elapsedMs\":{}}}",
-                label, info.score, info.depth, info.nodes, info.ms
-            );
+            if !params.log {
+                let mut depth_json = String::new();
+                for (i, e) in info.depth_log.iter().enumerate() {
+                    if i > 0 {
+                        depth_json.push(',');
+                    }
+                    let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
+                    depth_json.push_str(&format!(
+                        "{{\"depth\":{},\"score\":{},\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+                        e.depth, e.score, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
+                    ));
+                }
+                eprintln!(
+                    "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
+                    label,
+                    label,
+                    info.depth,
+                    info.nodes,
+                    info.score,
+                    info.white_dist,
+                    info.black_dist,
+                    info.ms,
+                    depth_json
+                );
+            }
             println!("bestmove {}", algebraic);
         }
         None => println!("bestmove (none)"),
@@ -516,7 +541,7 @@ fn run_ace_bench(args: &[String]) {
     } else {
         titanium::ace::AceSearch::new(g)
     };
-    let r = search.think(1_000_000_000, depth, true);
+    let r = search.think(1_000_000_000, depth, true, false, "ace-bench");
     println!(
         "{{\"move\":{},\"score\":{},\"depth\":{},\"nodes\":{},\"ms\":{}}}",
         r.mv, r.score, r.depth, r.nodes, r.ms

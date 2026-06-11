@@ -73,31 +73,70 @@ function titaniumSmokeOk(bin) {
   return titaniumSmokeStrict(bin) || titaniumBinaryQuickCheck(bin);
 }
 
+/** Reject stale binaries where --engine ace-v8 still routes to minimax. */
+function titaniumAceV8SmokeOk(bin) {
+  const result = spawnSync(bin, ['genmove', '--engine', 'ace-v8-ti', '--time', '0.1', '--log'], {
+    encoding: 'utf8',
+    cwd: repoRoot,
+    timeout: 20_000,
+  });
+  if (result.status !== 0) {
+    return false;
+  }
+  const jsonLine = String(result.stderr ?? '')
+    .split(/\r?\n/)
+    .reverse()
+    .find((line) => line.startsWith('info json '));
+  if (!jsonLine) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(jsonLine.slice('info json '.length));
+    return (
+      (payload.engine === 'ace-v8' || payload.engine === 'ace-v8-ti') &&
+      Array.isArray(payload.depthLog) &&
+      payload.depthLog.length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 function candidateBinaries() {
-  return [altReleaseBin, altDebugBin, debugBin, releaseBin].filter((p) => existsSync(p));
+  // Prefer target/release (default cargo output) so ace-v8 wiring is not shadowed by stale target-alt.
+  return [releaseBin, altReleaseBin, debugBin, altDebugBin].filter((p) => existsSync(p));
 }
 
 function resolveBinary() {
-  if (resolvedBin && existsSync(resolvedBin) && titaniumBinaryQuickCheck(resolvedBin)) {
+  if (
+    resolvedBin &&
+    existsSync(resolvedBin) &&
+    titaniumBinaryQuickCheck(resolvedBin) &&
+    titaniumAceV8SmokeOk(resolvedBin)
+  ) {
     return resolvedBin;
   }
   resolvedBin = null;
 
   if (process.env.TITANIUM_BIN) {
     const bin = process.env.TITANIUM_BIN;
-    if (!existsSync(bin)) {
-      throw new Error(`Titanium binary missing at ${bin}`);
+    if (
+      existsSync(bin) &&
+      titaniumBinaryQuickCheck(bin) &&
+      titaniumAceV8SmokeOk(bin)
+    ) {
+      resolvedBin = bin;
+      return bin;
     }
-    if (!titaniumBinaryQuickCheck(bin)) {
-      throw new Error(`Titanium binary failed smoke test at ${bin}`);
-    }
-    resolvedBin = bin;
-    return bin;
+    console.warn(
+      `[titanium] proxy: ignoring TITANIUM_BIN=${bin} (missing, failed smoke, or no ace-v8)`,
+    );
+    delete process.env.TITANIUM_BIN;
   }
 
   const candidates = candidateBinaries();
   for (const bin of candidates) {
-    if (titaniumSmokeOk(bin)) {
+    if (titaniumSmokeOk(bin) && titaniumAceV8SmokeOk(bin)) {
       resolvedBin = bin;
       return bin;
     }
@@ -114,9 +153,6 @@ function resolveBinary() {
 
 function prewarmTitaniumBinary() {
   resolvedBin = null;
-  if (!process.env.TITANIUM_BIN && existsSync(altReleaseBin)) {
-    process.env.TITANIUM_BIN = altReleaseBin;
-  }
   try {
     const bin = resolveBinary();
     console.log(`[titanium] proxy using ${bin}`);
@@ -148,28 +184,49 @@ function parseProgressLine(line) {
   return null;
 }
 
-function runGenmoveStreaming(moves, options, res) {
-  const bin = resolveBinary();
+function normalizeGenmoveEngine(engine) {
+  if (
+    engine === 'minimax' ||
+    engine === 'ace' ||
+    engine === 'ace-v8' ||
+    engine === 'ace-ti' ||
+    engine === 'ace-v8-ti' ||
+    engine === 'ace-cat'
+  ) {
+    return engine;
+  }
+  return 'mcts';
+}
+
+function buildGenmoveArgs(moves, options) {
   const timeSec = Math.max(0.1, Number(options.timeSec) || 10);
   const maxSims = Math.max(1, Number(options.maxSimulations) || 2_000_000_000);
   const maxNodes = Math.max(1, Number(options.maxNodes) || maxSims);
   const uct = Number(options.uct) || 0.2;
-  const engine = options.engine === 'minimax' ? 'minimax' : 'mcts';
+  const engine = normalizeGenmoveEngine(options.engine);
 
-  const args = [
-    'genmove',
-    ...moves,
-    '--engine',
-    engine,
-    '--time',
-    String(timeSec),
-    '--log',
-  ];
+  const args = ['genmove', ...moves, '--engine', engine, '--time', String(timeSec), '--log'];
   if (engine === 'minimax') {
     args.push('--nodes', String(maxNodes));
+  } else if (
+    engine === 'ace' ||
+    engine === 'ace-v8' ||
+    engine === 'ace-ti' ||
+    engine === 'ace-v8-ti' ||
+    engine === 'ace-cat'
+  ) {
+    if (options.maxDepth != null) {
+      args.push('--depth', String(Math.max(1, Math.round(Number(options.maxDepth)))));
+    }
   } else {
     args.push('--sims', String(maxSims), '--uct', String(uct));
   }
+  return { args, engine, timeSec };
+}
+
+function runGenmoveStreaming(moves, options, res) {
+  const bin = resolveBinary();
+  const { args, engine } = buildGenmoveArgs(moves, options);
 
   const childEnv = { ...process.env };
   delete childEnv.TITANIUM_DISABLE_BOOK;
@@ -237,26 +294,7 @@ function runGenmoveStreaming(moves, options, res) {
 
 function runGenmoveSync(moves, options) {
   const bin = resolveBinary();
-  const timeSec = Math.max(0.1, Number(options.timeSec) || 10);
-  const maxSims = Math.max(1, Number(options.maxSimulations) || 2_000_000_000);
-  const maxNodes = Math.max(1, Number(options.maxNodes) || maxSims);
-  const uct = Number(options.uct) || 0.2;
-  const engine = options.engine === 'minimax' ? 'minimax' : 'mcts';
-
-  const args = [
-    'genmove',
-    ...moves,
-    '--engine',
-    engine,
-    '--time',
-    String(timeSec),
-    '--log',
-  ];
-  if (engine === 'minimax') {
-    args.push('--nodes', String(maxNodes));
-  } else {
-    args.push('--sims', String(maxSims), '--uct', String(uct));
-  }
+  const { args, engine } = buildGenmoveArgs(moves, options);
 
   const childEnv = { ...process.env };
   delete childEnv.TITANIUM_DISABLE_BOOK;

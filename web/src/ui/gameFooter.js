@@ -1,6 +1,7 @@
 import { formatCoordinate, toAlgebraic } from '../lib/gameLogic.js';
 import { encodeReplayFromActions } from '../lib/replayCode.js';
 import { playerColorName } from '../lib/playerColors.js';
+import { formatEngineScore } from '../lib/engineScore.js';
 import { formatVisits, formatWallClock, TIME_TO_MOVE_PRESETS, STRENGTH_LEVEL_PRESETS } from '../lib/timeControl.js';
 
 const SETTINGS_FIELD_LABELS = {
@@ -80,23 +81,6 @@ function escapeHtml(text) {
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;');
-}
-
-function isMateScore(score) {
-  return Math.abs(Number(score) || 0) >= 19_500;
-}
-
-function formatEngineScore(score) {
-  if (score == null || !Number.isFinite(Number(score))) {
-    return '?';
-  }
-  const n = Number(score);
-  if (isMateScore(n)) {
-    const sign = n > 0 ? '+' : '-';
-    return `${sign}M${Math.max(0, 20_000 - Math.abs(n))}`;
-  }
-  const meters = n / 100;
-  return `${meters > 0 ? '+' : ''}${meters.toFixed(2)}`;
 }
 
 function formatDepthLog(depthLog) {
@@ -190,8 +174,17 @@ function formatThinkEntry(entry) {
     return `ply${entry.ply} ${who}${engine} ERROR: ${entry.error}${rejected}${legal}${budget}${dist}${think}`;
   }
 
+  const isAce =
+    entry.engine?.includes('ACE v8') ||
+    entry.stoppedBy === 'ace' ||
+    entry.stoppedBy === 'ace-v8-js' ||
+    entry.stoppedBy === 'ace-v8' ||
+    entry.stoppedBy === 'ace-ti' ||
+    entry.stoppedBy === 'ace-v8-ti';
+
   const isMcts =
     !isTitaniumThinkEntry(entry) &&
+    !isAce &&
     entry.stoppedBy !== 'minimax' &&
     (entry.stoppedBy === 'mcts' ||
       entry.stoppedBy === 'time' ||

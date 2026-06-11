@@ -10,6 +10,7 @@ import {
   formatWallClock,
   getEngineConfig,
   isQuoridorV3Engine,
+  isAceEngine,
 } from './timeControl.js';
 
 export { STRENGTH_LEVEL_PRESETS, TIME_TO_MOVE_PRESETS };
@@ -41,6 +42,31 @@ const TITANIUM_ENGINE = {
     'Iterative-deepening negamax with adaptive LMR and CAT (`cargo build --release` in engine/)',
 };
 
+const ACE_V8_JS_ENGINE = {
+  kind: 'ace-v8-js',
+  name: 'ACE v8 (JS HTML)',
+  key: PlayerType.AceV8Js,
+  tooltip:
+    'Unmodified engine extract from quoridor (5).html — runs in a Web Worker, parity reference',
+};
+
+const ACE_V8_ENGINE = {
+  kind: 'ace',
+  name: 'ACE v8 (Rust port)',
+  key: PlayerType.AceV8,
+  engineMode: 'ace-v8',
+  tooltip:
+    '1:1 Rust port of quoridor (5).html gen-8 — HalfPW eval (H=32), v8 think clock',
+};
+
+const ACE_V8_TI_ENGINE = {
+  kind: 'ace',
+  name: 'ACE v8 (Rust) + Ti movegen',
+  key: PlayerType.AceV8Ti,
+  engineMode: 'ace-v8-ti',
+  tooltip: 'Rust v8 search with Titanium legal-move generation at the root only',
+};
+
 const PLACEHOLDER_ENGINES = [
   {
     kind: 'placeholder',
@@ -56,7 +82,16 @@ export function getAllEngineConfigs() {
     ...entry,
     kind: 'remote',
   }));
-  return [GORISANSON_ENGINE, QUORIDOR_V3_ENGINE, TITANIUM_ENGINE, ...remote, ...PLACEHOLDER_ENGINES];
+  return [
+    GORISANSON_ENGINE,
+    QUORIDOR_V3_ENGINE,
+    TITANIUM_ENGINE,
+    ACE_V8_JS_ENGINE,
+    ACE_V8_ENGINE,
+    ACE_V8_TI_ENGINE,
+    ...remote,
+    ...PLACEHOLDER_ENGINES,
+  ];
 }
 
 export function getPlayerOptionGroups() {
@@ -85,6 +120,24 @@ export function getPlayerOptionGroups() {
           label: TITANIUM_ENGINE.name,
           disabled: false,
           tooltip: TITANIUM_ENGINE.tooltip,
+        },
+        {
+          value: PlayerType.AceV8Js,
+          label: ACE_V8_JS_ENGINE.name,
+          disabled: false,
+          tooltip: ACE_V8_JS_ENGINE.tooltip,
+        },
+        {
+          value: PlayerType.AceV8,
+          label: ACE_V8_ENGINE.name,
+          disabled: false,
+          tooltip: ACE_V8_ENGINE.tooltip,
+        },
+        {
+          value: PlayerType.AceV8Ti,
+          label: ACE_V8_TI_ENGINE.name,
+          disabled: false,
+          tooltip: ACE_V8_TI_ENGINE.tooltip,
         },
       ],
     },
@@ -136,18 +189,9 @@ export function describeActiveSearchInfo(
   return aiTypes.map(formatOne).filter(Boolean).join(' · ');
 }
 
-export function formatEngineScore(score) {
-  if (score == null || !Number.isFinite(Number(score))) {
-    return '?';
-  }
-  const n = Number(score);
-  if (Math.abs(n) >= 19_500) {
-    const sign = n > 0 ? '+' : '-';
-    return `${sign}M${Math.max(0, 20_000 - Math.abs(n))}`;
-  }
-  const meters = n / 100;
-  return `${meters > 0 ? '+' : ''}${meters.toFixed(2)}`;
-}
+import { formatEngineScore, isMateScore, mateInfo } from './engineScore.js';
+
+export { formatEngineScore, isMateScore, mateInfo };
 
 const SEARCH_STOP_LABELS = {
   visits: 'hit cap',
@@ -156,6 +200,11 @@ const SEARCH_STOP_LABELS = {
   trivial: 'instant',
   opening: 'opening',
   minimax: 'minimax',
+  ace: 'ACE v8',
+  'ace-v8-js': 'ACE v8 JS',
+  'ace-v8': 'ACE v8 Rust',
+  'ace-ti': 'ACE v8 + Ti',
+  'ace-v8-ti': 'ACE v8 + Ti',
   mcts: 'MCTS',
   hybrid: 'hybrid',
   race: 'win path',
@@ -191,8 +240,19 @@ function buildSearchDepthHeader(header, { live }) {
   const isAb =
     header.stoppedBy === 'minimax' ||
     header.mode === 'minimax' ||
+    header.stoppedBy === 'ace' ||
+    header.stoppedBy === 'ace-v8-js' ||
+    header.stoppedBy === 'ace-v8' ||
+    header.stoppedBy === 'ace-ti' ||
+    header.stoppedBy === 'ace-v8-ti' ||
+    header.mode === 'ace' ||
+    header.mode === 'ace-v8-js' ||
+    header.mode === 'ace-v8' ||
+    header.mode === 'ace-ti' ||
+    header.mode === 'ace-v8-ti' ||
     header.playerLabel?.includes('Titanium') ||
-    header.playerLabel?.includes('Quoridor v3');
+    header.playerLabel?.includes('Quoridor v3') ||
+    header.playerLabel?.includes('ACE v8');
   if (header.nodes != null) {
     parts.push(`${Number(header.nodes).toLocaleString()} nodes`);
   } else if (header.simulations != null && !isAb) {
@@ -301,14 +361,16 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
   if (
     (config?.kind === 'local' ||
       config?.kind === 'titanium' ||
-      config?.kind === 'quoridor-v3') &&
+      config?.kind === 'quoridor-v3' ||
+      config?.kind === 'ace') &&
     searchInfo.time != null
   ) {
     const isMinimax =
       searchInfo.stoppedBy === 'minimax' ||
       searchInfo.mode === 'minimax' ||
       config.engineMode === 'minimax' ||
-      isQuoridorV3Engine(playerType, engineConfigs);
+      isQuoridorV3Engine(playerType, engineConfigs) ||
+      isAceEngine(playerType, engineConfigs);
     const budgetLabel = isMinimax
       ? `${(searchInfo.nodes ?? 0).toLocaleString()} nodes`
       : `${searchInfo.simulations?.toLocaleString() ?? '?'} sims`;

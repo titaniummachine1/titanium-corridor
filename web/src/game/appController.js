@@ -6,6 +6,7 @@ import { buildLmrViz, fetchLmrSnapshot } from '../lib/lmrHeatmap.js';
 import { toAlgebraic } from '../lib/gameLogic.js';
 import { EngineClient } from '../lib/engineClient.js';
 import { GorisansonEngineClient, TitaniumEngineClient } from '../lib/localMctsEngine.js';
+import { AceV8JsEngineClient } from '../lib/aceV8JsEngine.js';
 import { QuoridorV3EngineClient } from '../lib/quoridorV3Engine.js';
 import { PlayerType, StrengthLevel, TimeToMove } from '../lib/engineConfig.js';
 import {
@@ -107,6 +108,8 @@ import {
   isRemoteEngine,
   isTitaniumEngine,
   isQuoridorV3Engine,
+  isAceEngine,
+  normalizePlayerType,
   getEngineConfig,
 } from '../lib/timeControl.js';
 import { playerColorName } from '../lib/playerColors.js';
@@ -119,6 +122,9 @@ function isSavedSettingsValid(playerType, saved, engineConfigs) {
       saved.wallClockSeconds != null &&
       saved.visitsBudget != null
     );
+  }
+  if (isAceEngine(playerType, engineConfigs)) {
+    return saved.wallClockSeconds != null;
   }
   if (isLocalEngine(playerType, engineConfigs)) {
     return saved.wallClockSeconds != null && saved.visitsBudget != null;
@@ -136,10 +142,10 @@ export class AppController {
     this.engineConfigs = getAllEngineConfigs();
 
     this.settings = {
-      players: [PlayerType.TitaniumMinimax, PlayerType.QuoridorV3],
+      players: [PlayerType.AceV8Ti, PlayerType.AceV8Js],
       playerAiSettings: [
-        defaultPlayerAiSettings(PlayerType.TitaniumMinimax, this.engineConfigs),
-        defaultPlayerAiSettings(PlayerType.QuoridorV3, this.engineConfigs),
+        defaultPlayerAiSettings(PlayerType.AceV8Ti, this.engineConfigs),
+        defaultPlayerAiSettings(PlayerType.AceV8Js, this.engineConfigs),
       ],
       playerAiSettingsMemory: [{}, {}],
       rotateBoard: false,
@@ -178,6 +184,8 @@ export class AppController {
     this.settingsChangelog = [];
     this.initialBudgetHint = null;
     this.lastThinkBySeat = [null, null];
+    /** Frozen per-seat card after each played move — kept while opponent thinks. */
+    this.lastCompletedThinkBySeat = [null, null];
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     this.aiThinking = false;
     this.liveSearch = null;
@@ -244,6 +252,7 @@ export class AppController {
       settingsChangelog: this.settingsChangelog,
       initialBudgetHint: this.initialBudgetHint,
       lastThinkBySeat: this.lastThinkBySeat,
+      lastCompletedThinkBySeat: this.lastCompletedThinkBySeat,
       uiMode: this.settings.uiMode,
       catViz: this.catViz,
       catVizLoading: this.catVizLoading,
@@ -282,20 +291,16 @@ export class AppController {
   onLiveUpdate = null;
   _liveUpdateLastMs = 0;
 
-  /** @deprecated PlayerType.Titanium merged into TitaniumMinimax */
+  /** Remap retired player keys (Titanium, Ace v7 aliases) to current engine slots. */
   migrateLegacyPlayerTypes() {
-    this.settings.players = this.settings.players.map((p) =>
-      p === PlayerType.Titanium ? PlayerType.TitaniumMinimax : p,
-    );
+    this.settings.players = this.settings.players.map((p) => normalizePlayerType(p));
   }
 
   setPlayer(playerNum, playerType) {
     if (playerType === PlayerType.Pavlosdais) {
       return;
     }
-    if (playerType === PlayerType.Titanium) {
-      playerType = PlayerType.TitaniumMinimax;
-    }
+    playerType = normalizePlayerType(playerType);
     const seatIndex = playerNum - 1;
     const prevType = this.settings.players[seatIndex];
     this.settings.players[seatIndex] = playerType;
@@ -384,6 +389,7 @@ export class AppController {
       isLocal: isLocalEngine(playerType, this.engineConfigs),
       isTitanium: isTitaniumEngine(playerType, this.engineConfigs),
       isQuoridorV3: isQuoridorV3Engine(playerType, this.engineConfigs),
+      isAceEngine: isAceEngine(playerType, this.engineConfigs),
       isLocalMcts: isLocalMctsEngine(playerType, this.engineConfigs),
       isRemote: isRemoteEngine(playerType, this.engineConfigs),
       strengthLevel: current?.strengthLevel ?? StrengthLevel.Alpha,
@@ -807,6 +813,7 @@ export class AppController {
       this.engineConfigs,
     );
     this.lastThinkBySeat = [null, null];
+    this.lastCompletedThinkBySeat = [null, null];
     this.catHintDismissed = false;
     this.showCatHint = false;
     this.settings.uiMode = 'play';
@@ -1071,7 +1078,10 @@ export class AppController {
     if (config.kind === 'quoridor-v3') {
       return new QuoridorV3EngineClient(config);
     }
-    if (config.kind === 'titanium') {
+    if (config.kind === 'ace-v8-js') {
+      return new AceV8JsEngineClient(config);
+    }
+    if (config.kind === 'titanium' || config.kind === 'ace') {
       return new TitaniumEngineClient(config, { seatId: this.engineSeatKey(seatIndex) });
     }
     return new EngineClient(config);
@@ -1153,7 +1163,11 @@ export class AppController {
             mode:
               info.mode ??
               info.stoppedBy ??
-              (isTitaniumEngine(playerType, this.engineConfigs) ? 'minimax' : 'mcts'),
+              (isTitaniumEngine(playerType, this.engineConfigs)
+                ? 'minimax'
+                : isAceEngine(playerType, this.engineConfigs)
+                  ? getEngineConfig(playerType, this.engineConfigs)?.engineMode ?? 'ace-v8'
+                  : 'mcts'),
             searchDepth: info.searchDepth ?? this.liveSearch?.searchDepth,
             depthLog: liveDepthLog,
             rootWinRate:
@@ -1188,22 +1202,6 @@ export class AppController {
               this.lmrPositionKey(),
             );
           }
-          this.snapshotThinkSeat(seat, {
-            live: true,
-            ply: this.session.actions.length + 1,
-            depthLog: liveDepthLog,
-            searchDepth: this.liveSearch.searchDepth,
-            whiteDist: this.liveSearch.whiteDist,
-            blackDist: this.liveSearch.blackDist,
-            rootScore: this.liveSearch.rootScore,
-            nodes: this.liveSearch.nodes,
-            simulations: this.liveSearch.simulations,
-            rootWinRate: this.liveSearch.rootWinRate,
-            stoppedBy: this.liveSearch.mode,
-            rootMoves: this.liveSearch.rootMoves,
-            lmrProfile: this.liveSearch.lmrProfile,
-            engine: this.liveSearch.playerLabel,
-          });
           const now = performance.now();
           if (now - this._liveUpdateLastMs >= 16) {
             this._liveUpdateLastMs = now;
@@ -1530,6 +1528,19 @@ export class AppController {
     });
   }
 
+  snapshotCompletedThinkSeat(seatIndex, fields) {
+    if (seatIndex < 0) {
+      return;
+    }
+    const snap = buildThinkSeatSnapshot({
+      engine: fields.engine ?? this.engineLabel(this.settings.players[seatIndex]),
+      live: false,
+      ...fields,
+    });
+    this.lastThinkBySeat[seatIndex] = snap;
+    this.lastCompletedThinkBySeat[seatIndex] = snap;
+  }
+
   maybeRequestAiMove() {
     if (this.replay || this.isFreePlayMode()) {
       this.aiThinking = false;
@@ -1572,26 +1583,6 @@ export class AppController {
     this.engineErrors[seatIndex] = null;
     this.engineStatus[seatIndex] = 'searching';
     this.searchInfo[playerType] = { depthLog: [] };
-    const prevThink = this.lastThinkBySeat[seatIndex] ?? null;
-    this.snapshotThinkSeat(seatIndex, {
-      live: true,
-      ply: requestPly + 1,
-      depthLog: [],
-      stoppedBy: 'searching',
-      engine: this.engineLabel(playerType),
-      move: null,
-      ...(prevThink && !prevThink.live
-        ? {
-          whiteDist: prevThink.whiteDist,
-          blackDist: prevThink.blackDist,
-          score: prevThink.score,
-          depth: prevThink.depth,
-          pv: prevThink.pv,
-          rootWinRate: prevThink.rootWinRate,
-          rootMoves: prevThink.rootMoves,
-        }
-        : {}),
-    });
     this.liveSearch = {
       playerType,
       playerLabel: this.engineLabel(playerType),
@@ -1687,8 +1678,7 @@ export class AppController {
           this.engineConfigs,
         );
         this._thinkAiSettings = null;
-        this.snapshotThinkSeat(seatIndex, {
-          live: false,
+        this.snapshotCompletedThinkSeat(seatIndex, {
           move: moveLabel,
           ply: plyNum,
           depthLog: si.depthLog,

@@ -108,13 +108,61 @@ pub fn board_move_to_ace(mv: BoardMove) -> i16 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+pub struct AceDepthLogEntry {
+    pub depth: i32,
+    pub score: i32,
+    pub nodes: u64,
+    pub elapsed_ms: u64,
+    pub marginal_nodes: u64,
+    pub pv: String,
+}
+
 pub struct ThinkResult {
     pub mv: i16,
     pub score: i32,
     pub depth: i32,
     pub nodes: u64,
     pub ms: u64,
+    pub white_dist: u8,
+    pub black_dist: u8,
+    pub depth_log: Vec<AceDepthLogEntry>,
+}
+
+fn emit_ace_progress(
+    engine_label: &str,
+    depth_log: &[AceDepthLogEntry],
+    search_depth: i32,
+    nodes: u64,
+    root_score: i32,
+    white_dist: u8,
+    black_dist: u8,
+    elapsed_ms: u64,
+) {
+    let mut depth_json = String::new();
+    for (i, e) in depth_log.iter().enumerate() {
+        if i > 0 {
+            depth_json.push(',');
+        }
+        let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
+        depth_json.push_str(&format!(
+            "{{\"depth\":{},\"score\":{},\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+            e.depth, e.score, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
+        ));
+    }
+    eprintln!(
+        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
+        engine_label,
+        engine_label,
+        search_depth,
+        nodes,
+        root_score,
+        white_dist,
+        black_dist,
+        elapsed_ms,
+        depth_json
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
 pub struct AceSearch {
@@ -847,7 +895,14 @@ impl AceSearch {
     }
 
     /// Entry: iterative deepening within `time_ms`. `full` disables the easy-move stop.
-    pub fn think(&mut self, time_ms: u64, max_depth: i32, full: bool) -> ThinkResult {
+    pub fn think(
+        &mut self,
+        time_ms: u64,
+        max_depth: i32,
+        full: bool,
+        log: bool,
+        engine_label: &str,
+    ) -> ThinkResult {
         let t0 = Instant::now();
         self.deadline = t0 + Duration::from_millis(time_ms);
         self.nodes = 0;
@@ -857,9 +912,11 @@ impl AceSearch {
         let mut last_score = 0;
         let mut last_depth = 0;
         let mut stable = 0;
+        let mut depth_log: Vec<AceDepthLogEntry> = Vec::new();
         let max_depth = if max_depth > 0 { max_depth } else { 30 };
 
         for d in 1..=max_depth {
+            let nodes_at_depth = self.nodes;
             let result = if d >= 4 && last_score > -2000 && last_score < 2000 {
                 // aspiration
                 let mut lo = last_score - 75;
@@ -887,6 +944,35 @@ impl AceSearch {
                     last_best = self.root_best;
                     last_score = sc;
                     last_depth = d;
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                    let pv = if last_best != 0 {
+                        super::ace_to_algebraic(last_best)
+                    } else {
+                        String::new()
+                    };
+                    depth_log.push(AceDepthLogEntry {
+                        depth: d,
+                        score: last_score,
+                        nodes: self.nodes,
+                        elapsed_ms,
+                        marginal_nodes: self.nodes.saturating_sub(nodes_at_depth),
+                        pv,
+                    });
+                    if log {
+                        self.refresh_dist(0);
+                        let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
+                        let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
+                        emit_ace_progress(
+                            engine_label,
+                            &depth_log,
+                            d,
+                            self.nodes,
+                            last_score,
+                            white_dist,
+                            black_dist,
+                            elapsed_ms,
+                        );
+                    }
                     if sc > MATE - 200 || sc < -(MATE - 200) {
                         break; // forced result
                     }
@@ -917,12 +1003,20 @@ impl AceSearch {
             }
         }
 
+        self.refresh_dist(0);
+        let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
+        let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
+        let ms = t0.elapsed().as_millis() as u64;
+
         ThinkResult {
             mv: last_best,
             score: last_score,
             depth: last_depth,
             nodes: self.nodes,
-            ms: t0.elapsed().as_millis() as u64,
+            ms,
+            white_dist,
+            black_dist,
+            depth_log,
         }
     }
 }

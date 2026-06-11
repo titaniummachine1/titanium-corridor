@@ -34,6 +34,9 @@ export const WALL_CLOCK_RANGE = {
 /** Default think budget for Quoridor v3 (JS αβ) — primary local adversary until Titanium NNUE lands. */
 export const QUORIDOR_V3_WALL_CLOCK_DEFAULT = 0.5;
 
+/** Default wall clock for ACE v8 engines (Rust + JS HTML). */
+export const ACE_WALL_CLOCK_DEFAULT = 10;
+
 /** Exponential visit cap for local MCTS — slider is linear, stored value is log-spaced. */
 export const LOCAL_VISITS_RANGE = {
   min: 1_000,
@@ -79,14 +82,25 @@ export function sliderPositionFromVisits(visits) {
   return Math.round(t * sliderSteps);
 }
 
+/** Map retired UI keys to their current engine slot. */
+export function normalizePlayerType(playerType) {
+  if (playerType === PlayerType.AceV7) {
+    return PlayerType.AceV8;
+  }
+  if (playerType === PlayerType.AceV7Ti) {
+    return PlayerType.AceV8Ti;
+  }
+  if (playerType === PlayerType.Titanium) {
+    return PlayerType.TitaniumMinimax;
+  }
+  return playerType;
+}
+
 export function getEngineConfig(playerType, engineConfigs) {
-  const direct = engineConfigs.find((entry) => entry.key === playerType);
+  const normalized = normalizePlayerType(playerType);
+  const direct = engineConfigs.find((entry) => entry.key === normalized);
   if (direct) {
     return direct;
-  }
-  // Legacy UI key — merged into titanium-minimax
-  if (playerType === PlayerType.Titanium) {
-    return engineConfigs.find((entry) => entry.key === PlayerType.TitaniumMinimax);
   }
   return undefined;
 }
@@ -115,9 +129,36 @@ export function isQuoridorV3Engine(playerType, engineConfigs) {
   );
 }
 
+export function isAceV8JsEngine(playerType, engineConfigs) {
+  return (
+    playerType === PlayerType.AceV8Js ||
+    getEngineConfig(playerType, engineConfigs)?.kind === 'ace-v8-js'
+  );
+}
+
+export function isAceEngine(playerType, engineConfigs) {
+  const normalized = normalizePlayerType(playerType);
+  return (
+    normalized === PlayerType.AceV8 ||
+    normalized === PlayerType.AceV8Ti ||
+    normalized === PlayerType.AceV8Js ||
+    getEngineConfig(playerType, engineConfigs)?.kind === 'ace' ||
+    getEngineConfig(playerType, engineConfigs)?.kind === 'ace-v8-js'
+  );
+}
+
+/** @deprecated use isAceEngine */
+export const isAceV7Engine = isAceEngine;
+
 export function isLocalMctsEngine(playerType, engineConfigs) {
   const kind = getEngineConfig(playerType, engineConfigs)?.kind;
-  return kind === 'local' || kind === 'titanium' || kind === 'quoridor-v3';
+  return (
+    kind === 'local' ||
+    kind === 'titanium' ||
+    kind === 'quoridor-v3' ||
+    kind === 'ace' ||
+    kind === 'ace-v8-js'
+  );
 }
 
 /** Map visit slider → iterative-deepening cap for Quoridor v3 (4–30 plies). */
@@ -151,6 +192,11 @@ export function defaultPlayerAiSettings(playerType, engineConfigs) {
     return {
       wallClockSeconds: QUORIDOR_V3_WALL_CLOCK_DEFAULT,
       visitsBudget: visitsFromSliderPosition(Math.round(LOCAL_VISITS_RANGE.sliderSteps * 0.45)),
+    };
+  }
+  if (isAceEngine(playerType, engineConfigs)) {
+    return {
+      wallClockSeconds: ACE_WALL_CLOCK_DEFAULT,
     };
   }
   if (isLocalEngine(playerType, engineConfigs)) {
@@ -226,6 +272,12 @@ export function describePlayerAiSettings(playerType, aiSettings, engineConfigs) 
     if (isQuoridorV3Engine(playerType, engineConfigs)) {
       const depthCap = formatMaxDepth(maxDepthFromVisitsBudget(aiSettings.visitsBudget));
       return `${config.name}: ${time} · ${depthCap}`;
+    }
+    if (isAceV8JsEngine(playerType, engineConfigs)) {
+      return `${config.name}: ${time} · HTML extract (Worker)`;
+    }
+    if (isAceEngine(playerType, engineConfigs)) {
+      return `${config.name}: ${time} · iterative deepening`;
     }
     return `${config.name}: ${time} · ${cap}`;
   }

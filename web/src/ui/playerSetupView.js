@@ -102,6 +102,26 @@ function renderPlayerAiSettings(ui, playerNum) {
     const { min: tMin, max: tMax, step: tStep } = ui.wallclockRange;
     const { min: vMin, max: vMax, step: vStep } = ui.visitsRange;
     const budgetLabel = ui.isTitanium ? 'Nodes' : ui.isQuoridorV3 ? 'Depth' : 'Rollouts';
+    const visitsSlider = ui.isAceEngine
+      ? ''
+      : `
+        <label class="control-label control-label--sub">${budgetLabel} · ${escapeHtml(engineName)}</label>
+        <div class="time-slider-row">
+          <input
+            type="range"
+            class="time-slider scraped-slider"
+            data-setting="visits-${playerNum}"
+            min="${vMin}"
+            max="${vMax}"
+            step="${vStep}"
+            value="${ui.visitsSliderPosition}"
+          />
+          <output class="time-slider-value" data-visits-label="${playerNum}">${
+            ui.isQuoridorV3
+              ? formatMaxDepth(maxDepthFromVisitsBudget(ui.visitsBudget))
+              : formatVisitsCap(ui.visitsBudget)
+          }</output>
+        </div>`;
     return `
       <div class="player-ai-settings" data-engine="${escapeHtml(engineName)}">
         <p class="player-ai-settings__engine">${escapeHtml(engineName)}</p>
@@ -128,23 +148,7 @@ function renderPlayerAiSettings(ui, playerNum) {
           />
           <output class="time-slider-value" data-wallclock-label="${playerNum}">${formatWallClock(ui.wallClockSeconds)}</output>
         </div>
-        <label class="control-label control-label--sub">${budgetLabel} · ${escapeHtml(engineName)}</label>
-        <div class="time-slider-row">
-          <input
-            type="range"
-            class="time-slider scraped-slider"
-            data-setting="visits-${playerNum}"
-            min="${vMin}"
-            max="${vMax}"
-            step="${vStep}"
-            value="${ui.visitsSliderPosition}"
-          />
-          <output class="time-slider-value" data-visits-label="${playerNum}">${
-            ui.isQuoridorV3
-              ? formatMaxDepth(maxDepthFromVisitsBudget(ui.visitsBudget))
-              : formatVisitsCap(ui.visitsBudget)
-          }</output>
-        </div>
+        ${visitsSlider}
       </div>`;
   }
 

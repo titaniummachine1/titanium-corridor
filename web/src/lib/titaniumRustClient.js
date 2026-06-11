@@ -265,7 +265,16 @@ export class TitaniumEngineClient {
 
     const uct = uctFromStrengthLevel(aiSettings?.strengthLevel);
 
-    const engineMode = this.config?.engineMode === 'minimax' ? 'minimax' : 'mcts';
+    const configured = this.config?.engineMode;
+    const engineMode =
+      configured === 'minimax' ||
+      configured === 'ace' ||
+      configured === 'ace-v8' ||
+      configured === 'ace-ti' ||
+      configured === 'ace-v8-ti' ||
+      configured === 'ace-cat'
+        ? configured
+        : 'mcts';
 
 
 
@@ -286,16 +295,23 @@ export class TitaniumEngineClient {
 
 
   startOneShotGenmove(history, { timeSec, maxBudget, uct, engineMode, started }) {
+    const isAlphaBeta =
+      engineMode === 'minimax' ||
+      engineMode === 'ace' ||
+      engineMode === 'ace-v8' ||
+      engineMode === 'ace-ti' ||
+      engineMode === 'ace-v8-ti' ||
+      engineMode === 'ace-cat';
 
-    if (engineMode === 'minimax') {
+    if (isAlphaBeta) {
 
       this.onInfo?.({
 
         thinking: true,
 
-        mode: 'minimax',
+        mode: engineMode,
 
-        stoppedBy: 'minimax',
+        stoppedBy: engineMode,
 
         nodes: 0,
 
@@ -405,7 +421,7 @@ export class TitaniumEngineClient {
 
             if (data.type === 'progress') {
 
-              if (engineMode === 'minimax') {
+              if (isAlphaBeta) {
 
                 continue;
 
@@ -437,9 +453,30 @@ export class TitaniumEngineClient {
 
               const stoppedBy = data.stoppedBy ?? engineMode;
 
-              finalMeta = { ...finalMeta, ...data, stoppedBy };
+              let depthLog = data.depthLog;
+              if (
+                (!depthLog || depthLog.length === 0) &&
+                data.searchDepth != null &&
+                data.rootScore != null
+              ) {
+                depthLog = [
+                  {
+                    depth: data.searchDepth,
+                    score: data.rootScore,
+                    nodes: data.nodes ?? 0,
+                  },
+                ];
+              }
 
-              const isMinimax = stoppedBy === 'minimax';
+              finalMeta = { ...finalMeta, ...data, stoppedBy, depthLog };
+
+              const isMinimax =
+                stoppedBy === 'minimax' ||
+                stoppedBy === 'ace' ||
+                stoppedBy === 'ace-v8' ||
+                stoppedBy === 'ace-ti' ||
+                stoppedBy === 'ace-v8-ti' ||
+                stoppedBy === 'ace-cat';
 
               this.onInfo?.({
 
@@ -449,19 +486,23 @@ export class TitaniumEngineClient {
 
                 stoppedBy,
 
-                simulations: data.simulations,
+                simulations: isMinimax ? 0 : data.simulations,
 
                 nodes: data.nodes,
 
                 searchDepth: data.searchDepth,
 
-                depthLog: data.depthLog,
+                depthLog,
 
                 whiteDist: data.whiteDist,
 
                 blackDist: data.blackDist,
 
                 rootScore: data.rootScore,
+
+                progress: isMinimax && data.searchDepth
+                  ? Math.min(0.99, (data.elapsedMs ?? 0) / (timeSec * 1000))
+                  : undefined,
 
                 rootWinRate: isMinimax ? null : data.rootWinRate,
 
@@ -500,6 +541,13 @@ export class TitaniumEngineClient {
               this.setStatus('idle');
 
               const stoppedBy = finalMeta.stoppedBy ?? data.stoppedBy ?? engineMode;
+              const isAbFinal =
+                stoppedBy === 'minimax' ||
+                stoppedBy === 'ace' ||
+                stoppedBy === 'ace-v8' ||
+                stoppedBy === 'ace-ti' ||
+                stoppedBy === 'ace-v8-ti' ||
+                stoppedBy === 'ace-cat';
 
               this.onInfo?.({
 
@@ -509,7 +557,7 @@ export class TitaniumEngineClient {
 
                 stoppedBy,
 
-                simulations: finalMeta.simulations ?? 0,
+                simulations: isAbFinal ? 0 : (finalMeta.simulations ?? 0),
 
                 nodes: finalMeta.nodes ?? 0,
 
@@ -521,7 +569,9 @@ export class TitaniumEngineClient {
 
                 blackDist: finalMeta.blackDist,
 
-                rootWinRate: stoppedBy === 'minimax' ? null : finalMeta.rootWinRate,
+                rootScore: finalMeta.rootScore,
+
+                rootWinRate: isAbFinal ? null : finalMeta.rootWinRate,
 
                 rootMoves: finalMeta.rootMoves,
 
