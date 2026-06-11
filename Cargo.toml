@@ -1,0 +1,50 @@
+[package]
+name = "titanium"
+version = "0.1.0"
+edition = "2021"
+description = "Titanium Engine — hybrid Quoridor AI (alpha-beta + guided MCTS)"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[lib]
+name = "titanium"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "titanium"
+path = "src/main.rs"
+required-features = ["parallel"]
+
+[features]
+default = ["parallel"]
+# Multi-threaded perft / Lazy SMP (rayon). Disable for wasm.
+parallel = ["dep:rayon"]
+# wasm-bindgen bindings for the website (build with:
+#   wasm-pack build --no-default-features --features wasm
+# or cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm)
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+rand = "0.8"
+rayon = { version = "1.10", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+core_affinity = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "path_bfs"
+harness = false
+
+[[bench]]
+name = "perft_pawn_modes"
+harness = false
