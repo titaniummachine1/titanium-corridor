@@ -1,4 +1,4 @@
-//! ACE v8 hybrid port — v8 search (_vendor/acev8_engine.js) plus optional Titanium root movegen.
+//! ACE v10 hybrid port — quoridor (8).html search (_vendor/acev10_engine.js) plus optional Titanium movegen.
 //!
 //! Self-contained: own board representation, search, and HalfPW net eval.
 //! Only this module's `genmove` entry translates between Titanium algebraic

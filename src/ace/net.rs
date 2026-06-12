@@ -1,4 +1,4 @@
-//! ACE v7 HalfPW net — weights from `net_weights.bin` (H=32 NET_DATA blob).
+//! ACE v10 HalfPW net — weights from `net_weights.bin` (H=32 NET_DATA blob).
 //!
 //! Blob layout (little-endian f64): Wskip[13] B1[32] W2[32] W1C[36864] PO[2592] PX[2592].
 
