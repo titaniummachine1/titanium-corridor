@@ -37,14 +37,11 @@ pub enum Move {
     },
 }
 
-/// Saved state for `unmake_move`.
+/// Saved state for `unmake_move` — everything else is recomputed by inverse ops.
 #[derive(Debug, Clone, Copy)]
 pub struct Undo {
     pub mv: Move,
-    pub side_to_move: Player,
-    pub move_number: u32,
     pub pawn_from: (Row, Column),
-    pub walls_remaining: u8,
     pub hash: u64,
 }
 
@@ -134,33 +131,32 @@ impl Board {
         let side = self.side_to_move as usize;
         let undo = Undo {
             mv,
-            side_to_move: self.side_to_move,
-            move_number: self.move_number,
             pawn_from: self.pawns[side],
-            walls_remaining: self.walls_remaining[side],
             hash: self.hash,
         };
 
         match mv {
             Move::Pawn { row, col } => {
-                crate::core::zobrist::xor_pawn(&mut self.hash, side, undo.pawn_from.0, undo.pawn_from.1);
+                self.hash ^= crate::core::zobrist::pawn_move_delta(side, undo.pawn_from, (row, col));
                 self.pawns[side] = (row, col);
-                crate::core::zobrist::xor_pawn(&mut self.hash, side, row, col);
             }
             Move::Wall {
                 row,
                 col,
                 orientation,
             } => {
-                crate::core::zobrist::xor_wall(&mut self.hash, orientation, row, col);
+                self.hash ^= crate::core::zobrist::wall_move_delta(
+                    orientation,
+                    row,
+                    col,
+                    side,
+                    self.walls_remaining[side],
+                );
                 crate::util::grid::set_wall(self, row, col, orientation, true);
-                crate::core::zobrist::xor_walls_left(&mut self.hash, side, self.walls_remaining[side]);
                 self.walls_remaining[side] -= 1;
-                crate::core::zobrist::xor_walls_left(&mut self.hash, side, self.walls_remaining[side]);
             }
         }
 
-        crate::core::zobrist::xor_side(&mut self.hash);
         self.side_to_move = self.side_to_move.opposite();
         if self.side_to_move == Player::One {
             self.move_number += 1;
@@ -173,9 +169,9 @@ impl Board {
         if self.side_to_move == Player::One {
             self.move_number -= 1;
         }
-        self.side_to_move = undo.side_to_move;
+        self.side_to_move = self.side_to_move.opposite();
 
-        let side = undo.side_to_move as usize;
+        let side = self.side_to_move as usize;
         match undo.mv {
             Move::Pawn { .. } => {
                 self.pawns[side] = undo.pawn_from;
@@ -185,7 +181,7 @@ impl Board {
                 col,
                 orientation,
             } => {
-                self.walls_remaining[side] = undo.walls_remaining;
+                self.walls_remaining[side] += 1;
                 crate::util::grid::set_wall(self, row, col, orientation, false);
             }
         }
