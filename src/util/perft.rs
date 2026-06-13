@@ -115,37 +115,6 @@ pub fn perft_no_tt_mode_ctx(
     nodes
 }
 
-/// Pawn-only perft — no walls in tree; isolates pawn-generation cost (no TT, no wall BFS).
-pub fn perft_pawn_only_mode(board: &mut Board, depth: u32, mode: PawnGenMode) -> u64 {
-    let mut scratch = BfsScratch::new();
-    perft_pawn_only_mode_ctx(board, depth, mode, &mut scratch)
-}
-
-pub fn perft_pawn_only_mode_ctx(
-    board: &mut Board,
-    depth: u32,
-    mode: PawnGenMode,
-    scratch: &mut BfsScratch,
-) -> u64 {
-    if depth == 0 {
-        return 1;
-    }
-
-    let mut move_buf = [Move::Pawn { row: 0, col: 0 }; 8];
-    let move_count = generate_pawn_moves_slice_mode(board, &mut move_buf, scratch, mode);
-    if depth == 1 {
-        return move_count as u64;
-    }
-    let mut nodes = 0u64;
-    for i in 0..move_count {
-        let mv = move_buf[i];
-        let undo = board.make_move(mv);
-        nodes += perft_pawn_only_mode_ctx(board, depth - 1, mode, scratch);
-        board.unmake_move(undo);
-    }
-    nodes
-}
-
 /// Fast perft — single-threaded via a fresh [`SharedState`].
 pub fn perft_fast(board: &mut Board, depth: u32) -> u64 {
     let mut shared = SharedState::new();
@@ -479,62 +448,6 @@ mod tests {
         let mut engine = Engine::new();
         let lines = engine.perft_iterative(&mut board, 3);
         assert_eq!(lines.last().map(|x| x.1), Some(PERFT3_STARTPOS));
-    }
-
-    #[test]
-    fn perft_o1_lookup_depth1_start() {
-        let mut board = Board::new();
-        assert_eq!(perft_no_tt_mode(&mut board, 1, PawnGenMode::O1Lookup), 131);
-    }
-
-    #[test]
-    fn perft_o1_lookup_depth2_smoke() {
-        let mut board = Board::new();
-        assert_eq!(
-            perft_no_tt_mode(&mut board, 2, PawnGenMode::O1Lookup),
-            16_677
-        );
-    }
-
-    #[test]
-    fn perft_o1_lookup_depth3_matches_oracle() {
-        let mut board = Board::new();
-        assert_eq!(
-            perft_no_tt_mode(&mut board, 3, PawnGenMode::O1Lookup),
-            PERFT3_STARTPOS
-        );
-    }
-
-    #[test]
-    fn perft_o1_lookup_matches_scalar_depth3() {
-        let mut board = Board::new();
-        let scalar = perft_no_tt_mode(&mut board, 3, PawnGenMode::Scalar);
-        let o1 = perft_no_tt_mode(&mut board, 3, PawnGenMode::O1Lookup);
-        assert_eq!(scalar, o1);
-        assert_eq!(o1, PERFT3_STARTPOS);
-    }
-
-    /// Full-tree correctness with TT (production-speed path ~3s @ d4 release).
-    #[test]
-    #[ignore = "slow; cargo test --release perft_o1_lookup_depth4 -- --ignored --nocapture"]
-    fn perft_o1_lookup_depth4_matches_oracle() {
-        let mut board = Board::new();
-        let t0 = Instant::now();
-        let nodes = perft_fast_mode(&mut board, 4, PawnGenMode::O1Lookup);
-        eprintln!(
-            "perft_o1+TT d4: {nodes} nodes in {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
-        assert_eq!(nodes, PERFT4_STARTPOS);
-    }
-
-    /// O1 without TT — isolates pawn-gen cost only (~12s @ d4); not the production perft path.
-    #[test]
-    #[ignore = "slow; cargo test --release perft_o1_lookup_depth4_no_tt -- --ignored --nocapture"]
-    fn perft_o1_lookup_depth4_no_tt() {
-        let mut board = Board::new();
-        let nodes = perft_no_tt_mode(&mut board, 4, PawnGenMode::O1Lookup);
-        assert_eq!(nodes, PERFT4_STARTPOS);
     }
 
     /// Depths 1→4: worker on a P-core, timer on another; d4 budget 10s; `exit(1)` on timeout.

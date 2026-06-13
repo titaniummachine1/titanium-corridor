@@ -1,7 +1,7 @@
 //! Legal move generation — pawn jumps + wall placements with path validation.
 
 use crate::core::board::{Board, Move, Player, WallOrientation};
-use crate::movegen::o1::{generate_pawn_moves_o1, wall_masks, wall_physically_legal_o1};
+use crate::movegen::wall_masks::{wall_masks, wall_physically_legal_shift};
 use crate::movegen::pawn_bits::{
     generate_pawn_moves_bitboard_with_masks, generate_pawn_moves_shift_slice,
 };
@@ -28,8 +28,6 @@ pub enum PawnGenMode {
     BitboardCachedDirMasks,
     /// Blind bit shift + `can_step` wall check — no `DirMasks`. **Production default.**
     ShiftCanStep,
-    /// Offline `PAWN_LEGAL` tables — research only (`movgen-o1-lookup` branch).
-    O1Lookup,
 }
 
 impl Default for PawnGenMode {
@@ -55,7 +53,6 @@ fn generate_pawn_moves_with_mode(
             generate_pawn_moves_bitboard_with_masks(board, &masks, out)
         }
         PawnGenMode::ShiftCanStep => generate_pawn_moves_shift_slice(board, out),
-        PawnGenMode::O1Lookup => generate_pawn_moves_o1(board, out),
     }
 }
 
@@ -268,7 +265,7 @@ fn collect_wall_orientation(
         heavy &= heavy - 1;
         let row = (bit / 8) as u8;
         let col = (bit % 8) as u8;
-        debug_assert!(wall_physically_legal_o1(
+        debug_assert!(wall_physically_legal_shift(
             board,
             row,
             col,
@@ -297,7 +294,7 @@ fn is_legal_wall(
     orientation: WallOrientation,
     ctx: &mut WallTrialCtx,
 ) -> bool {
-    if !wall_physically_legal_o1(
+    if !wall_physically_legal_shift(
         board,
         row,
         col,

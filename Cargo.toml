@@ -19,10 +19,6 @@ name = "titanium"
 path = "src/main.rs"
 required-features = ["parallel"]
 
-[[bin]]
-name = "movegen-o1-gen"
-path = "src/bin/movegen_o1_gen.rs"
-
 [features]
 default = ["parallel"]
 # Multi-threaded perft / Lazy SMP (rayon). Disable for wasm.
@@ -55,8 +51,4 @@ harness = false
 
 [[bench]]
 name = "perft_pawn_modes"
-harness = false
-
-[[bench]]
-name = "perft_pawn_only"
 harness = false

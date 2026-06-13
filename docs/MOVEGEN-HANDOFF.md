@@ -1,7 +1,7 @@
 # Movegen + core handoff
 
-**`main` @ `9302db0`** — movegen closed, §A (Zobrist/Undo) merged.  
-**Branch `movgen-improvements`** — same as `main` after fast-forward.
+**`main`** — production: shift wall masks + `ShiftCanStep` pawns. No pawn O1 tables.  
+**`movgen-o1-lookup`** — research: ~2MB pawn `PAWN_LEGAL` lookup + generator + pawn-only bench.
 
 ---
 
@@ -9,55 +9,42 @@
 
 | Item | Status |
 | ---- | ------ |
-| Shift L2 / TOPO wall masks | ✓ production |
-| Lazy L3, `wall_masks`, split loops | ✓ |
+| **Wall shift L2/TOPO** (`wall_masks.rs`) | ✓ **production** — measured speedup |
+| Lazy L3, split loops | ✓ |
 | Perft bulk d1, gates exact | ✓ |
-| §A const Zobrist, fused deltas, slim `Undo` | ✓ merged `main` |
-| §B pawn default | ✓ **`ShiftCanStep`** — see MOVEGEN.md “why not O1” |
-| Movegen multithread / GPU | ✗ policy: never |
+| §A Zobrist / slim Undo | ✓ |
+| §B pawn default `ShiftCanStep` | ✓ |
+| Pawn O1 tables | ✓ **`movgen-o1-lookup` branch only** (~3% pawn-only; not shipped) |
+| Pinned bench script | ✓ `scripts/bench-pinned.ps1` |
 
 ### Gates
 
 ```text
 perft 3 = 2_062_264
 perft 4 = 247_569_030
-cargo test --release → 130 passed
-titanium bench 3 20 → ~210–240M nps (honest)
+cargo test --release → 123 passed (+ 1 ignored d4)
+scripts/bench-pinned.ps1 → ~231M nps @ core 7
 ```
 
 ---
 
-## O1 pawn — research only (not a bug)
+## Branch split (important)
 
-**We are not “failing to use” O1 — we chose not to make it default.**
+| What | `main` | `movgen-o1-lookup` |
+| ---- | ------ | ------------------- |
+| `wall_masks()` shift path | ✓ | ✓ |
+| `ShiftCanStep` pawns | ✓ default | ✓ default |
+| `PAWN_LEGAL` + 1.6MB remap | ✗ | ✓ research |
+| `movegen-o1-gen` | ✗ | ✓ |
+| `perft_pawn_only` bench | ✗ | ✓ |
 
-- Tables exist, tests verify them vs scalar.
-- `generate_legal_moves_slice` uses `PawnGenMode::default()` → `ShiftCanStep`.
-- `O1Lookup` only runs when code passes that mode (perft tests, `perft_pawn_modes` bench).
-- Wall production path lives in `lookup.rs` shifts; pawn tables are a separate offline artifact for future completeness work.
-
----
-
-## Next work (Fable or Cursor)
-
-### 1. L3 flood fraction in **search** (not perft)
-
-Profile wall-heavy replay positions — is §C incremental L3 worth a proof harness?
-
-### 2. §C incremental L3
-
-**Blocked** until harness spec + tests vs scalar flood (BUG-DIARY `a1h`/`a5h`).
-
-### 3. §D completeness oracle
-
-Batch exact solve + invariant hash collisions — research track.
-
-### 4. Eval / search (STATE.md)
-
-Distance cache, opening depth, Game A/B replays.
+**Do not confuse:** wall shift masks are the production win. Pawn O1 is the optional gimmick.
 
 ---
 
-## Do not redo
+## Next work
 
-Movegen tables, topo tables, movegen threads, O1 as default without in-search proof.
+1. L3 flood fraction in **search** replays  
+2. §C incremental L3 (needs proof harness)  
+3. §D completeness oracle  
+4. Eval / search (STATE.md)

@@ -31,19 +31,15 @@ wasm-pack build --release --no-default-features --features wasm
 
 ## Move generation
 
-Production movegen is **single-thread shift algebra** (no wall tables, no movegen GPU/threads):
+Production movegen is **single-thread shift algebra** (wall speedup on `main`; pawn O1 tables on research branch only):
 
-- **Walls:** L1 empty → L2 collision shifts → TOPO flood-skip → L3 parallel flood + bit theft
-- **Pawns:** `ShiftCanStep` default (`PawnGenMode` in `movegen/legal.rs`)
+- **Walls:** `wall_masks.rs` — L1 empty → L2 collision shifts → TOPO flood-skip → L3 flood (**measured speedup**)
+- **Pawns:** `ShiftCanStep` default — few bit shifts, no tables
 
 Full reference: [`docs/MOVEGEN.md`](docs/MOVEGEN.md)  
-Handoff for follow-up work: [`docs/MOVEGEN-HANDOFF.md`](docs/MOVEGEN-HANDOFF.md)
+Handoff: [`docs/MOVEGEN-HANDOFF.md`](docs/MOVEGEN-HANDOFF.md)
 
-Offline pawn O(1) tables (research, not production default):
-
-```bash
-cargo run --release --bin movegen-o1-gen
-```
+Pawn O(1) ~2MB lookup (research, ~3% pawn-only bench): branch **`movgen-o1-lookup`** only.
 
 ## Documentation
 

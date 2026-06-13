@@ -24,7 +24,6 @@ fn main() {
             PawnGenMode::BitboardCachedDirMasks,
             "bitboard_cached_dirmasks",
         ),
-        (PawnGenMode::O1Lookup, "o1_lookup"),
     ];
 
     println!("perft({DEPTH}) oracle={oracle} startpos — no TT, BFS mask cache shared");
