@@ -22,6 +22,12 @@ const TT_CLUSTER: usize = 4;
 /// cost of 22 is shallow perft(4) (0.41 s vs 0.30 s at 18 — the tiny working set
 /// can't amortise the scattered-probe page-fault/TLB cost); a memory-constrained
 /// caller can drop back with `TT_BITS=18`.
+///
+/// Flag guidance: `TT_BITS=23` (768 MB) is a good choice for deeper-than-d5
+/// searches (ties 22 at d5, more headroom beyond), and `24` (1.5 GB) for even
+/// deeper still. Default stays 22. (An adaptive table that starts small — sized
+/// to the d3/d4 working set — and grows a bit at a time while preserving stored
+/// entries is prototyped on the `adaptive-tt` branch for A/B testing vs this.)
 const DEFAULT_TT_BITS: usize = 22;
 
 // NOTE: a 16-byte packed layout (`key` + `depth<<56 | nodes`, cluster = one
