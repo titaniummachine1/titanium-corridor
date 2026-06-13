@@ -9,8 +9,8 @@
 
 | Layer | Status |
 | ----- | ------ |
-| **Movegen** | **Closed.** Shift L2 + shift TOPO + lazy L3 flood. `ShiftCanStep` pawns. See `docs/MOVEGEN.md`. |
-| **Perft** | Gates exact: d3 = **2_062_264**, d4 = **247_569_030**. Bench d3 ~**175–250M nps** (honest make/unmake). Perft time uses bulk d1 + TT — see MOVEGEN.md. |
+| **Movegen** | **Closed.** Shift walls + `ShiftCanStep` pawns. O1 pawn tables = research only (`docs/MOVEGEN.md`). |
+| **Perft** | Gates exact. Bench d3 ~**210–240M nps** (Zobrist §A on `main`). |
 | **Search** | Pure **ID negamax** + aspiration + adaptive LMR + qsearch + TT + CAT v3 prune. |
 | **ACE** | v11 port (pathfix gen11_ghi). |
 | **Eval** | Path-distance + CAT; opening depth still shallow. |
@@ -26,7 +26,7 @@ Single-thread only. No GPU. No movegen multithreading.
 | 3 | 2_062_264 | CI gate |
 | 4 | 247_569_030 | Stress oracle |
 
-**Next perf wins are not movegen:** make/unmake, search parallelism, eval cache — see `docs/MOVEGEN-HANDOFF.md`.
+**Next perf wins are not movegen:** L3 in wall-heavy search, eval cache — see `docs/MOVEGEN-HANDOFF.md`. §A (Zobrist/Undo) merged on `main`.
 
 ---
 

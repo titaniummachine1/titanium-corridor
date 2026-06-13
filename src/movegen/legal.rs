@@ -26,9 +26,10 @@ pub enum PawnGenMode {
     BitboardFreshDirMasks,
     /// Reuse `BfsScratch::dir_masks` — incorrect if stale after wall trials.
     BitboardCachedDirMasks,
-    /// Blind bit shift + `can_step` wall check — no `DirMasks`.
+    /// Blind bit shift + `can_step` wall check — no `DirMasks`. **Production default.**
     ShiftCanStep,
-    /// Precomputed O(1) localized pawn table + O(1) wall physical gate (`movegen::o1`).
+    /// Offline `PAWN_LEGAL` tables (`movegen-o1-gen`). Research / validation only — not
+    /// [`default`](Self::default); isolated perft benches trade off with `ShiftCanStep` by run.
     O1Lookup,
 }
 
