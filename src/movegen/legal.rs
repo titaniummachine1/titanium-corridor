@@ -28,8 +28,7 @@ pub enum PawnGenMode {
     BitboardCachedDirMasks,
     /// Blind bit shift + `can_step` wall check — no `DirMasks`. **Production default.**
     ShiftCanStep,
-    /// Offline `PAWN_LEGAL` tables (`movegen-o1-gen`). Research / validation only — not
-    /// [`default`](Self::default); isolated perft benches trade off with `ShiftCanStep` by run.
+    /// Offline `PAWN_LEGAL` tables — research only (`movgen-o1-lookup` branch).
     O1Lookup,
 }
 
@@ -98,6 +97,19 @@ pub fn generate_legal_moves_slice_mode(
     }
     debug_assert!(n <= MAX_LEGAL_MOVES);
     n
+}
+
+/// Pawn moves only — no wall enumeration, no BFS wall trials (mobility / pawn-only perft).
+pub fn generate_pawn_moves_slice_mode(
+    board: &Board,
+    out: &mut [Move],
+    scratch: &mut BfsScratch,
+    mode: PawnGenMode,
+) -> usize {
+    if board.is_terminal().is_some() {
+        return 0;
+    }
+    generate_pawn_moves_with_mode(board, scratch, out, mode)
 }
 
 /// Reuses `out` buffer and `scratch` BFS pool — board restored after wall trials.

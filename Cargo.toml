@@ -38,6 +38,9 @@ rand = "0.8"
 rayon = { version = "1.10", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+core_affinity = "0.8"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = "1"
 getrandom = { version = "0.2", features = ["js"] }
@@ -52,4 +55,8 @@ harness = false
 
 [[bench]]
 name = "perft_pawn_modes"
+harness = false
+
+[[bench]]
+name = "perft_pawn_only"
 harness = false

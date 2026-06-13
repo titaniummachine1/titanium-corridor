@@ -9,7 +9,31 @@ use titanium::{
     DEFAULT_MAX_NODES, DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+fn maybe_pin_core() {
+    use core_affinity::CoreId;
+
+    let core = if let Ok(s) = env::var("TITANIUM_PIN_CORE") {
+        s.parse::<usize>().ok().map(|id| CoreId { id })
+    } else if env::var("TITANIUM_PIN_LAST").is_ok() {
+        core_affinity::get_core_ids().and_then(|ids| ids.last().copied())
+    } else {
+        None
+    };
+    if let Some(c) = core {
+        if core_affinity::set_for_current(c) {
+            eprintln!("pinned: logical core {}", c.id);
+        } else {
+            eprintln!("warning: could not pin to core {}", c.id);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn maybe_pin_core() {}
+
 fn main() {
+    maybe_pin_core();
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_usage();

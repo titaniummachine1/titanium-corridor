@@ -17,7 +17,7 @@ pub const PERFT_DEPTH_TIMEOUT_FLOOR_MS: u64 = 250;
 use crate::core::board::{Board, Move};
 use crate::movegen::{
     generate_legal_moves_into, generate_legal_moves_slice, generate_legal_moves_slice_mode,
-    PawnGenMode, MAX_LEGAL_MOVES,
+    generate_pawn_moves_slice_mode, PawnGenMode, MAX_LEGAL_MOVES,
 };
 use crate::path::BfsScratch;
 use crate::search::context::{SharedState, WorkerContext};
@@ -110,6 +110,37 @@ pub fn perft_no_tt_mode_ctx(
         let mv = move_buf[i];
         let undo = board.make_move(mv);
         nodes += perft_no_tt_mode_ctx(board, depth - 1, mode, scratch);
+        board.unmake_move(undo);
+    }
+    nodes
+}
+
+/// Pawn-only perft — no walls in tree; isolates pawn-generation cost (no TT, no wall BFS).
+pub fn perft_pawn_only_mode(board: &mut Board, depth: u32, mode: PawnGenMode) -> u64 {
+    let mut scratch = BfsScratch::new();
+    perft_pawn_only_mode_ctx(board, depth, mode, &mut scratch)
+}
+
+pub fn perft_pawn_only_mode_ctx(
+    board: &mut Board,
+    depth: u32,
+    mode: PawnGenMode,
+    scratch: &mut BfsScratch,
+) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let mut move_buf = [Move::Pawn { row: 0, col: 0 }; 8];
+    let move_count = generate_pawn_moves_slice_mode(board, &mut move_buf, scratch, mode);
+    if depth == 1 {
+        return move_count as u64;
+    }
+    let mut nodes = 0u64;
+    for i in 0..move_count {
+        let mv = move_buf[i];
+        let undo = board.make_move(mv);
+        nodes += perft_pawn_only_mode_ctx(board, depth - 1, mode, scratch);
         board.unmake_move(undo);
     }
     nodes

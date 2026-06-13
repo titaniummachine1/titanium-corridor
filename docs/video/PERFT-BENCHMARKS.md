@@ -23,34 +23,52 @@ cargo run --release -- perft            # same as perft 3
 cargo run --release -- perft-id 3       # iterative deepening 0..3
 cargo run --release -- divide           # divide at depth 3
 
+# Reliable perf: pin to least-loaded logical core (highest index among low-load CPUs)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bench-pinned.ps1
+# Or manual pin (one build, then invoke binary — avoids cargo run window spam):
+# cargo build --release --bin titanium
+# $env:TITANIUM_PIN_CORE='7'; .\target\release\titanium.exe perft 4
+
 node benchmark/perft_triple.mjs         # scraped JS + gorisanson + Rust
 node benchmark/compare_perft.mjs          # JS vs Rust timing
 node benchmark/perft_diff.mjs           # divide diff when something breaks
 ```
 
+**Pinning:** `TITANIUM_PIN_CORE=N` or `TITANIUM_PIN_LAST=1` (highest logical index).  
+`scripts/bench-pinned.ps1` samples `\Processor(*)\% Processor Time`, picks the **highest-index** core within 8% of minimum load, then runs 3× perft + bench.
+
 ## Titanium perft stack (fundamentals)
 
-| Layer           | What                                                                  |
-| --------------- | --------------------------------------------------------------------- |
-| Tree walk       | `make_move` / `unmake_move` (no clone per node)                       |
-| Hash            | Zobrist incremental                                                   |
-| TT              | Clustered buckets (4 slots), `(hash, depth) → nodes`                  |
-| Move gen        | `generate_legal_moves_slice` → stack `[Move; 140]`                    |
-| Wall legality   | L1 empty → L2 shift collision → TOPO shift flood-skip → L3 flood      |
-| Flood fill      | `WallGrids` u128 parallel dilation + **bit theft** (P2 reuses P1)     |
-| Perft           | Bulk count at depth 1; see `docs/MOVEGEN.md`                          |
-| Build           | `lto = fat`, `codegen-units = 1`                                      |
+| Layer         | What                                                              |
+| ------------- | ----------------------------------------------------------------- |
+| Tree walk     | `make_move` / `unmake_move` (no clone per node)                   |
+| Hash          | Zobrist incremental                                               |
+| TT            | Clustered buckets (4 slots), `(hash, depth) → nodes`              |
+| Move gen      | `generate_legal_moves_slice` → stack `[Move; 140]`                |
+| Wall legality | L1 empty → L2 shift collision → TOPO shift flood-skip → L3 flood  |
+| Flood fill    | `WallGrids` u128 parallel dilation + **bit theft** (P2 reuses P1) |
+| Perft         | Bulk count at depth 1; see `docs/MOVEGEN.md`                      |
+| Build         | `lto = fat`, `codegen-units = 1`                                  |
 
 Full movegen reference: `docs/MOVEGEN.md`. Discovery log: `PERFT-OPTIMIZATIONS.md`.
 
 ## Release timings (this machine, startpos, Jun 2026)
 
-| Depth | Time (perft CLI) | Bench nps | Notes |
-| ----- | ---------------- | --------- | ----- |
-| 3     | **~0.05–0.12s**  | ~**175–250M** | Gates exact; bench = honest make/unmake |
-| 4     | **~0.35–0.45s**  | —         | Oracle locked; perft uses bulk d1 + TT |
+**Pinned core 7** (least-loaded logical CPU on i7-4900MQ, 8 threads):
 
-Run `cargo run --release --bin titanium -- bench 3 20` for stable bench nps.  
+| Metric       | Pinned result                        | Notes                           |
+| ------------ | ------------------------------------ | ------------------------------- |
+| `perft 4`    | **0.317 / 0.323 / 0.358 s** (3 runs) | 247,569,030 nodes; bulk d1 + TT |
+| `bench 3 20` | **~231M nps**                        | Honest make/unmake loop         |
+
+Unpinned ranges (noisy under OS load):
+
+| Depth | Time (perft CLI) | Bench nps     | Notes                                   |
+| ----- | ---------------- | ------------- | --------------------------------------- |
+| 3     | **~0.05–0.12s**  | ~**175–250M** | Gates exact; bench = honest make/unmake |
+| 4     | **~0.30–0.45s**  | —             | Oracle locked; perft uses bulk d1 + TT  |
+
+Run `scripts/bench-pinned.ps1` or `TITANIUM_PIN_CORE=7 cargo run --release --bin titanium -- bench 3 20` for stable numbers.  
 Perft CLI time is **not** the same metric as bench nps (bulk counting + TT).
 
 ## Competition comparison (3s wall-clock race)
