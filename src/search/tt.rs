@@ -11,13 +11,17 @@ const TT_CLUSTER: usize = 4;
 ///   | 18 | 24 MB | 0.30 s | 20.7 s |
 ///   | 20 | 96 MB | 0.33 s | 16.1 s |
 ///   | 22 | 384 MB | 0.41 s | **12.6 s** |
+///   | 23 | 768 MB | — | 11.0 s (≈ 22) |
 ///   | 24 | 1.5 GB | 0.76 s | 13.4 s |
 /// **22 is the chosen default — the optimal speed/size tradeoff:** it owns the
-/// deep perft (d5 record 12.6 s, ~1.6× over 18) for 384 MB, while 24 doubles to
-/// 1.5 GB *and* regresses (the table's own cache pressure outweighs the marginal
-/// hit-rate gain). The only cost is shallow perft(4) (0.41 s vs 0.30 s at 18 —
-/// the tiny working set can't amortise the scattered-probe page-fault/TLB cost);
-/// a memory-constrained caller can drop back with `TT_BITS=18`.
+/// deep perft (d5 ~1.6× over 18) for 384 MB, while 24 doubles to 1.5 GB *and*
+/// regresses (the table's own cache pressure outweighs the marginal hit-rate
+/// gain). **Why not 23?** measured d5 (best of 3, this machine): 22 = 11.04 s,
+/// 23 = 11.00 s, 24 = 11.76 s — 23 is a noise-level tie with 22 but costs **2×
+/// the RAM (768 MB vs 384)** for nothing, so 22 is the better point. The only
+/// cost of 22 is shallow perft(4) (0.41 s vs 0.30 s at 18 — the tiny working set
+/// can't amortise the scattered-probe page-fault/TLB cost); a memory-constrained
+/// caller can drop back with `TT_BITS=18`.
 const DEFAULT_TT_BITS: usize = 22;
 
 // NOTE: a 16-byte packed layout (`key` + `depth<<56 | nodes`, cluster = one
