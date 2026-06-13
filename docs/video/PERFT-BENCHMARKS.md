@@ -36,22 +36,22 @@ node benchmark/perft_diff.mjs           # divide diff when something breaks
 | Hash            | Zobrist incremental                                                   |
 | TT              | Clustered buckets (4 slots), `(hash, depth) → nodes`                  |
 | Move gen        | `generate_legal_moves_slice` → stack `[Move; 140]`                    |
-| Wall legality   | Collision → topology → **known-path skip** → in-place flood trial     |
-| Flood fill      | `DirMasks` (N/S/E/W u128) + bitwise shifts on centered 11-wide layout |
-| Component reuse | Ishtar trick: if P2 pawn ∈ P1 flood component, skip P2 flood          |
+| Wall legality   | L1 empty → L2 shift collision → TOPO shift flood-skip → L3 flood      |
+| Flood fill      | `WallGrids` u128 parallel dilation + **bit theft** (P2 reuses P1)     |
+| Perft           | Bulk count at depth 1; see `docs/MOVEGEN.md`                          |
 | Build           | `lto = fat`, `codegen-units = 1`                                      |
 
-Full discovery log: `PERFT-OPTIMIZATIONS.md`.
+Full movegen reference: `docs/MOVEGEN.md`. Discovery log: `PERFT-OPTIMIZATIONS.md`.
 
-## Release timings (this machine, startpos)
+## Release timings (this machine, startpos, Jun 2026)
 
-| Depth | Time       | nps (approx) | Notes                                             |
-| ----- | ---------- | ------------ | ------------------------------------------------- |
-| 3     | **~0.06s** | ~34M         | After Layer 4 flood fill                          |
-| 4     | **~3.4s**  | ~73M         | Locked oracle — search slowness is separate issue |
-| 5     | ~18s       | —            | Ishtar reference only                             |
+| Depth | Time (perft CLI) | Bench nps | Notes |
+| ----- | ---------------- | --------- | ----- |
+| 3     | **~0.05–0.12s**  | ~**175–250M** | Gates exact; bench = honest make/unmake |
+| 4     | **~0.35–0.45s**  | —         | Oracle locked; perft uses bulk d1 + TT |
 
-Run `cargo run --release -- bench 3 20` for a stable nps average.
+Run `cargo run --release --bin titanium -- bench 3 20` for stable bench nps.  
+Perft CLI time is **not** the same metric as bench nps (bulk counting + TT).
 
 ## Competition comparison (3s wall-clock race)
 

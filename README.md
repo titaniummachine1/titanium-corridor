@@ -1,6 +1,6 @@
 # Titanium Quoridor Engine
 
-Rust search engine for [Quoridor](https://en.wikipedia.org/wiki/Quoridor): iterative-deepening αβ, CAT corridor pruning, ACE v10 eval, UCI protocol, and WASM bindings.
+Rust search engine for [Quoridor](https://en.wikipedia.org/wiki/Quoridor): iterative-deepening αβ, CAT corridor pruning, ACE v11 eval, UCI protocol, and WASM bindings.
 
 Repo: [github.com/titaniummachine1/titanium-quoridor](https://github.com/titaniummachine1/titanium-quoridor)
 
@@ -15,10 +15,12 @@ Related repos:
 ## Build & test
 
 ```bash
-cargo test
+cargo test --release
 cargo build --release
-cargo run --release -- perft          # depth 3 → 2_062_264 nodes
-cargo run --release -- uci            # UCI loop: uci / isready / position startpos / go movetime 500 / quit
+cargo run --release --bin titanium -- perft 3    # → 2_062_264 nodes
+cargo run --release --bin titanium -- perft 4    # → 247_569_030 nodes (stress)
+cargo run --release --bin titanium -- bench 3 10 # honest movegen+make/unmake nps
+cargo run --release --bin titanium -- uci        # UCI loop
 ```
 
 WASM (install once: `cargo install wasm-pack`):
@@ -27,9 +29,31 @@ WASM (install once: `cargo install wasm-pack`):
 wasm-pack build --release --no-default-features --features wasm
 ```
 
+## Move generation
+
+Production movegen is **single-thread shift algebra** (no wall tables, no movegen GPU/threads):
+
+- **Walls:** L1 empty → L2 collision shifts → TOPO flood-skip → L3 parallel flood + bit theft
+- **Pawns:** `ShiftCanStep` default (`PawnGenMode` in `movegen/legal.rs`)
+
+Full reference: [`docs/MOVEGEN.md`](docs/MOVEGEN.md)  
+Handoff for follow-up work: [`docs/MOVEGEN-HANDOFF.md`](docs/MOVEGEN-HANDOFF.md)
+
+Offline pawn O(1) tables (research, not production default):
+
+```bash
+cargo run --release --bin movegen-o1-gen
+```
+
 ## Documentation
 
-See `docs/` — start with `docs/STATE.md` for session handoff and `docs/video/README.md` for the episode index.
+| Doc | Content |
+| --- | ------- |
+| [`docs/MOVEGEN.md`](docs/MOVEGEN.md) | Production movegen architecture |
+| [`docs/MOVEGEN-HANDOFF.md`](docs/MOVEGEN-HANDOFF.md) | Next work for audit / make-unmake / L3 |
+| [`docs/STATE.md`](docs/STATE.md) | Session handoff (search, eval) |
+| [`docs/video/README.md`](docs/video/README.md) | Episode index |
+| [`docs/video/PERFT-BENCHMARKS.md`](docs/video/PERFT-BENCHMARKS.md) | Perft gates + timings |
 
 ## License
 
