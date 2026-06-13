@@ -1,10 +1,7 @@
 //! Legal move generation — pawn jumps + wall placements with path validation.
 
 use crate::core::board::{Board, Move, Player, WallOrientation};
-use crate::movegen::o1::{
-    generate_pawn_moves_o1, wall_l12_h_mask, wall_l12_v_mask, wall_needs_flood_h_mask,
-    wall_needs_flood_v_mask, wall_physically_legal_o1,
-};
+use crate::movegen::o1::{generate_pawn_moves_o1, wall_masks, wall_physically_legal_o1};
 use crate::movegen::pawn_bits::{
     generate_pawn_moves_bitboard_with_masks, generate_pawn_moves_shift_slice,
 };
@@ -207,18 +204,21 @@ fn generate_wall_moves_slice(
 ) -> usize {
     // Walls: L1 empty ∧ L2 collision → topo flood-skip → L3 parallel flood when needed.
     // Flood grids are built only if some candidate actually needs L3.
+    let masks = wall_masks(board);
     let mut ctx: Option<WallTrialCtx> = None;
     let mut n = 0usize;
     n += collect_wall_orientation(
         board,
-        wall_l12_h_mask(board),
+        masks.l12_h,
+        masks.topo_h,
         WallOrientation::Horizontal,
         &mut out[n..],
         &mut ctx,
     );
     n += collect_wall_orientation(
         board,
-        wall_l12_v_mask(board),
+        masks.l12_v,
+        masks.topo_v,
         WallOrientation::Vertical,
         &mut out[n..],
         &mut ctx,
@@ -226,23 +226,33 @@ fn generate_wall_moves_slice(
     n
 }
 
-/// L1∧L2 candidates — isolated walls (topo O(1)) skip flood; others run L3.
+/// L1∧L2 candidates — phase A emits isolated walls; phase B runs L3 flood.
 fn collect_wall_orientation(
     board: &Board,
     candidates: u64,
+    needs_flood: u64,
     orientation: WallOrientation,
     out: &mut [Move],
     ctx: &mut Option<WallTrialCtx>,
 ) -> usize {
-    let needs_flood = match orientation {
-        WallOrientation::Horizontal => wall_needs_flood_h_mask(board),
-        WallOrientation::Vertical => wall_needs_flood_v_mask(board),
-    };
     let mut n = 0usize;
-    let mut bits = candidates;
-    while bits != 0 {
-        let bit = bits.trailing_zeros();
-        bits &= bits - 1;
+
+    let mut isolated = candidates & !needs_flood;
+    while isolated != 0 {
+        let bit = isolated.trailing_zeros();
+        isolated &= isolated - 1;
+        out[n] = Move::Wall {
+            row: (bit / 8) as u8,
+            col: (bit % 8) as u8,
+            orientation,
+        };
+        n += 1;
+    }
+
+    let mut heavy = candidates & needs_flood;
+    while heavy != 0 {
+        let bit = heavy.trailing_zeros();
+        heavy &= heavy - 1;
         let row = (bit / 8) as u8;
         let col = (bit % 8) as u8;
         debug_assert!(wall_physically_legal_o1(
@@ -251,11 +261,9 @@ fn collect_wall_orientation(
             col,
             orientation == WallOrientation::Horizontal
         ));
-        let flood = (needs_flood >> bit) & 1 != 0;
-        if !flood
-            || ctx
-                .get_or_insert_with(|| WallTrialCtx::new(board))
-                .wall_keeps_paths_open(row, col, orientation)
+        if ctx
+            .get_or_insert_with(|| WallTrialCtx::new(board))
+            .wall_keeps_paths_open(row, col, orientation)
         {
             out[n] = Move::Wall {
                 row,

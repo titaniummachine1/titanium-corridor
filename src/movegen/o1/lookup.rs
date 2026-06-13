@@ -1,12 +1,12 @@
-//! Runtime pawn lookup + wall O(1) tables.
+//! Runtime pawn lookup + shift-based wall masks.
 //!
-//! Pawns: enemy_key + wall_key → `PAWN_LEGAL` mask.
+//! Pawns: offline `PAWN_LEGAL[sq][enemy_key][wall_key]` tables (`PawnGenMode::O1Lookup` only).
 //!
-//! Walls (3 layers + topology opt):
-//! - L1: empty slot (`!board.horizontal_walls` / `!vertical_walls`) — bitboard, no table
-//! - L2: collision rules (overlap / cross / neighbor) — `WALL_PHYSICAL_TABLE` per slot
-//! - Topo: `can_wall_block_topology` O(1) — skip L3 flood when isolated (not a placement rule)
-//! - L3: parallel flood — `legal.rs` when topo says wall can cage someone
+//! Walls (production — all shift algebra, no runtime tables):
+//! - L1: empty slot (`!horizontal_walls` / `!vertical_walls`)
+//! - L2: collision (overlap / cross / neighbor) — whole-board shifts
+//! - Topo: `can_wall_block_topology` — two-of-three anchor shifts (flood-skip opt)
+//! - L3: parallel flood + bit theft — `legal.rs`, lazy `WallTrialCtx`
 
 use crate::core::board::{Board, Move, WallOrientation};
 use crate::util::grid::{has_wall, square_index};
@@ -98,36 +98,110 @@ pub fn generate_pawn_moves_o1(board: &Board, out: &mut [Move]) -> usize {
 /// L2: passes overlap / cross / neighbor collision rules (`wall_collides` inverse).
 #[inline]
 pub fn wall_physically_legal_o1(board: &Board, row: u8, col: u8, horizontal: bool) -> bool {
-    let mask = if horizontal {
-        wall_collision_clear_h_mask(board)
-    } else {
-        wall_collision_clear_v_mask(board)
-    };
+    let masks = wall_masks(board);
+    let mask = if horizontal { masks.l12_h } else { masks.l12_v };
     (mask >> ((row as u64) * 8 + col as u64)) & 1 != 0
 }
 
-/// L2 horizontal: bit set ⇒ no collision — slot empty (H/V), no H neighbor left/right.
+// --- shift helpers (L2 collision + topo flood-skip) ---
+
+const COL_0: u64 = 0x0101_0101_0101_0101;
+const COL_7: u64 = COL_0 << 7;
+const ROW_0: u64 = 0xFF;
+const ROW_7: u64 = 0xFF << 56;
+
+#[inline]
+fn east1(x: u64) -> u64 {
+    (x << 1) & !COL_0
+}
+
+#[inline]
+fn east2(x: u64) -> u64 {
+    (x << 2) & !(COL_0 | COL_0 << 1)
+}
+
+#[inline]
+fn west1(x: u64) -> u64 {
+    (x >> 1) & !COL_7
+}
+
+#[inline]
+fn west2(x: u64) -> u64 {
+    (x >> 2) & !(COL_7 | COL_7 >> 1)
+}
+
+#[inline]
+fn two_of_three(a: u64, b: u64, m: u64) -> u64 {
+    (a & b) | (m & (a | b))
+}
+
+#[inline]
+fn topo_h_from(h: u64, v: u64) -> u64 {
+    let side_a = COL_0 | east1(v) | east1(v >> 8) | east1(v << 8) | east2(h);
+    let side_b = COL_7 | west1(v) | west1(v >> 8) | west1(v << 8) | west2(h);
+    let middle = (v >> 8) | (v << 8);
+    two_of_three(side_a, side_b, middle)
+}
+
+#[inline]
+fn topo_v_from(h: u64, v: u64) -> u64 {
+    let side_a = ROW_7 | (h >> 8) | east1(h >> 8) | west1(h >> 8) | (v >> 16);
+    let side_b = ROW_0 | (h << 8) | east1(h << 8) | west1(h << 8) | (v << 16);
+    let middle = east1(h) | west1(h);
+    two_of_three(side_a, side_b, middle)
+}
+
+/// All wall candidate masks for one node — single read of the two wall bitboards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallMasks {
+    pub l12_h: u64,
+    pub l12_v: u64,
+    pub topo_h: u64,
+    pub topo_v: u64,
+}
+
+#[inline]
+pub fn wall_masks(board: &Board) -> WallMasks {
+    let h = board.horizontal_walls;
+    let v = board.vertical_walls;
+    let coll_h = !(h | v | east1(h) | west1(h));
+    let coll_v = !(v | h | (v << 8) | (v >> 8));
+    WallMasks {
+        l12_h: !h & coll_h,
+        l12_v: !v & coll_v,
+        topo_h: topo_h_from(h, v),
+        topo_v: topo_v_from(h, v),
+    }
+}
+
 #[inline]
 pub fn wall_collision_clear_h_mask(board: &Board) -> u64 {
     let h = board.horizontal_walls;
     !(h | board.vertical_walls | east1(h) | west1(h))
 }
 
-/// L2 vertical: bit set ⇒ no collision — slot empty (H/V), no V neighbor above/below.
 #[inline]
 pub fn wall_collision_clear_v_mask(board: &Board) -> u64 {
     let v = board.vertical_walls;
     !(v | board.horizontal_walls | (v << 8) | (v >> 8))
 }
 
-/// L1∧L2 horizontal candidates (empty ∧ collision-clear).
 pub fn wall_l12_h_mask(board: &Board) -> u64 {
-    !board.horizontal_walls & wall_collision_clear_h_mask(board)
+    wall_masks(board).l12_h
 }
 
-/// L1∧L2 vertical candidates.
 pub fn wall_l12_v_mask(board: &Board) -> u64 {
-    !board.vertical_walls & wall_collision_clear_v_mask(board)
+    wall_masks(board).l12_v
+}
+
+#[inline]
+pub fn wall_needs_flood_h_mask(board: &Board) -> u64 {
+    topo_h_from(board.horizontal_walls, board.vertical_walls)
+}
+
+#[inline]
+pub fn wall_needs_flood_v_mask(board: &Board) -> u64 {
+    topo_v_from(board.horizontal_walls, board.vertical_walls)
 }
 
 pub fn generate_wall_candidates_o1(board: &Board, horizontal: bool, out: &mut [(u8, u8)]) -> usize {
@@ -145,70 +219,6 @@ pub fn generate_wall_candidates_o1(board: &Board, horizontal: bool, out: &mut [(
         n += 1;
     }
     n
-}
-
-// Topology masks — branchless bitboard form of `can_wall_block_topology`.
-// Slot bit = row*8 + col. A candidate wall can change connectivity only when at
-// least two of {side_a, side_b, middle} anchor to an edge or an existing wall,
-// so the whole 64-slot mask is a fixed shift/OR expression of the two wall
-// bitboards. No table can do this: the mask depends on all 128 wall bits.
-
-const COL_0: u64 = 0x0101_0101_0101_0101;
-const COL_7: u64 = COL_0 << 7;
-const ROW_0: u64 = 0xFF;
-const ROW_7: u64 = 0xFF << 56;
-
-/// Value at slot (r,c) = source at (r,c-1).
-#[inline]
-fn east1(x: u64) -> u64 {
-    (x << 1) & !COL_0
-}
-
-/// Value at slot (r,c) = source at (r,c-2).
-#[inline]
-fn east2(x: u64) -> u64 {
-    (x << 2) & !(COL_0 | COL_0 << 1)
-}
-
-/// Value at slot (r,c) = source at (r,c+1).
-#[inline]
-fn west1(x: u64) -> u64 {
-    (x >> 1) & !COL_7
-}
-
-/// Value at slot (r,c) = source at (r,c+2).
-#[inline]
-fn west2(x: u64) -> u64 {
-    (x >> 2) & !(COL_7 | COL_7 >> 1)
-}
-
-#[inline]
-fn two_of_three(a: u64, b: u64, m: u64) -> u64 {
-    (a & b) | (m & (a | b))
-}
-
-/// Bit set ⇒ `can_wall_block_topology` — must run L3 flood before accepting.
-#[inline]
-pub fn wall_needs_flood_h_mask(board: &Board) -> u64 {
-    let h = board.horizontal_walls;
-    let v = board.vertical_walls;
-    // side_a anchors west of slot (r,c): V(r,c-1), V(r±1,c-1), H(r,c-2); col 0 is on-edge.
-    let side_a = COL_0 | east1(v) | east1(v >> 8) | east1(v << 8) | east2(h);
-    let side_b = COL_7 | west1(v) | west1(v >> 8) | west1(v << 8) | west2(h);
-    let middle = (v >> 8) | (v << 8);
-    two_of_three(side_a, side_b, middle)
-}
-
-/// Bit set ⇒ `can_wall_block_topology` — must run L3 flood before accepting.
-#[inline]
-pub fn wall_needs_flood_v_mask(board: &Board) -> u64 {
-    let h = board.horizontal_walls;
-    let v = board.vertical_walls;
-    // side_a anchors south of slot (r,c): H(r+1,c±{0,1}), V(r+2,c); row 7 is on-edge.
-    let side_a = ROW_7 | (h >> 8) | east1(h >> 8) | west1(h >> 8) | (v >> 16);
-    let side_b = ROW_0 | (h << 8) | east1(h << 8) | west1(h << 8) | (v << 16);
-    let middle = east1(h) | west1(h);
-    two_of_three(side_a, side_b, middle)
 }
 
 #[cfg(test)]
@@ -315,6 +325,26 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn wall_masks_agrees_with_split_masks() {
+        let boards = [
+            Board::new(),
+            {
+                let mut b = Board::new();
+                b.horizontal_walls = 0x00_00_0A_00_14_00;
+                b.vertical_walls = 0x01_02_04_00;
+                b
+            },
+        ];
+        for b in &boards {
+            let m = wall_masks(b);
+            assert_eq!(m.l12_h, !b.horizontal_walls & wall_collision_clear_h_mask(b));
+            assert_eq!(m.l12_v, !b.vertical_walls & wall_collision_clear_v_mask(b));
+            assert_eq!(m.topo_h, wall_needs_flood_h_mask(b));
+            assert_eq!(m.topo_v, wall_needs_flood_v_mask(b));
+        }
     }
 
     #[test]
