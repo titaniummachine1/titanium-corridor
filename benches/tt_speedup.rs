@@ -60,7 +60,7 @@ fn main() {
     // TT memory layout — the pasted analysis warned about awkward entry sizing.
     println!("\nTT layout (titanium::search::tt is private; sizes mirrored here):");
     println!(
-        "  Entry {{ key:u64, depth:u8, nodes:u64 }} → {} bytes (align {})",
+        "  Entry {{ key:u64, nodes:u64, verify:u32, depth:u8, walls_total:u8 }} → {} bytes (align {})",
         size_of::<MirrorEntry>(),
         align_of::<MirrorEntry>()
     );
@@ -76,8 +76,10 @@ fn main() {
 #[allow(dead_code)]
 struct MirrorEntry {
     key: u64,
-    depth: u8,
     nodes: u64,
+    verify: u32,
+    depth: u8,
+    walls_total: u8,
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
