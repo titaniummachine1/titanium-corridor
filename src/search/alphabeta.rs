@@ -32,6 +32,25 @@ pub const DEFAULT_MAX_ID_DEPTH: u32 = 256;
 const MAX_PLY: u32 = DEFAULT_MAX_ID_DEPTH;
 const CM_PER_SQUARE: i32 = 100;
 const MAX_EVAL: i32 = 10_000;
+/// Proven-win score from the v13 endgame certificate. Above any static eval
+/// (`MAX_EVAL`) so a certified line dominates ordinary evaluation, but below the
+/// mate window (`MATE - MATE_WINDOW`) so a real forced mate still outranks it and
+/// mate-distance logic never mistakes a certificate for a mate-in-N.
+const CERT_WIN: i32 = 15_000;
+/// Within-outcome ordering band. The proof fixes the outcome CLASS (win ≫ draw ≫
+/// loss); inside a class the engine's OWN static eval (clamped to ±this) orders
+/// moves, so it plays the materially best move — converting a win and being a
+/// "stubborn loser" (keep racing, obstruct) rather than wandering. Bounded so the
+/// class always dominates and scores stay inside `(MAX_EVAL, mate-window)`.
+const CERT_BAND: i32 = 4_000;
+/// Only consult the (expensive) proof when the race is this close — within this
+/// many tempo a pawn jump can flip win↔loss and the static `dMe<=dOpp` eval can
+/// be wrong. With a wider margin the distance eval is correct, so we trust it and
+/// skip the proof (keeps search fast: neither optimistic nor pessimistic waste).
+const CERT_TEMPO_MARGIN: i32 = 2;
+/// Count of endgame certificate proofs (win or loss) returned this process —
+/// observability for strength matches. Not used by the search itself.
+pub static CERT_PROOFS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const WALL_INVENTORY_CM: i32 = 12;
 const PAWN_PROGRESS_CM: i32 = 6;
 const RACE_LEAD_CM: i32 = 15;
@@ -186,6 +205,53 @@ struct SearchState<'a> {
     black_dist: u8,
     last_iter_asp_fails: u32,
     last_iter_score_delta: i32,
+    /// v13 endgame win-certificate state (see `endgame_cert_floor`).
+    cert: EndgameCert,
+}
+
+/// Endgame guaranteed-win/loss proof oracle (v13 `certify_win` via
+/// `acev13::cert_bridge`). Caches verdicts by (hash, side) and bounds total
+/// certify attempts per search so the cost stays negligible.
+struct EndgameCert {
+    enabled: bool,
+    /// Per-attempt certify node budget.
+    budget: u64,
+    /// Max certify *attempts* per whole search (cache hits are free and uncapped).
+    cap: u32,
+    calls: u32,
+    /// (board hash, stm as u8) → proven side (`0`/`1`) or `2` = not provable here.
+    cache: std::collections::HashMap<(u64, u8), u8>,
+    /// Exact hands-empty (both 0 walls) retrograde DP oracle — sound AND
+    /// complete, ply-exact. Used when both hands are empty; the certificate
+    /// above covers the 1–2 wall band the oracle can't (walls not yet frozen).
+    oracle: crate::acev13::oracle::Oracle,
+}
+
+impl EndgameCert {
+    fn from_env() -> Self {
+        // ON by default: path-aware classifier (oracle only when paths overlap +
+        // delta≤1) measured +Elo in 43-game self-play (A 28-15, 65%, lower CI
+        // bound ~58%). Set TITANIUM_ENDGAME_CERT=0 to disable.
+        let enabled = std::env::var("TITANIUM_ENDGAME_CERT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let budget = std::env::var("TITANIUM_CERT_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1200);
+        let cap = std::env::var("TITANIUM_CERT_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        Self {
+            enabled,
+            budget,
+            cap,
+            calls: 0,
+            cache: std::collections::HashMap::new(),
+            oracle: crate::acev13::oracle::Oracle::default(),
+        }
+    }
 }
 
 /// Score a repeated position: draw when racing evenly; penalize shuffles when behind.
@@ -476,7 +542,7 @@ fn pawn_mobility(board: &Board, player: Player) -> i32 {
 ///
 /// CAT intentionally does not feed this function.  CAT is a search-ordering
 /// signal; eval stays on stable board features so TT scores remain meaningful.
-fn eval_stm(board: &Board, stm: Player, bfs: &mut BfsScratch) -> i32 {
+pub(crate) fn eval_stm(board: &Board, stm: Player, bfs: &mut BfsScratch) -> i32 {
     let opp = stm.opposite();
     let our_steps = bfs.shortest_distance(board, stm).unwrap_or(DIST_PENALTY);
     let opp_steps = bfs.shortest_distance(board, opp).unwrap_or(DIST_PENALTY);
@@ -582,6 +648,111 @@ fn terminal_score(ply: u32) -> i32 {
 /// Leaf score: stand-pat eval plus at most one ply of **forward pawn** pushes.
 /// Wall quiescence was removed (too expensive, fought LMR); this fixes the
 /// odd/even depth oscillation (0 / −1.21 / 0 / …) in symmetric pawn races.
+/// Endgame exact-outcome floor (v13 `certify_win` + v14.1 hands-empty oracle).
+///
+/// The leaf is treated as a TERMINAL (solved) position: the proof gives the exact
+/// win/loss/draw, and we score it in a dominant outcome band while keeping the
+/// engine's own static eval (clamped) as the within-class ordering — so a proven
+/// win is converted and a proven loss is played as a "stubborn loser" (materially
+/// best move, keep racing), and the search NEVER goes blind to a losing leaf.
+///
+/// COST CONTROL: the proof only runs when the race is within `CERT_TEMPO_MARGIN`
+/// (a pawn jump can flip the result there and the static `dMe<=dOpp` eval can be
+/// wrong). With a wider margin the distance eval is already correct, so we return
+/// `None` and let normal eval stand — keeping search fast (no per-leaf proof tax).
+fn endgame_cert_floor(
+    state: &mut SearchState<'_>,
+    board: &Board,
+    stm: Player,
+    static_eval: i32,
+) -> Option<i32> {
+    if !state.cert.enabled {
+        return None; // off by default → zero overhead (no extra dist/proof work)
+    }
+
+    // Outcome class dominates; static eval (clamped) orders within the class so we
+    // play the materially best move (convert / stubborn-defend), never blind.
+    let band = static_eval.clamp(-CERT_BAND, CERT_BAND);
+    let win = CERT_WIN + band;
+    let loss = -CERT_WIN + band;
+
+    // ── Hands-empty: path-aware tempo classifier, exact oracle only if volatile ─
+    // No walls left ⇒ a pure pawn race. Most positions resolve DETERMINISTICALLY
+    // (lead ≥2, or lead ≤1 with non-overlapping shortest paths) — no proof. Only
+    // when the paths overlap AND the lead is ≤1 tempo can a jump flip the result;
+    // there (and only there) we pay for the exact retrograde oracle.
+    if board.walls_remaining[0] == 0 && board.walls_remaining[1] == 0 {
+        use crate::acev13::cert_bridge::{hands_empty_race, RaceVerdict};
+        let g = crate::acev13::cert_bridge::ace_from_board(board);
+        match hands_empty_race(&g) {
+            RaceVerdict::Win => {
+                CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(win);
+            }
+            RaceVerdict::Loss => {
+                CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(loss);
+            }
+            RaceVerdict::NeedsProof => {
+                let v = state.cert.oracle.query(&g);
+                if v > 0 {
+                    CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(win);
+                }
+                if v < 0 {
+                    CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(loss);
+                }
+                // v == 0 is the reachability game's "repetition" value, NOT a real
+                // outcome — Quoridor has no draws. Not a proof: fall back to eval.
+                return None;
+            }
+        }
+    }
+
+    // ── 1–2 walls: v13 certificate (sound, incomplete), tempo-gated ──────────
+    let our_dist = state.bfs.shortest_distance(board, stm).unwrap_or(DIST_PENALTY);
+    let opp_dist = state
+        .bfs
+        .shortest_distance(board, stm.opposite())
+        .unwrap_or(DIST_PENALTY);
+    if (our_dist as i32 - opp_dist as i32).abs() > CERT_TEMPO_MARGIN {
+        return None;
+    }
+    let stm_walls = board.walls_remaining[stm as usize];
+    if stm_walls > 2 || static_eval.abs() >= 3_000 {
+        return None;
+    }
+    let key = (board.hash, stm as u8);
+    let proven = if let Some(&cached) = state.cert.cache.get(&key) {
+        cached
+    } else {
+        if state.cert.calls >= state.cert.cap {
+            return None; // attempt budget spent; only cached verdicts remain free
+        }
+        state.cert.calls += 1;
+        let verdict = crate::acev13::cert_bridge::certify_board(board, state.cert.budget, 0, None);
+        let code = match verdict {
+            Some(Player::One) => 0u8,
+            Some(Player::Two) => 1u8,
+            None => 2u8,
+        };
+        state.cert.cache.insert(key, code);
+        code
+    };
+    match proven {
+        2 => None,
+        side if side == stm as u8 => {
+            CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(win)
+        }
+        _ => {
+            CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(loss) // opponent's win is proven ⇒ stm is lost (scored, not blind)
+        }
+    }
+}
+
 fn leaf_eval(
     state: &mut SearchState<'_>,
     board: &mut Board,
@@ -597,7 +768,14 @@ fn leaf_eval(
         return terminal_score(ply);
     }
 
-    let stand_pat = eval_stm(board, board.side(), state.bfs);
+    let stm = board.side();
+    let stand_pat = eval_stm(board, stm, state.bfs);
+
+    // Endgame exact-outcome floor (opt-in; off by default → no-op). Collapses the
+    // leaf to a proven win/loss when the race is close enough to need a proof.
+    if let Some(certified) = endgame_cert_floor(state, board, stm, stand_pat) {
+        return certified;
+    }
     if stand_pat >= beta {
         return beta;
     }
@@ -605,7 +783,6 @@ fn leaf_eval(
         alpha = stand_pat;
     }
 
-    let stm = board.side();
     let our_dist = state
         .bfs
         .shortest_distance(board, stm)
@@ -1584,6 +1761,7 @@ pub fn run_search(session: &mut GameSearchSession, config: SearchConfig) -> Opti
         black_dist,
         last_iter_asp_fails: 0,
         last_iter_score_delta: i32::MAX,
+        cert: EndgameCert::from_env(),
     };
 
     let static_eval = eval_stm(board, root_side, state.bfs);
@@ -1830,6 +2008,93 @@ mod tests {
         assert_eq!(DEFAULT_MAX_ID_DEPTH, 256);
         assert_eq!(MAX_PLY, DEFAULT_MAX_ID_DEPTH);
         assert_eq!(SearchConfig::default().max_id_depth, DEFAULT_MAX_ID_DEPTH);
+    }
+
+    #[test]
+    fn endgame_certificate_proves_win_beyond_horizon() {
+        // Near-even STATIC eval (equal distances) but a tempo-won race the
+        // opponent cannot interdict (0 walls). The mate is 9 plies away — beyond
+        // a depth-3 search — yet the v13 endgame certificate should PROVE the
+        // win at a leaf and floor the root score to a winning magnitude.
+        //
+        // One (stm, goal row 8) at (3,1): dist 5. Two (goal row 0) at (5,7):
+        // dist 5. DIFFERENT columns ⇒ pawns never interact (no jump-tempo gift),
+        // One moves first ⇒ wins the independent race. Two has 0 walls, so no
+        // wall campaign can save it; One's 2 walls are irrelevant to the proof.
+        let mut board = Board::new();
+        board.pawns = [(3, 1), (5, 7)];
+        board.walls_remaining = [2, 0];
+        board.horizontal_walls = 0;
+        board.vertical_walls = 0;
+        board.side_to_move = Player::One;
+        board.hash = crate::core::zobrist::hash_board(&board);
+
+        // Sanity: static eval really is near-even (the gate requires |eval|<3000).
+        let mut bfs = BfsScratch::new();
+        let se = eval_stm(&board, Player::One, &mut bfs);
+        assert!(se.abs() < 3000, "precondition: near-even static eval, got {se}");
+
+        let config = SearchConfig {
+            time_ms: 5_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            max_id_depth: 4, // far too shallow (4 < 9) to SEE the mate directly
+        };
+        // Feature is ON by default; no env override needed.
+        let report = search_best_move(&mut board, config).expect("report");
+        // A proven win lands in the certified band: above any static eval (so the
+        // engine knows it's winning beyond the horizon) and below the mate window
+        // (so a real forced mate still outranks it). The exact value varies within
+        // the band with the aggression gradient / negamax sign flips.
+        assert!(
+            report.root_score > MAX_EVAL && report.root_score < MATE - MATE_WINDOW,
+            "expected a certified-win-band score in ({MAX_EVAL}, {}), got {}",
+            MATE - MATE_WINDOW,
+            report.root_score
+        );
+    }
+
+    #[test]
+    fn endgame_loss_never_leaks_phantom_draw() {
+        // SEBASTIAN LEAGUE PROTECTION regression: a hands-empty PROVEN-LOSS
+        // position must score strictly NEGATIVE — never a phantom 0/draw that a
+        // losing engine would gladly walk into. (Quoridor has no draws; a 0 from
+        // the oracle is a repetition artifact, not an "equal" verdict, and must
+        // fall back to the real losing eval.)
+        //
+        // One (1,0) dist 7 vs Two (5,8) dist 5, DIFFERENT columns (clean race),
+        // One to move, hands empty ⇒ One is losing the race.
+        let mut board = Board::new();
+        board.pawns = [(1, 0), (5, 8)];
+        board.walls_remaining = [0, 0];
+        board.side_to_move = Player::One;
+        board.hash = crate::core::zobrist::hash_board(&board);
+
+        // Precondition: the oracle really calls this a loss for the side to move.
+        let mut oracle = crate::acev13::oracle::Oracle::default();
+        let g = crate::acev13::cert_bridge::ace_from_board(&board);
+        assert!(
+            oracle.query(&g) < 0,
+            "precondition: One should be losing this race, got {}",
+            oracle.query(&g)
+        );
+
+        let config = SearchConfig {
+            time_ms: 3_000,
+            max_nodes: 2_000_000_000,
+            log: false,
+            book_hint: None,
+            max_id_depth: 4,
+        };
+        let report = search_best_move(&mut board, config).expect("report");
+
+        assert!(
+            report.root_score < 0,
+            "a proven-loss endgame must score negative, never a phantom draw — \
+             got {}",
+            report.root_score
+        );
     }
 
     #[test]

@@ -28,9 +28,11 @@
 //!   pawn  m = (8 - row) * 9 + col
 //!   wall  m = base + (7 - row) * 8 + col   (base 100 = h, 200 = v)
 
+pub mod cert_bridge;
 pub mod certify;
 pub mod game;
 pub mod net;
+pub mod oracle;
 pub mod perft;
 pub mod race;
 pub mod search;

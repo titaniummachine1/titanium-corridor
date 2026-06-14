@@ -4,9 +4,10 @@ use std::env;
 use std::time::Instant;
 
 use titanium::{
-    cat_snapshot_json, generate_legal_moves, genmove_algebraic, lmr_snapshot_json, perft_divide,
-    run_session_stdio, Board, Engine, GenmoveConfig, GenmoveEngine, MctsConfig, SearchConfig,
-    DEFAULT_MAX_NODES, DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,
+    cat_snapshot_json, format_move, generate_legal_moves, genmove_algebraic, lmr_snapshot_json,
+    perft_divide, run_search, run_session_stdio, Board, Engine, GameSearchSession, GenmoveConfig,
+    GenmoveEngine, MctsConfig, SearchConfig, DEFAULT_MAX_NODES, DEFAULT_TIME_MS,
+    MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,6 +66,8 @@ fn main() {
         "ace-perft" => run_ace_perft(&args),
         "cat" => run_cat(&args),
         "lmr" => run_lmr(&args),
+        "rollout" => run_rollout(&args),
+        "match" => run_match(&args),
         "uci" => titanium::run_uci_stdio(),
         "session" => match ace_engine_flag(&args) {
             Some(flag) if is_acev13(flag) => titanium::acev13::run_ace_session_stdio(flag),
@@ -99,6 +102,10 @@ fn print_usage() {
         "  titanium genmove --engine ace-v13 [moves...] — gen13 ACE port (O1 movegen; ace-v13-pure = faithful 1:1)"
     );
     println!("  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare");
+    println!(
+        "  titanium rollout [moves...] [--sims K] [--plies P] [--cmp-depth D] [--seed S] [--time SEC]"
+    );
+    println!("              — EXPERIMENT: eval-guided rollout ranking vs deep αβ (see search::rollout)");
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
@@ -451,6 +458,407 @@ fn run_lmr(args: &[String]) {
         i += 1;
     }
     println!("{}", lmr_snapshot_json(&mut board, time_ms, id_depth));
+}
+
+/// EXPERIMENTAL — measure how well eval-guided rollouts predict the deep
+/// alpha-beta root-move ranking. Validates the "simulation-guided minimax"
+/// hypothesis before any production wiring. See `search::rollout`.
+///
+/// Usage: `titanium rollout [moves...] [--sims K] [--plies P] [--cmp-depth D]
+///         [--seed S] [--time SEC]`
+fn run_rollout(args: &[String]) {
+    let mut moves: Vec<String> = Vec::new();
+    let mut sims = 64u32;
+    let mut plies = 24u32;
+    let mut cmp_depth = 8u32;
+    let mut seed = 1u64;
+    let mut time_ms = 5000u64;
+    let mut i = 2usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let next_u = args.get(i + 1).and_then(|s| s.parse::<u64>().ok());
+        match arg {
+            "--sims" if next_u.is_some() => {
+                sims = next_u.unwrap() as u32;
+                i += 2;
+                continue;
+            }
+            "--plies" if next_u.is_some() => {
+                plies = next_u.unwrap() as u32;
+                i += 2;
+                continue;
+            }
+            "--cmp-depth" if next_u.is_some() => {
+                cmp_depth = next_u.unwrap() as u32;
+                i += 2;
+                continue;
+            }
+            "--seed" if next_u.is_some() => {
+                seed = next_u.unwrap();
+                i += 2;
+                continue;
+            }
+            "--time" => {
+                if let Some(sec) = args.get(i + 1).and_then(|s| s.parse::<f64>().ok()) {
+                    time_ms = (sec * 1000.0).round() as u64;
+                    i += 2;
+                    continue;
+                }
+            }
+            other if looks_like_algebraic_move(other) => moves.push(other.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // ── Rollout ranking ─────────────────────────────────────────────────────
+    let mut board = Board::new();
+    for mv in &moves {
+        board.apply_algebraic(mv);
+    }
+    let t0 = Instant::now();
+    let ranks = titanium::search::rollout::rollout_rank(&mut board, sims, plies, seed);
+    let roll_ms = t0.elapsed().as_millis();
+
+    // ── Ground-truth deep ranking ───────────────────────────────────────────
+    let mut session = GameSearchSession::new();
+    if !moves.is_empty() {
+        let _ = session.set_position(&moves);
+    }
+    let config = SearchConfig {
+        time_ms,
+        max_nodes: DEFAULT_MAX_NODES,
+        log: false,
+        book_hint: None,
+        max_id_depth: cmp_depth,
+    };
+    let t1 = Instant::now();
+    let report = run_search(&mut session, config);
+    let deep_ms = t1.elapsed().as_millis();
+
+    let Some(report) = report else {
+        println!("position is terminal — nothing to rank");
+        return;
+    };
+    let mut deep: Vec<_> = report.root_moves.clone();
+    deep.sort_by(|a, b| b.score.cmp(&a.score));
+
+    // Rank lookup tables keyed by algebraic notation.
+    let deep_rank: std::collections::HashMap<String, usize> = deep
+        .iter()
+        .enumerate()
+        .map(|(r, m)| (m.mv.clone(), r))
+        .collect();
+    let roll_algeb: Vec<String> = ranks.iter().map(|r| format_move(r.mv)).collect();
+
+    // ── Agreement metrics ───────────────────────────────────────────────────
+    let roll_top = roll_algeb.first().cloned().unwrap_or_default();
+    let deep_top = deep.first().map(|m| m.mv.clone()).unwrap_or_default();
+    let top1 = roll_top == deep_top;
+    let top3 = deep
+        .iter()
+        .take(3)
+        .any(|m| m.mv == roll_top);
+
+    // Spearman over the moves common to both lists. Deep search root-filters to
+    // a handful of candidates, so re-rank BOTH lists densely within that common
+    // subset (0..n-1) — otherwise rollout ranks 0..130 vs deep ranks 0..18 make
+    // the d² term meaningless.
+    let mut common_moves: Vec<(usize, usize)> = Vec::new(); // (roll_pos, deep_pos)
+    for (roll_r, alg) in roll_algeb.iter().enumerate() {
+        if let Some(&deep_r) = deep_rank.get(alg) {
+            common_moves.push((roll_r, deep_r));
+        }
+    }
+    let common = common_moves.len();
+    // Dense rank within the common subset for each ordering.
+    let mut by_roll: Vec<usize> = (0..common).collect();
+    by_roll.sort_by_key(|&k| common_moves[k].0);
+    let mut by_deep: Vec<usize> = (0..common).collect();
+    by_deep.sort_by_key(|&k| common_moves[k].1);
+    let mut roll_dense = vec![0usize; common];
+    let mut deep_dense = vec![0usize; common];
+    for (rank, &k) in by_roll.iter().enumerate() {
+        roll_dense[k] = rank;
+    }
+    for (rank, &k) in by_deep.iter().enumerate() {
+        deep_dense[k] = rank;
+    }
+    let mut d2_sum = 0.0f64;
+    for k in 0..common {
+        let d = roll_dense[k] as f64 - deep_dense[k] as f64;
+        d2_sum += d * d;
+    }
+    let spearman = if common > 1 {
+        1.0 - (6.0 * d2_sum) / (common as f64 * ((common * common - 1) as f64))
+    } else {
+        f64::NAN
+    };
+
+    // ── Report ──────────────────────────────────────────────────────────────
+    println!("=== rollout vs deep-search root ranking ===");
+    println!(
+        "sims/move={sims} plies={plies} cmp-depth={cmp_depth} seed={seed} \
+         | rollout {roll_ms}ms, deep {deep_ms}ms ({} nodes)",
+        report.nodes
+    );
+    println!(
+        "top-1 match: {} | rollout #1 in deep top-3: {} | Spearman ρ = {:.3} (n={common})",
+        if top1 { "YES" } else { "no" },
+        if top3 { "YES" } else { "no" },
+        spearman
+    );
+    println!();
+    println!("  {:<5} {:<8} {:<8} {:<8} {:<8} {:<8}", "rank", "roll", "q", "prior", "deep@", "deepScore");
+    for (r, rk) in ranks.iter().take(12).enumerate() {
+        let alg = &roll_algeb[r];
+        let dr = deep_rank
+            .get(alg)
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let ds = deep
+            .iter()
+            .find(|m| &m.mv == alg)
+            .map(|m| m.score.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {:<5} {:<8} {:<8.3} {:<8.3} {:<8} {:<8}",
+            r, alg, rk.q, rk.prior, dr, ds
+        );
+    }
+}
+
+/// STRENGTH MATCH — Titanium+endgame-certificate vs plain Titanium, head to
+/// head over `--games` games. Measures whether the v13 endgame proof oracle
+/// makes the engine *win more*, not whether it searches the same nodes.
+///
+/// Each color-swapped PAIR shares one seeded random opening, so the two configs
+/// face identical positions with both colors (fair + varied — a deterministic
+/// engine plays the same game every time from a fixed start otherwise).
+///
+/// Usage: `titanium match [--games N] [--time SEC] [--seed S] [--open PLIES]
+///         [--maxply N]`
+fn run_match(args: &[String]) {
+    use std::sync::atomic::Ordering;
+    use titanium::search::alphabeta::CERT_PROOFS;
+
+    let mut games = 100usize;
+    let mut time_sec = 2.0f64;
+    let mut seed = 1u64;
+    let mut open_plies = 4u32;
+    let mut max_ply = 200u32;
+    let mut i = 2usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--games" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    games = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--time" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    time_sec = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--seed" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    seed = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--open" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    open_plies = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--maxply" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    max_ply = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let time_ms = (time_sec * 1000.0).round() as u64;
+
+    // cert-ON wins / cert-OFF wins / draws (adjudicated).
+    let (mut cert_w, mut plain_w, mut draws) = (0u32, 0u32, 0u32);
+    let mut decisive_by_cert = 0u64;
+    let started = Instant::now();
+
+    eprintln!(
+        "match: {games} games @ {time_sec}s/move, open={open_plies} plies, maxply={max_ply}"
+    );
+    eprintln!("  A = Titanium+endgame-cert   B = plain Titanium");
+
+    for g in 0..games {
+        // Color-swapped pairs share one opening (seeded by pair index).
+        let pair = (g / 2) as u64;
+        let opening = match_random_opening(seed.wrapping_add(pair), open_plies);
+        // Even game: A (cert) plays One; odd game: B (plain) plays One.
+        let cert_is_one = g % 2 == 0;
+
+        let proofs_before = CERT_PROOFS.load(Ordering::Relaxed);
+        let outcome = play_one_game(&opening, cert_is_one, time_ms, max_ply);
+        let proofs_after = CERT_PROOFS.load(Ordering::Relaxed);
+        if proofs_after > proofs_before {
+            decisive_by_cert += 1;
+        }
+
+        // `outcome`: Some(Player::One)=One won, Some(Two)=Two won, None=draw.
+        match outcome {
+            Some(titanium::Player::One) => {
+                if cert_is_one {
+                    cert_w += 1;
+                } else {
+                    plain_w += 1;
+                }
+            }
+            Some(titanium::Player::Two) => {
+                if cert_is_one {
+                    plain_w += 1;
+                } else {
+                    cert_w += 1;
+                }
+            }
+            None => draws += 1,
+        }
+
+        let played = g + 1;
+        let score = cert_w as f64 + 0.5 * draws as f64;
+        eprintln!(
+            "  [{played}/{games}] A {cert_w} - {plain_w} B  ({draws} draws)  \
+             A-score {:.1}/{played}  cert-touched {decisive_by_cert} games  \
+             {:.0}s elapsed",
+            score,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    let n = games as f64;
+    let score = cert_w as f64 + 0.5 * draws as f64;
+    let p = score / n;
+    // Approx 95% CI on the score rate (normal approx) → rough Elo.
+    let se = (p * (1.0 - p) / n).sqrt();
+    let elo = if p > 0.0 && p < 1.0 {
+        -400.0 * ((1.0 - p) / p).log10()
+    } else {
+        f64::INFINITY * (p - 0.5).signum()
+    };
+    println!("=== STRENGTH MATCH RESULT ===");
+    println!("A = Titanium+endgame-cert,  B = plain Titanium");
+    println!("games {games} @ {time_sec}s/move");
+    println!("A wins {cert_w}  |  B wins {plain_w}  |  draws {draws}");
+    println!(
+        "A score {score:.1}/{games} = {:.1}% (±{:.1}%)  →  ~{elo:+.0} Elo",
+        p * 100.0,
+        se * 196.0
+    );
+    println!(
+        "endgame certificate fired in {decisive_by_cert}/{games} games "
+    );
+}
+
+/// Build a seeded random legal opening of `plies` moves from startpos.
+fn match_random_opening(seed: u64, plies: u32) -> Vec<String> {
+    use titanium::{generate_legal_moves, Board};
+    let mut board = Board::new();
+    let mut state = seed | 1;
+    let mut next = || {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut out = Vec::new();
+    for _ in 0..plies {
+        if board.is_terminal().is_some() {
+            break;
+        }
+        let moves = generate_legal_moves(&board);
+        if moves.is_empty() {
+            break;
+        }
+        let pick = (next() as usize) % moves.len();
+        let mv = moves[pick];
+        out.push(format_move(mv));
+        board.apply_move(mv);
+    }
+    out
+}
+
+/// Play one full game from `opening`. `cert_is_one` decides which config holds
+/// Player::One. Returns the winner, or `None` for an adjudicated draw at the
+/// ply cap (closer pawn wins; equal distance = draw).
+fn play_one_game(
+    opening: &[String],
+    cert_is_one: bool,
+    time_ms: u64,
+    max_ply: u32,
+) -> Option<titanium::Player> {
+    use titanium::{Board, GameSearchSession, Player, SearchConfig, DEFAULT_MAX_NODES};
+
+    let mut moves: Vec<String> = opening.to_vec();
+    let mut board = Board::new();
+    for m in &moves {
+        board.apply_algebraic(m);
+    }
+    let mut session = GameSearchSession::new();
+
+    for _ in 0..max_ply {
+        if let Some(w) = board.is_terminal() {
+            return Some(w);
+        }
+        // Whose config moves now?
+        let one_to_move = board.side() == Player::One;
+        let cert_on = one_to_move == cert_is_one;
+        std::env::set_var("TITANIUM_ENDGAME_CERT", if cert_on { "1" } else { "0" });
+
+        // Fresh-positioned session each ply (fair: both sides identical handling).
+        if session.set_position(&moves).is_err() {
+            return None;
+        }
+        let config = SearchConfig {
+            time_ms,
+            max_nodes: DEFAULT_MAX_NODES,
+            log: false,
+            book_hint: None,
+            ..SearchConfig::default()
+        };
+        let report = match run_search(&mut session, config) {
+            Some(r) => r,
+            None => return None,
+        };
+        let mv = report.best_move;
+        let alg = format_move(mv);
+        board.apply_move(mv);
+        moves.push(alg);
+    }
+
+    // Ply cap reached — adjudicate by shortest path (closer pawn wins).
+    let mut bfs = titanium::BfsScratch::new();
+    let d_one = bfs
+        .shortest_distance(&board, titanium::Player::One)
+        .unwrap_or(255);
+    let d_two = bfs
+        .shortest_distance(&board, titanium::Player::Two)
+        .unwrap_or(255);
+    match d_one.cmp(&d_two) {
+        std::cmp::Ordering::Less => Some(titanium::Player::One),
+        std::cmp::Ordering::Greater => Some(titanium::Player::Two),
+        std::cmp::Ordering::Equal => None,
+    }
 }
 
 fn run_genmove(args: &[String]) {

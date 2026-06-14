@@ -13,6 +13,7 @@ pub mod greedy;
 pub mod lmr_profile;
 pub mod lmr_viz;
 pub mod pipeline;
+pub mod rollout;
 pub mod root_cap;
 pub mod runtime;
 pub mod tt;
