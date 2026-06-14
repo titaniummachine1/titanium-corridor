@@ -174,8 +174,47 @@ pub fn tables() -> &'static PawnTables {
 
 /// Force table construction now (so later search/perft timing excludes the
 /// cold-start build). Idempotent; safe to call from any thread.
+///
+/// Also enforces the BMI2/PEXT "saint rule": if the CPU supports BMI2 but the
+/// binary was compiled without it, we loudly warn — the pawn O1 lookup uses
+/// PEXT for maximum speed and the silent scalar fallback hides a real perf loss.
 pub fn prewarm() {
     let _ = tables();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CPUID leaf 7, sub-leaf 0: EBX bit 8 = BMI2 support.
+        // SAFETY: CPUID is always safe to call on x86_64.
+        let has_bmi2 = unsafe {
+            let r = std::arch::x86_64::__cpuid_count(7, 0);
+            (r.ebx >> 8) & 1 != 0
+        };
+
+        // Case 1: CPU has BMI2 but binary was not compiled with it.
+        // The O1 pawn LUT falls back to the scalar packer — correct but slower.
+        #[cfg(not(target_feature = "bmi2"))]
+        if has_bmi2 {
+            eprintln!(
+                "WARNING [titanium/movegen]: CPU supports BMI2/PEXT but this binary \
+                 was NOT compiled with it. The O1 pawn lookup is running the scalar \
+                 fallback. Recompile with RUSTFLAGS='-C target-cpu=native' (or \
+                 '-C target-feature=+bmi2') for full PEXT speed."
+            );
+        }
+
+        // Case 2: binary compiled with BMI2 but CPU doesn't have it — will crash
+        // on the first PEXT instruction. Abort immediately with a clear message.
+        #[cfg(target_feature = "bmi2")]
+        if !has_bmi2 {
+            eprintln!(
+                "FATAL [titanium/movegen]: Binary was compiled with BMI2/PEXT \
+                 (target-feature=+bmi2) but this CPU does not support it. \
+                 The process will crash on the first pawn lookup. \
+                 Recompile without BMI2 flags for this hardware."
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Mirrors the embedded `wall_remap_byte` free function (kept for call-site parity).
