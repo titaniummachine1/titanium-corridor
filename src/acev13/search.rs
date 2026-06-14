@@ -339,7 +339,7 @@ impl AceSearch {
             eme: false,
             nodes: 0,
             deadline: Instant::now(),
-            root_best: 0,
+            root_best: super::ACE_NO_MOVE,
             root_score: 0,
             race_proof: true,
             refused_cuts: 0,
@@ -1550,7 +1550,7 @@ impl AceSearch {
         }
         self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
         self.nodes = 0;
-        self.root_best = 0;
+        self.root_best = super::ACE_NO_MOVE;
         self.root_score = 0;
         // RaceProof per-think solve budgets + caps
         self.rc_think_solve_ms = 0;
@@ -1567,14 +1567,14 @@ impl AceSearch {
         self.stream_depth_log.clear();
         self.stream_last_emit_nodes = 0;
         self.stream_last_emit_ms = 0;
-        self.stream_last_best = 0;
+        self.stream_last_best = super::ACE_NO_MOVE;
         // Re-sync the mirrored Titanium board from the authoritative ACE game.
         // Kills any drift left over from a previous search (e.g. an unbalanced
         // push/pop on time-abort) before it can poison this move's root list.
         if self.bridge.is_some() {
             self.bridge = Some(TiBridge::from_game(&self.g));
         }
-        let mut last_best: i16 = 0;
+        let mut last_best: i16 = super::ACE_NO_MOVE;
         let mut last_score = 0;
         let mut last_depth = 0;
         let mut stable = 0;
@@ -1635,7 +1635,7 @@ impl AceSearch {
                         last_pawn_score = self.root_pawn_score;
                     }
                     let elapsed_ms = t0.elapsed().as_millis() as u64;
-                    let pv = if last_best != 0 {
+                    let pv = if last_best >= 0 {
                         super::ace_to_algebraic(last_best)
                     } else {
                         String::new()
@@ -1733,8 +1733,9 @@ impl AceSearch {
         self.refresh_dist(0);
         let mut legal = [0i16; 160];
         let nlegal = self.gen_moves(0, 1, last_best, &mut legal);
-        if last_best == 0 || !legal[..nlegal].contains(&last_best) {
-            if last_best != 0 {
+        let root_ok = nlegal > 0 && last_best >= 0 && legal[..nlegal].contains(&last_best);
+        if !root_ok {
+            if last_best >= 0 && nlegal > 0 {
                 eprintln!(
                     "info string ace root guard: searched best {} is illegal in true position — substituting",
                     super::ace_to_algebraic(last_best)
@@ -1744,7 +1745,7 @@ impl AceSearch {
                 self.order_moves(0, &mut legal[..nlegal], 0, 0);
                 last_best = legal[0];
             } else {
-                last_best = 0;
+                last_best = super::ACE_NO_MOVE;
             }
         }
 

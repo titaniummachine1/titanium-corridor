@@ -8,7 +8,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use super::{algebraic_to_ace, ace_to_algebraic, AceGame, AceSearch};
+use super::{ace_to_algebraic, algebraic_to_ace, AceGame, AceSearch};
 
 fn reply_ready(stdout: &mut io::Stdout) {
     let _ = writeln!(stdout, "ready");
@@ -72,7 +72,8 @@ pub fn run_ace_session_stdio(engine_flag: &str) {
             }
             "position" => {
                 let moves: Vec<String> = parts[1..].iter().map(|s| (*s).to_string()).collect();
-                let extends = moves.len() >= applied.len()
+                let extends = !applied.is_empty()
+                    && moves.len() >= applied.len()
                     && moves.iter().zip(applied.iter()).all(|(a, b)| a == b);
                 if extends {
                     // common case: game advanced — push only the new plies,
@@ -124,7 +125,7 @@ pub fn run_ace_session_stdio(engine_flag: &str) {
                 let time_sec: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4.0);
                 let time_ms = (time_sec * 1000.0).max(1.0) as u64;
                 let result = search.think(time_ms, 30, false, true, engine_flag);
-                if result.mv == 0 {
+                if result.mv == super::ACE_NO_MOVE {
                     let _ = writeln!(stdout, "bestmove (none)");
                 } else {
                     let _ = writeln!(stdout, "bestmove {}", ace_to_algebraic(result.mv));

@@ -31,6 +31,9 @@ pub use perft::{
 pub use search::{board_move_to_ace, AceSearch, ThinkResult};
 pub use session::run_ace_session_stdio;
 
+/// Sentinel — pawn move id `0` is legal (cell a9); do not use `0` for "no move".
+pub const ACE_NO_MOVE: i16 = -1;
+
 use crate::core::board::{Move as BoardMove, WallOrientation};
 
 /// ACE move encoding → Titanium board move (row flip between coordinate systems).
@@ -149,6 +152,9 @@ pub fn ace_genmove(
         params.log,
         engine_label,
     );
+    if result.mv == ACE_NO_MOVE {
+        return None;
+    }
     if result.mv == 0 && search.g.winner() >= 0 {
         return None;
     }

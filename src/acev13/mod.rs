@@ -44,6 +44,9 @@ pub use perft::{
 pub use search::{board_move_to_ace, AceSearch, ThinkResult};
 pub use session::run_ace_session_stdio;
 
+/// Sentinel — pawn move id `0` is legal (cell a9); do not use `0` for "no move".
+pub const ACE_NO_MOVE: i16 = -1;
+
 use crate::core::board::{Move as BoardMove, WallOrientation};
 
 /// ACE move encoding → Titanium board move (row flip between coordinate systems).
@@ -162,6 +165,9 @@ pub fn ace_genmove(
         params.log,
         engine_label,
     );
+    if result.mv == ACE_NO_MOVE {
+        return None;
+    }
     if result.mv == 0 && search.g.winner() >= 0 {
         return None;
     }
@@ -204,6 +210,29 @@ mod tests {
             }
         }
         assert_eq!(walls, 128);
+    }
+
+    #[test]
+    fn a8_goal_pawn_encodes_as_zero_not_no_move() {
+        assert_eq!(algebraic_to_ace("a9"), 0);
+        assert_eq!(ace_to_algebraic(0), "a9");
+        let moves: Vec<String> = "e2 e8 e3 e7 e4 e6 d3h d6h f3h f6h d5v h3v e4h h6h h1h e3v d4 c4h b3h f6 c4 g6 f1h g5 b4 h5 d1h h4 b5 b6h c5h h3 a5 g3 b7v f3 a6 g5v a7 b2v a8 f2"
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let params = AceParams {
+            time_ms: 500,
+            max_depth: 4,
+            full: false,
+            cat: false,
+            ti_movegen: true,
+            log: false,
+            eme: false,
+        };
+        let (alg, result) = ace_genmove(&moves, params, "ace-v13-ti").expect("best move");
+        assert_eq!(alg, "a9");
+        assert_eq!(result.mv, 0);
+        assert_ne!(result.mv, ACE_NO_MOVE);
     }
 
     #[test]
