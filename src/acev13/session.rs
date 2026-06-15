@@ -21,13 +21,13 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
 }
 
 fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
-    // `titanium-v14` is our versioned alias for the current strongest engine.
-    // `ace-v13-pure` is the faithful 1:1 JS-matching reference.
-    // `ace-v13-grafted` is the same as titanium-v14 (kept for internal benchmarks).
+    // `titanium-v15` is the current production engine (gen13 + O1 movegen + cert + adaptive-TT + partial-iter).
+    // `ace-v13-ti-pure` is the JS v13 baseline (+ O1 movegen only) — fair yardstick for Elo measurement.
+    // `titanium-v14` / `ace-v13-grafted` are legacy aliases for the same v15 build.
     let mut search = match engine_flag {
         "ace-v13-pure"    => AceSearch::new(g),
         "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
-        "ace-v13-grafted" | "titanium-v14" => AceSearch::grafted(g, None),
+        "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => AceSearch::grafted(g, None),
         _ => AceSearch::with_ti_movegen(g),
     };
     if engine_flag.contains("pmc") {

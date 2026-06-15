@@ -463,7 +463,7 @@ impl AceSearch {
     /// Pure JS-port baseline + O1 movegen only. All Rust-side state-retention extras
     /// (gen TT, history aging, dynamic ID startup, accumulator retention) are disabled
     /// so this is a faithful 1:1 JS v13 reference, just with the faster movegen.
-    /// Use as the fair B-engine when measuring compounded advantage of titanium-v14.
+    /// Use as the fair B-engine when measuring how far Titanium v15 is beyond JS v13.
     pub fn with_ti_movegen_pure(g: AceGame) -> Box<Self> {
         let mut search = Self::new(g);
         search.bridge = Some(TiBridge::from_game(&search.g));
