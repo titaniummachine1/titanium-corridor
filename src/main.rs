@@ -66,6 +66,7 @@ fn main() {
         "ace-perft" => run_ace_perft(&args),
         "cat" => run_cat(&args),
         "eval" => run_eval(&args),
+        "eval-batch" => run_eval_batch(),
         "lmr" => run_lmr(&args),
         "rollout" => run_rollout(&args),
         "match" => run_match(&args),
@@ -438,6 +439,32 @@ fn run_eval(args: &[String]) {
         println!("{}", s.eval_dump_json());
     } else {
         println!("eval {}", s.eval_position());
+    }
+}
+
+/// Batch eval — reads one move-sequence per stdin line, emits one JSON per stdout line.
+/// Dramatically faster than launching `titanium eval --json` per position (single startup).
+/// Input:  `e2 e8 e3 e7 d3h f5v`  (space-separated algebraic moves, empty line = startpos)
+/// Output: one compact JSON record per line (same format as `eval --json`)
+fn run_eval_batch() {
+    use std::io::{self, BufRead};
+    use titanium::acev13::{algebraic_to_ace, AceGame, AceSearch};
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue; // skip comment lines
+        }
+        let mut g = AceGame::new();
+        for tok in line.split_whitespace() {
+            g.make_move(algebraic_to_ace(tok));
+        }
+        let mut s = AceSearch::grafted(g, None);
+        println!("{}", s.eval_dump_json());
     }
 }
 
