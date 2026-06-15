@@ -385,7 +385,7 @@ impl AceSearch {
             deadline: Instant::now(),
             root_best: super::ACE_NO_MOVE,
             root_score: 0,
-            use_partial_iter: false,
+            use_partial_iter: true,
             race_proof: true,
             refused_cuts: 0,
             rb1_stores: 0,
