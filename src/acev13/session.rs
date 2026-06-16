@@ -4,8 +4,8 @@
 //! `go TIME_SEC` / `quit`.  Holds one warm `AceSearch` per process so the
 //! TT, killers, history, and countermove tables persist between plies.
 //!
-//! **Titanium v15 uses `session_v15` instead** — this file handles only the
-//! ACE reference engines used as comparison baselines.
+//! `titanium-v15` uses this session (grafted build).  `session_v15` infinite
+//! search exists but is not routed — see main.rs.
 
 use std::io::{self, BufRead, Write};
 
@@ -22,11 +22,11 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
 }
 
 fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
-    // Reference engines only — titanium-v15 is routed to session_v15::run_v15_session_stdio.
-    // ace-v13-ti-pure = O1 movegen + pure_mode (faithful JS baseline, Elo measurement yardstick).
+    // titanium-v15 = production grafted build. ace-v13-ti-pure = JS baseline yardstick.
     let mut search = match engine_flag {
         "ace-v13-pure"    => AceSearch::new(g),
         "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
+        "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => AceSearch::grafted(g, None),
         _                 => AceSearch::with_ti_movegen(g),
     };
     if engine_flag.contains("pmc") {

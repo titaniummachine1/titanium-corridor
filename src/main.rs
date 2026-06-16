@@ -67,12 +67,14 @@ fn main() {
         "cat" => run_cat(&args),
         "eval" => run_eval(&args),
         "eval-batch" => run_eval_batch(),
+        "fields" => run_fields(&args),
         "lmr" => run_lmr(&args),
         "rollout" => run_rollout(&args),
         "match" => run_match(&args),
         "uci" => titanium::run_uci_stdio(),
         "session" => match ace_engine_flag(&args) {
-            Some(flag) if flag == "titanium-v15" => titanium::acev13::run_v15_session_stdio(flag),
+            // v15 uses the standard warm session (go TIME_SEC). session_v15 infinite
+            // search is kept in-tree but disabled — it regressed vs ti-pure baseline.
             Some(flag) if uses_acev13_module(flag) => titanium::acev13::run_ace_session_stdio(flag),
             Some(flag) => titanium::ace::run_ace_session_stdio(flag),
             None => run_session_stdio(),
@@ -105,10 +107,10 @@ fn print_usage() {
         "  titanium genmove --engine ace-v13 [moves...] — gen13 ACE port (O1 movegen; ace-v13-pure = faithful 1:1)"
     );
     println!("  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare");
+    println!("  titanium eval [moves...] [--json]     — HalfPW net eval dump (trainer parity)");
     println!(
-        "  titanium rollout [moves...] [--sims K] [--plies P] [--cmp-depth D] [--seed S] [--time SEC]"
+        "  titanium fields [moves...] [--check]  — ASCII distance/corridor field grids + invariants"
     );
-    println!("              — EXPERIMENT: eval-guided rollout ranking vs deep αβ (see search::rollout)");
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
@@ -443,6 +445,33 @@ fn run_eval(args: &[String]) {
     }
 }
 
+/// ASCII grids for NNUE distance / corridor fields — eyeball training geometry.
+fn run_fields(args: &[String]) {
+    use titanium::acev13::fields_viz::{compute_nnue_fields, render_fields_text, validate_fields};
+    use titanium::acev13::{algebraic_to_ace, AceGame};
+    let check = args.iter().any(|a| a == "--check");
+    let mut g = AceGame::new();
+    for a in args.iter().skip(2) {
+        if a.starts_with("--") {
+            continue;
+        }
+        g.make_move(algebraic_to_ace(a));
+    }
+    let fields = compute_nnue_fields(&g);
+    if check {
+        let errs = validate_fields(&g, &fields);
+        if errs.is_empty() {
+            eprintln!("fields: all invariants OK");
+        } else {
+            for e in &errs {
+                eprintln!("fields ERROR: {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+    print!("{}", render_fields_text(&g, &fields));
+}
+
 /// Batch eval — reads one move-sequence per stdin line, emits one JSON per stdout line.
 /// Dramatically faster than launching `titanium eval --json` per position (single startup).
 /// Input:  `e2 e8 e3 e7 d3h f5v`  (space-separated algebraic moves, empty line = startpos)
@@ -607,10 +636,7 @@ fn run_rollout(args: &[String]) {
     let roll_top = roll_algeb.first().cloned().unwrap_or_default();
     let deep_top = deep.first().map(|m| m.mv.clone()).unwrap_or_default();
     let top1 = roll_top == deep_top;
-    let top3 = deep
-        .iter()
-        .take(3)
-        .any(|m| m.mv == roll_top);
+    let top3 = deep.iter().take(3).any(|m| m.mv == roll_top);
 
     // Spearman over the moves common to both lists. Deep search root-filters to
     // a handful of candidates, so re-rank BOTH lists densely within that common
@@ -661,7 +687,10 @@ fn run_rollout(args: &[String]) {
         spearman
     );
     println!();
-    println!("  {:<5} {:<8} {:<8} {:<8} {:<8} {:<8}", "rank", "roll", "q", "prior", "deep@", "deepScore");
+    println!(
+        "  {:<5} {:<8} {:<8} {:<8} {:<8} {:<8}",
+        "rank", "roll", "q", "prior", "deep@", "deepScore"
+    );
     for (r, rk) in ranks.iter().take(12).enumerate() {
         let alg = &roll_algeb[r];
         let dr = deep_rank
@@ -713,18 +742,86 @@ fn run_match(args: &[String]) {
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--games"  => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { games = v; i += 2; continue; } }
-            "--time"   => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { time_sec = v; i += 2; continue; } }
-            "--seed"   => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { seed = v; i += 2; continue; } }
-            "--open"   => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { open_plies = v; i += 2; continue; } }
-            "--maxply" => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { max_ply = v; i += 2; continue; } }
-            "--threads"=> { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { threads = v; i += 2; continue; } }
-            "--tt-bits"=> { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { tt_bits = Some(v); i += 2; continue; } }
-            "--a"      => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_a = e; i += 2; continue; } }
-            "--b" | "--vs" => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_b = e; i += 2; continue; } }
-            "--no-early-stop" => { early_stop = false; i += 1; continue; }
-            "--openings" => { if let Some(v) = args.get(i+1) { book_openings = v == "book"; i += 2; continue; } }
-            "--dump-games" => { dump_games = true; i += 1; continue; }
+            "--games" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    games = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--time" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    time_sec = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--seed" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    seed = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--open" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    open_plies = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--maxply" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    max_ply = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--threads" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    threads = v;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--tt-bits" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    tt_bits = Some(v);
+                    i += 2;
+                    continue;
+                }
+            }
+            "--a" => {
+                if let Some(e) = args.get(i + 1).and_then(|s| MatchEngine::parse(s)) {
+                    engine_a = e;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--b" | "--vs" => {
+                if let Some(e) = args.get(i + 1).and_then(|s| MatchEngine::parse(s)) {
+                    engine_b = e;
+                    i += 2;
+                    continue;
+                }
+            }
+            "--no-early-stop" => {
+                early_stop = false;
+                i += 1;
+                continue;
+            }
+            "--openings" => {
+                if let Some(v) = args.get(i + 1) {
+                    book_openings = v == "book";
+                    i += 2;
+                    continue;
+                }
+            }
+            "--dump-games" => {
+                dump_games = true;
+                i += 1;
+                continue;
+            }
             _ => {}
         }
         i += 1;
@@ -741,9 +838,9 @@ fn run_match(args: &[String]) {
 
     let a_w = AtomicU32::new(0);
     let b_w = AtomicU32::new(0);
-    let draws   = AtomicU32::new(0);
+    let draws = AtomicU32::new(0);
     let cert_touched = AtomicU64::new(0);
-    let games_done   = AtomicU32::new(0);
+    let games_done = AtomicU32::new(0);
     // Disaster guard: set when we're statistically confident A is ≥100 Elo worse.
     // In-flight games still finish, but no new ones launch — saves a doomed run.
     let aborted = AtomicBool::new(false);
@@ -756,7 +853,9 @@ fn run_match(args: &[String]) {
     let pairs = raw_pairs.div_ceil(pair_threads) * pair_threads;
     let games = pairs * 2;
 
-    let tt_note = tt_bits.map(|b| format!(", tt-bits={b}")).unwrap_or_default();
+    let tt_note = tt_bits
+        .map(|b| format!(", tt-bits={b}"))
+        .unwrap_or_default();
     let open_note = if book_openings {
         "book lines".to_string()
     } else {
@@ -777,29 +876,42 @@ fn run_match(args: &[String]) {
 
         for flip in 0..2u32 {
             let game_idx = pair * 2 + flip as usize;
-            if game_idx >= games { break; }
-            if aborted.load(Ordering::Relaxed) { break; } // disaster guard tripped
-            // Swap colors per game in the pair so the opening is played from both
-            // sides — `a_is_one` true means engine A holds Player::One this game.
+            if game_idx >= games {
+                break;
+            }
+            if aborted.load(Ordering::Relaxed) {
+                break;
+            } // disaster guard tripped
+              // Swap colors per game in the pair so the opening is played from both
+              // sides — `a_is_one` true means engine A holds Player::One this game.
             let a_is_one = flip == 0;
 
             let proofs_before = CERT_PROOFS.load(Ordering::Relaxed);
-            let (outcome, game_moves) =
-                play_one_game(&opening, a_is_one, time_ms, max_ply, engine_a, engine_b, tt_bits);
+            let (outcome, game_moves) = play_one_game(
+                &opening, a_is_one, time_ms, max_ply, engine_a, engine_b, tt_bits,
+            );
             if CERT_PROOFS.load(Ordering::Relaxed) > proofs_before {
                 cert_touched.fetch_add(1, Ordering::Relaxed);
             }
 
             match outcome {
                 Some(titanium::Player::One) => {
-                    if a_is_one { a_w.fetch_add(1, Ordering::Relaxed); }
-                    else        { b_w.fetch_add(1, Ordering::Relaxed); }
+                    if a_is_one {
+                        a_w.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        b_w.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Some(titanium::Player::Two) => {
-                    if a_is_one { b_w.fetch_add(1, Ordering::Relaxed); }
-                    else        { a_w.fetch_add(1, Ordering::Relaxed); }
+                    if a_is_one {
+                        b_w.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        a_w.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                None => { draws.fetch_add(1, Ordering::Relaxed); }
+                None => {
+                    draws.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             if dump_games {
@@ -866,7 +978,11 @@ fn run_match(args: &[String]) {
         f64::INFINITY * (p - 0.5).signum()
     };
     println!("=== STRENGTH MATCH RESULT ===");
-    println!("A = {},  B = {}{tt_note}", engine_a.label(), engine_b.label());
+    println!(
+        "A = {},  B = {}{tt_note}",
+        engine_a.label(),
+        engine_b.label()
+    );
     if was_aborted {
         println!("EARLY-STOPPED after {played}/{games} games (A ≥100 Elo worse)");
     } else {
@@ -875,7 +991,8 @@ fn run_match(args: &[String]) {
     println!("A wins {aw}  |  B wins {bw}  |  draws {dr}");
     println!(
         "A score {score:.1}/{played} = {:.1}% (±{:.1}%)  →  ~{elo:+.0} Elo",
-        p * 100.0, se * 196.0
+        p * 100.0,
+        se * 196.0
     );
     println!("Titanium-cert fired in {ct}/{played} games");
 }
@@ -917,11 +1034,23 @@ fn match_random_opening(seed: u64, plies: u32) -> Vec<String> {
 /// whole line is played (its length is the intended opening depth).
 const BOOK_OPENINGS: &[(&[&str], u32)] = &[
     (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h"], 40),
-    (&["e2", "e8", "e3", "e7", "e4", "e6", "d3h", "c6h", "e6v"], 10),
-    (&["e2", "e8", "e3", "e7", "e4", "e6", "d3h", "c6h", "d5v"], 10),
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "d3h", "c6h", "e6v"],
+        10,
+    ),
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "d3h", "c6h", "d5v"],
+        10,
+    ),
     (&["e2", "e8", "e3", "e7", "e4", "d4v"], 8),
-    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "d4v", "c5h"], 6),
-    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "h6h", "c3h"], 5),
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "d4v", "c5h"],
+        6,
+    ),
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "h6h", "c3h"],
+        5,
+    ),
 ];
 
 /// Pick a weighted book line, play it, then append `diverge` seed-random PAWN
@@ -978,7 +1107,11 @@ fn match_book_opening(seed: u64, diverge: u32) -> Vec<String> {
                 !s.ends_with('h') && !s.ends_with('v')
             })
             .collect();
-        let pool = if pawns.is_empty() { &moves[..] } else { &pawns[..] };
+        let pool = if pawns.is_empty() {
+            &moves[..]
+        } else {
+            &pawns[..]
+        };
         if pool.is_empty() {
             break;
         }
@@ -1041,7 +1174,9 @@ impl MatchEngine {
             MatchEngine::AceV13Cert => "ace-v13 + cheap-cert (no CAT)",
             MatchEngine::AceV13AdaptiveTt => "ace-v13 + adaptive cache-tier TT",
             MatchEngine::AceV13DeadZone => "ace-v13 + dead-zone wall prune",
-            MatchEngine::AceV13Grafted => "Titanium v15 (gen13 + O1 movegen + cert + adaptive-TT + partial-iter)",
+            MatchEngine::AceV13Grafted => {
+                "Titanium v15 (gen13 + O1 movegen + cert + adaptive-TT + partial-iter)"
+            }
             MatchEngine::AceV13GraftedPartial => "ace-v13 grafted + Lague partial-iteration",
         }
     }
@@ -1244,9 +1379,7 @@ fn ace_engine_mode(flag: &str) -> &'static str {
         // Titanium O1 movegen. `ace-v13-pure` is the faithful 1:1 (native ACE
         // `wall_legal` movegen) kept as the JS-matching reference.
         "ace-ti" | "ace-v8-ti" | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc"
-        | "ace-v11-ti" | "ace-v11-ti-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc" => {
-            "ace-ti"
-        }
+        | "ace-v11-ti" | "ace-v11-ti-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc" => "ace-ti",
         _ => "ace",
     }
 }

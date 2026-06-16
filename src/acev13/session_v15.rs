@@ -11,7 +11,7 @@
 //! ### Standard commands (compatible with self_match.js and run_overnight.bat)
 //!   reset / position [MOVES] / makemove MOVE / go TIME_SEC / quit
 //!
-//! ### Titanium v15 infinite-search extensions
+//! ### Titanium v15 infinite-search extensions (disabled — not routed in main.rs)
 //!   go infinite [PONDER_MOVE]   — start pondering; applies PONDER_MOVE first if given
 //!   stop                        — stop pondering; replies "bestmove MOVE"
 //!   ponderhit TIME_MS           — ponder move was correct; think for TIME_MS; replies "bestmove MOVE"
@@ -87,7 +87,10 @@ fn search_daemon(engine_flag: String, rx: Receiver<Cmd>, tx: Sender<Reply>) {
                 if ponder_mv != ACE_NO_MOVE {
                     search.apply_move(ponder_mv);
                 }
-                // Think in 100 ms chunks until interrupted.
+                // Ponder mode: tt_gen and history are frozen across all chunks
+                // so the TT entries built during pondering stay fresh and history
+                // accumulates. Cleared to false before every real think() call.
+                search.set_pondering(true);
                 let mut last_mv = ACE_NO_MOVE;
                 loop {
                     let r = search.think(100, 30, false, false, label);
@@ -97,18 +100,22 @@ fn search_daemon(engine_flag: String, rx: Receiver<Cmd>, tx: Sender<Reply>) {
                     }
                     match rx.try_recv() {
                         Ok(Cmd::StopAndGet) => {
+                            search.set_pondering(false);
                             let _ = tx.send(Reply::BestMove(last_mv));
                             break;
                         }
                         Ok(Cmd::PonderHit(time_ms)) => {
-                            // Already at the ponder position — just think for real.
+                            // Predicted correctly — zero TT/history loss.
+                            // Exit ponder mode so the real think does one normal
+                            // tt_gen advance + history halving and then runs.
+                            search.set_pondering(false);
                             let r2 = search.think(time_ms, 30, false, true, label);
                             last_score = r2.score;
                             let _ = tx.send(Reply::BestMove(r2.mv));
                             break;
                         }
                         Ok(Cmd::MoveMiss { new_game, time_ms }) => {
-                            // Opponent played something unexpected.
+                            search.set_pondering(false);
                             search.set_position(new_game);
                             search.decay_history_by_surprise(last_score);
                             let r2 = search.think(time_ms, 30, false, true, label);

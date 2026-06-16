@@ -6,7 +6,8 @@
 //! win-certificate solver (`certify.rs`), and incremental HalfPW accumulator
 //! onto the gen13 search core.  It is NOT just an ACE port — it is the
 //! Titanium engine, using ACE v13 as its search algorithm foundation.
-//! Session: `run_v15_session_stdio` (two-thread daemon, infinite search).
+//! Session: `run_ace_session_stdio` (warm TT, `go TIME_SEC`).  Optional
+//! `run_v15_session_stdio` (infinite search) is compiled but not routed.
 //!
 //! ## ACE v13 reference engines
 //! Faithful Rust ports of `ACEV13.html` ("pathfix gen11_ghi +
@@ -26,6 +27,9 @@
 
 pub mod cert_bridge;
 pub mod certify;
+pub mod dist;
+pub mod field_planes;
+pub mod fields_viz;
 pub mod game;
 pub mod net;
 pub mod oracle;

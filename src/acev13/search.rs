@@ -20,6 +20,10 @@
 //!   commitment gate keeps the wall when no certifier exists).
 
 use crate::acev13::ace_move_to_board;
+use crate::acev13::dist::{
+    fill_ace_dist_from_pawn, fill_ace_dist_to_goal, fill_choke_points, fill_contested,
+    fill_corridor_delta, fill_path_crossing,
+};
 use crate::util::clock::{Duration, Instant};
 
 use crate::acev13::certify::{certify, CertifyOpts};
@@ -31,7 +35,7 @@ use crate::cat::prune::{
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
-use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
+use crate::movegen::{count_geometric_legal_walls, generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::path::BfsScratch;
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
@@ -279,6 +283,10 @@ pub struct AceSearch {
     /// (gen TT, history aging, dynamic ID startup, accumulator retention).
     /// Use with `ti_movegen=true` as the fair baseline opponent.
     pure_mode: bool,
+    /// Ponder mode: suppresses tt_gen advance and history decay so all ponder
+    /// chunks share one TT generation and history accumulates uninterrupted.
+    /// Set true before the ponder loop, false before the real think() call.
+    is_pondering: bool,
     // ---------- pathfix feature flags (gen11 shipping config) ----------
     /// Exact k=0 race endgame + last-wall gate (JS `raceProof`, ships true).
     race_proof: bool,
@@ -398,6 +406,7 @@ impl AceSearch {
             root_score: 0,
             use_partial_iter: true,
             pure_mode: false,
+            is_pondering: false,
             race_proof: true,
             refused_cuts: 0,
             rb1_stores: 0,
@@ -694,15 +703,36 @@ impl AceSearch {
         self.use_partial_iter = on;
     }
 
+    /// Enter/exit ponder mode. While pondering, `think()` skips the tt_gen
+    /// advance and history decay so all ponder chunks build on each other
+    /// rather than aging their own work.  Call with `false` before the real
+    /// think so it does the normal one-time decay and advances the generation.
+    pub fn set_pondering(&mut self, on: bool) {
+        self.is_pondering = on;
+    }
+
+    /// Path-valid wall slot count (geometric; ignores wall budget and side to move).
+    pub fn geometric_legal_wall_count(&mut self) -> u32 {
+        if let Some(bridge) = self.bridge.as_mut() {
+            return count_geometric_legal_walls(&mut bridge.board, &mut bridge.bfs) as u32;
+        }
+        let mut board = Board::new();
+        for i in 0..self.g.hist_len {
+            let _ = board.make_move(ace_move_to_board(self.g.hist_m[i]));
+        }
+        let mut scratch = BfsScratch::new();
+        count_geometric_legal_walls(&mut board, &mut scratch) as u32
+    }
+
     /// Dump the raw net inputs + the resulting eval as JSON. Lets the Python NNUE
     /// trainer verify its forward pass against the engine on the *inputs alone*,
     /// without reimplementing Quoridor rules/BFS in Python — and is the record
     /// format for training-data generation.
     ///
     /// `d0`/`d1` are the pawn shortest-path distances (scalars).
-    /// `d0_field`/`d1_field` are the full 81-cell BFS distance arrays — used by
-    /// the trainer to compute geometry inputs (corridor-width, delta field) without
-    /// running a second BFS in Python.
+    /// Canonical field keys: `goal_inv_p0_field`, `pawn_fwd_p0_field`, `corridor_delta_p0_field`,
+    /// `path_cross_p0_field` (and `_p1` variants). Legacy aliases `d0_field`, `player0_field`, …
+    /// are duplicated in the JSON for old JSONL; trainer reads either via `rec_field()`.
     pub fn eval_dump_json(&mut self) -> String {
         self.position_changed();
         self.refresh_dist(0);
@@ -731,10 +761,46 @@ impl AceSearch {
         };
         let d0f = self.d0[self.dist0_idx];
         let d1f = self.d1[self.dist1_idx];
+        let mut p0_steps = [255u8; 81];
+        let mut p1_steps = [255u8; 81];
+        let mut delta0 = [255u8; 81];
+        let mut delta1 = [255u8; 81];
+        fill_ace_dist_from_pawn(&self.g, self.g.pawn[0], &mut p0_steps);
+        fill_ace_dist_from_pawn(&self.g, self.g.pawn[1], &mut p1_steps);
+        fill_corridor_delta(&p0_steps, &d0f, d0_scalar, &mut delta0);
+        fill_corridor_delta(&p1_steps, &d1f, d1_scalar, &mut delta1);
+        let mut cross0 = [0u8; 81];
+        let mut cross1 = [0u8; 81];
+        fill_path_crossing(&self.g, &p0_steps, &d0f, d0_scalar, &mut cross0);
+        fill_path_crossing(&self.g, &p1_steps, &d1f, d1_scalar, &mut cross1);
+        let mut choke0 = [0u8; 81];
+        let mut choke1 = [0u8; 81];
+        fill_choke_points(&self.g, &p0_steps, &d0f, d0_scalar, &mut choke0);
+        fill_choke_points(&self.g, &p1_steps, &d1f, d1_scalar, &mut choke1);
+        let mut contested = [0u8; 81];
+        fill_contested(&delta0, &delta1, &mut contested);
+        let legal_walls = self.geometric_legal_wall_count();
+        let width_me = self.d0[self.dist0_idx]
+            .iter()
+            .filter(|&&d| d as i32 == d0_scalar as i32)
+            .count();
+        let width_opp = self.d1[self.dist1_idx]
+            .iter()
+            .filter(|&&d| d as i32 == d1_scalar as i32)
+            .count();
         format!(
             "{{\"turn\":{},\"pawn0\":{},\"pawn1\":{},\"wl0\":{},\"wl1\":{},\
-             \"d0\":{},\"d1\":{},\
+             \"d0\":{},\"d1\":{},\"legal_wall_count\":{},\"corridor_width0\":{},\"corridor_width1\":{},\
+             \"goal_inv_p0_field\":[{}],\"goal_inv_p1_field\":[{}],\
+             \"pawn_fwd_p0_field\":[{}],\"pawn_fwd_p1_field\":[{}],\
+             \"corridor_delta_p0_field\":[{}],\"corridor_delta_p1_field\":[{}],\
+             \"path_cross_p0_field\":[{}],\"path_cross_p1_field\":[{}],\
+             \"choke_p0_field\":[{}],\"choke_p1_field\":[{}],\
+             \"contested_field\":[{}],\
              \"d0_field\":[{}],\"d1_field\":[{}],\
+             \"player0_field\":[{}],\"player1_field\":[{}],\
+             \"delta0_field\":[{}],\"delta1_field\":[{}],\
+             \"cross0_field\":[{}],\"cross1_field\":[{}],\
              \"hw\":[{}],\"vw\":[{}],\"eval\":{}}}",
             self.g.turn,
             self.g.pawn[0],
@@ -743,8 +809,28 @@ impl AceSearch {
             self.g.wl[1],
             d0_scalar,
             d1_scalar,
+            legal_walls,
+            width_me,
+            width_opp,
             field(&d0f),
             field(&d1f),
+            field(&p0_steps),
+            field(&p1_steps),
+            field(&delta0),
+            field(&delta1),
+            field(&cross0),
+            field(&cross1),
+            field(&choke0),
+            field(&choke1),
+            field(&contested),
+            field(&d0f),
+            field(&d1f),
+            field(&p0_steps),
+            field(&p1_steps),
+            field(&delta0),
+            field(&delta1),
+            field(&cross0),
+            field(&cross1),
             bits(&self.g.hw),
             bits(&self.g.vw),
             eval
@@ -834,6 +920,89 @@ impl AceSearch {
         t0.elapsed().as_millis() as f64 > budget
     }
 
+    fn field_plane_contrib(
+        &self,
+        hid: &mut [f64; NET_H],
+        nw: &Net,
+        p0_steps: &[u8; 81],
+        p1_steps: &[u8; 81],
+    ) {
+        let d0f = &self.d0[self.dist0_idx];
+        let d1f = &self.d1[self.dist1_idx];
+        let d0 = d0f[self.g.pawn[0]];
+        let d1 = d1f[self.g.pawn[1]];
+        let mut delta0 = [255u8; 81];
+        let mut delta1 = [255u8; 81];
+        fill_corridor_delta(p0_steps, d0f, d0, &mut delta0);
+        fill_corridor_delta(p1_steps, d1f, d1, &mut delta1);
+        let mut cross0 = [0u8; 81];
+        let mut cross1 = [0u8; 81];
+        fill_path_crossing(&self.g, p0_steps, d0f, d0, &mut cross0);
+        fill_path_crossing(&self.g, p1_steps, d1f, d1, &mut cross1);
+        let mut choke0 = [0u8; 81];
+        let mut choke1 = [0u8; 81];
+        fill_choke_points(&self.g, p0_steps, d0f, d0, &mut choke0);
+        fill_choke_points(&self.g, p1_steps, d1f, d1, &mut choke1);
+        let mut contested = [0u8; 81];
+        fill_contested(&delta0, &delta1, &mut contested);
+
+        for i in 0..81 {
+            let base = i * NET_H;
+            let dg0 = d0f[i];
+            if dg0 != 255 {
+                let gf0 = dg0 as f64 / 16.0;
+                let pf0 = if p0_steps[i] == 255 {
+                    0.0
+                } else {
+                    p0_steps[i] as f64 / 16.0
+                };
+                let df0 = if delta0[i] == 255 {
+                    0.0
+                } else {
+                    delta0[i] as f64 / 16.0
+                };
+                let cf0 = cross0[i] as f64 / 16.0;
+                let ch0 = choke0[i] as f64 / 16.0;
+                for j in 0..NET_H {
+                    hid[j] += nw.goal_inv_p0[base + j] * gf0
+                        + nw.pawn_fwd_p0[base + j] * pf0
+                        + nw.corridor_delta_p0[base + j] * df0
+                        + nw.path_cross_p0[base + j] * cf0
+                        + nw.choke_p0[base + j] * ch0;
+                }
+            }
+            let dg1 = d1f[i];
+            if dg1 != 255 {
+                let gf1 = dg1 as f64 / 16.0;
+                let pf1 = if p1_steps[i] == 255 {
+                    0.0
+                } else {
+                    p1_steps[i] as f64 / 16.0
+                };
+                let df1 = if delta1[i] == 255 {
+                    0.0
+                } else {
+                    delta1[i] as f64 / 16.0
+                };
+                let cf1 = cross1[i] as f64 / 16.0;
+                let ch1 = choke1[i] as f64 / 16.0;
+                for j in 0..NET_H {
+                    hid[j] += nw.goal_inv_p1[base + j] * gf1
+                        + nw.pawn_fwd_p1[base + j] * pf1
+                        + nw.corridor_delta_p1[base + j] * df1
+                        + nw.path_cross_p1[base + j] * cf1
+                        + nw.choke_p1[base + j] * ch1;
+                }
+            }
+            let ct = contested[i] as f64 / 16.0;
+            if ct != 0.0 {
+                for j in 0..NET_H {
+                    hid[j] += nw.contested[base + j] * ct;
+                }
+            }
+        }
+    }
+
     fn refresh_dist(&mut self, ply: usize) {
         let stamp = self.g.wall_stamp;
         if self.cached_stamp == stamp {
@@ -855,12 +1024,12 @@ impl AceSearch {
                 let d0 = &self.d0[self.dist0_idx];
                 if d0[a] != d0[b2] || d0[c2] != d0[e2] {
                     self.dist0_idx = ply; // redirect first: never write an ancestor's array
-                    self.g.compute_dist(0, &mut self.d0[ply]);
+                    fill_ace_dist_to_goal(&self.g, 0, &mut self.d0[ply]);
                 }
                 let d1 = &self.d1[self.dist1_idx];
                 if d1[a] != d1[b2] || d1[c2] != d1[e2] {
                     self.dist1_idx = ply;
-                    self.g.compute_dist(1, &mut self.d1[ply]);
+                    fill_ace_dist_to_goal(&self.g, 1, &mut self.d1[ply]);
                 }
                 self.cached_stamp = stamp;
                 return;
@@ -868,8 +1037,8 @@ impl AceSearch {
         }
         self.dist0_idx = ply; // own arrays: ancestors stay intact
         self.dist1_idx = ply;
-        self.g.compute_dist(0, &mut self.d0[ply]);
-        self.g.compute_dist(1, &mut self.d1[ply]);
+        fill_ace_dist_to_goal(&self.g, 0, &mut self.d0[ply]);
+        fill_ace_dist_to_goal(&self.g, 1, &mut self.d1[ply]);
         self.cached_stamp = stamp;
     }
 
@@ -878,10 +1047,8 @@ impl AceSearch {
     /// Key = position hash with pawns and turn XORed out (wall config only).
     fn race_tbl(&mut self, force: bool) -> Option<usize> {
         let z = &ZOBRIST;
-        let mut k_lo =
-            self.g.hash_lo ^ z.pawn_lo[0][self.g.pawn[0]] ^ z.pawn_lo[1][self.g.pawn[1]];
-        let mut k_hi =
-            self.g.hash_hi ^ z.pawn_hi[0][self.g.pawn[0]] ^ z.pawn_hi[1][self.g.pawn[1]];
+        let mut k_lo = self.g.hash_lo ^ z.pawn_lo[0][self.g.pawn[0]] ^ z.pawn_lo[1][self.g.pawn[1]];
+        let mut k_hi = self.g.hash_hi ^ z.pawn_hi[0][self.g.pawn[0]] ^ z.pawn_hi[1][self.g.pawn[1]];
         if self.g.turn == 1 {
             k_lo ^= z.turn_lo;
             k_hi ^= z.turn_hi;
@@ -989,9 +1156,19 @@ impl AceSearch {
                 RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
             };
             // Classifier is from the side-to-move's view; `s` may be either side.
-            return if s == self.g.turn { stm_wins } else { !stm_wins };
+            return if s == self.g.turn {
+                stm_wins
+            } else {
+                !stm_wins
+            };
         }
-        let key = (self.g.hash_lo, self.g.hash_hi, s, self.g.wl[0], self.g.wl[1]);
+        let key = (
+            self.g.hash_lo,
+            self.g.hash_hi,
+            s,
+            self.g.wl[0],
+            self.g.wl[1],
+        );
         let bud: i64 = if budget == 0 { 2500 } else { budget as i64 };
         let prior = self.cw_cache.get(&key).copied();
         if let Some(c) = prior {
@@ -1039,7 +1216,8 @@ impl AceSearch {
                 }
             }
         }
-        self.cw_cache.insert(key, if res { 1 } else { -(work as i32) });
+        self.cw_cache
+            .insert(key, if res { 1 } else { -(work as i32) });
         res
     }
 
@@ -1121,12 +1299,21 @@ impl AceSearch {
         }
         // ws[13]: fragile-lead (tempo × opp walls — a lead is fragile when opp can spend walls)
         out += ws[13] * pd * w_opp / 10.0;
-        // ws[14..15]: corridor-width proxies — cells sharing the pawn's distance-to-goal rank.
-        // Narrow corridor (few cells) → high bottleneck risk; wide → flexible paths.
-        // O(81) scan over the already-computed BFS distance field, no extra BFS needed.
-        let width_me = self.d0[self.dist0_idx].iter().filter(|&&d| d as i32 == d_me_i).count() as f64;
-        let width_opp = self.d1[self.dist1_idx].iter().filter(|&&d| d as i32 == d_opp_i).count() as f64;
-        out += ws[14] * width_me + ws[15] * width_opp;
+        // ws[14]: unrealized wall action capacity (path-valid slots / 128). NOT corridor width.
+        let legal_wall_norm = self.geometric_legal_wall_count() as f64 / 128.0;
+        // ws[15]: opponent corridor width on their goal field (matches halfpw.py).
+        let width_opp = if me == 0 {
+            self.d1[self.dist1_idx]
+                .iter()
+                .filter(|&&d| d as i32 == d_opp_i)
+                .count()
+        } else {
+            self.d0[self.dist0_idx]
+                .iter()
+                .filter(|&&d| d as i32 == d_opp_i)
+                .count()
+        } as f64;
+        out += ws[14] * legal_wall_norm + ws[15] * width_opp;
 
         let b0 = NET_BKT[self.g.pawn[0]] as i32;
         let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
@@ -1215,6 +1402,11 @@ impl AceSearch {
                 hid[j] += nw.px[o1 + j];
             }
         }
+        let mut p0_steps = [255u8; 81];
+        let mut p1_steps = [255u8; 81];
+        fill_ace_dist_from_pawn(&self.g, self.g.pawn[0], &mut p0_steps);
+        fill_ace_dist_from_pawn(&self.g, self.g.pawn[1], &mut p1_steps);
+        self.field_plane_contrib(&mut hid, nw, &p0_steps, &p1_steps);
         for j in 0..NET_H {
             let a2 = hid[j].clamp(0.0, 1.0);
             out += nw.w2[j] * a2 * 200.0;
@@ -1232,7 +1424,13 @@ impl AceSearch {
             && out < 700.0
             && d_me_i <= d_opp_i + 1
         {
-            let key = (self.g.hash_lo, self.g.hash_hi, me, self.g.wl[0], self.g.wl[1]);
+            let key = (
+                self.g.hash_lo,
+                self.g.hash_hi,
+                me,
+                self.g.wl[0],
+                self.g.wl[1],
+            );
             if (self.cw_think_calls < self.cw_cap || self.cw_cache.contains_key(&key))
                 && self.cert_win(me, 1200, 0)
             {
@@ -1943,13 +2141,17 @@ impl AceSearch {
         self.nodes = 0;
         self.root_best = super::ACE_NO_MOVE;
         self.root_score = 0;
-        if !self.pure_mode {
+        if !self.pure_mode && !self.is_pondering {
             // Advance TT generation: depth-preferred replacement will now protect entries
             // from this search over shallower rewrites, while stale (prior-gen) entries
             // are always evictable regardless of their depth.
+            // Skipped during pondering: all ponder chunks share one generation so the
+            // opponent's ponder time builds real depth rather than aging itself out.
             self.tt_gen = self.tt_gen.wrapping_add(1);
             // Decay history table before each search: halve all values so stale tactical
             // patterns from several moves ago don't dominate current move ordering.
+            // Skipped during pondering: history accumulates across all ponder chunks and
+            // is decayed exactly once when the real think() call begins.
             for h in self.history_tbl.iter_mut() {
                 *h >>= 1;
             }

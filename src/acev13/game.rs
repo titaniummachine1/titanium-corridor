@@ -481,4 +481,35 @@ impl AceGame {
             }
         }
     }
+
+    /// BFS steps from `start` cell (255 = unreachable). Used for per-cell player-distance plane.
+    pub fn compute_steps_from(&self, start: usize, dist: &mut [u8; 81]) {
+        dist.fill(255);
+        if start >= 81 {
+            return;
+        }
+        let mut queue = [0i16; 81];
+        let mut head = 0usize;
+        let mut tail = 0usize;
+        dist[start] = 0;
+        queue[tail] = start as i16;
+        tail += 1;
+        while head < tail {
+            let u = queue[head] as usize;
+            head += 1;
+            let du = dist[u] + 1;
+            let bm = self.blocked[u] | BORDER[u];
+            for d in 0..4 {
+                if bm & DIRBIT[d] != 0 {
+                    continue;
+                }
+                let v = (u as i16 + DELTA[d]) as usize;
+                if dist[v] > du {
+                    dist[v] = du;
+                    queue[tail] = v as i16;
+                    tail += 1;
+                }
+            }
+        }
+    }
 }

@@ -219,6 +219,16 @@ pub fn generate_wall_moves_into(board: &mut Board, out: &mut Vec<Move>, scratch:
     out.extend_from_slice(&buf[..n]);
 }
 
+/// Path-valid wall placements (both players retain routes). Ignores wall budget / side to move.
+pub fn count_geometric_legal_walls(board: &mut Board, scratch: &mut BfsScratch) -> usize {
+    let mut buf = [Move::Wall {
+        row: 0,
+        col: 0,
+        orientation: WallOrientation::Horizontal,
+    }; MAX_LEGAL_MOVES];
+    generate_wall_moves_slice(board, &mut buf, scratch)
+}
+
 fn generate_wall_moves_slice(
     board: &mut Board,
     out: &mut [Move],
