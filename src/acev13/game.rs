@@ -92,6 +92,7 @@ pub static BORDER: [u8; 81] = build_border();
 
 // ── Game state ────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct AceGame {
     pub pawn: [usize; 2],
     pub wl: [i32; 2],

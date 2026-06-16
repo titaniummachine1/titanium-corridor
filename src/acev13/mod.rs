@@ -37,6 +37,7 @@ pub mod perft;
 pub mod race;
 pub mod search;
 pub mod session;
+pub mod session_v15;
 
 pub use game::AceGame;
 pub use perft::{
@@ -45,6 +46,7 @@ pub use perft::{
 };
 pub use search::{board_move_to_ace, AceSearch, ThinkResult};
 pub use session::run_ace_session_stdio;
+pub use session_v15::run_v15_session_stdio;
 
 /// Sentinel — pawn move id `0` is legal (cell a9); do not use `0` for "no move".
 pub const ACE_NO_MOVE: i16 = -1;

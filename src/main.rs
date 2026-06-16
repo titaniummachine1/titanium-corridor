@@ -72,6 +72,7 @@ fn main() {
         "match" => run_match(&args),
         "uci" => titanium::run_uci_stdio(),
         "session" => match ace_engine_flag(&args) {
+            Some(flag) if flag == "titanium-v15" => titanium::acev13::run_v15_session_stdio(flag),
             Some(flag) if is_acev13(flag) => titanium::acev13::run_ace_session_stdio(flag),
             Some(flag) => titanium::ace::run_ace_session_stdio(flag),
             None => run_session_stdio(),

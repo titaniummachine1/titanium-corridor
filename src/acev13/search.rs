@@ -656,6 +656,28 @@ impl AceSearch {
         self.position_changed();
     }
 
+    /// Scale history table by a surprise-proportional factor.
+    /// Called when the opponent played an unexpected move so stale tactical
+    /// patterns from the abandoned search don't dominate the new root.
+    /// For a correct prediction (|prior - current| ≈ 0) decay ≈ 1.0 (no-op).
+    pub fn decay_history_by_surprise(&mut self, prior_score: i32) {
+        let surprise = (prior_score - self.root_score).abs() as f32;
+        let decay = 1.0 / (1.0 + surprise / 200.0);
+        for h in self.history_tbl.iter_mut() {
+            *h = (*h as f32 * decay) as i32;
+        }
+    }
+
+    /// Advance the root by one ply (predicted opponent move) and adjust state
+    /// for seamless continuation. For use after `go infinite` + `ponderhit`.
+    pub fn migrate_root(&mut self, m: i16, prior_score: i32) {
+        self.apply_move(m);
+        self.decay_history_by_surprise(prior_score);
+        if !self.pure_mode {
+            self.tt_gen = self.tt_gen.wrapping_add(1);
+        }
+    }
+
     /// Static evaluation of the current position (no search) — primes the distance
     /// cache and forces an accumulator rebuild, then runs `evaluate()`. On mid-game
     /// positions this returns the pure HalfPW net output; used by the NNUE trainer
