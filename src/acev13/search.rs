@@ -1148,7 +1148,7 @@ impl AceSearch {
         // forward race-minimax only when paths overlap within 1 tempo). Sound: with
         // no walls the win-certificate reduces to the race outcome, so this returns
         // the same verdict as `certify` at a fraction of the node cost.
-        if self.cheap_cert && self.g.wl[0] == 0 && self.g.wl[1] == 0 {
+        if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
             use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
             let stm_wins = match hands_empty_race(&self.g) {
                 RaceVerdict::Win => true,
@@ -1249,12 +1249,9 @@ impl AceSearch {
                     if rv < 0 {
                         return -(RACE_MATE + rv); // proven loss in -rv plies (slower = higher)
                     }
-                    // rv==0 with a built table: the retrograde fixpoint resolved
-                    // every forced win/loss, so this live state (ab's terminal
-                    // check guarantees neither pawn is home here) is a PROVEN
-                    // DRAW under optimal play — score 0; the naive ±3000 formula
-                    // on a proven draw is phantom optimism (ZeroFence class).
-                    return 0;
+                    // rv==0 is unresolved by this table pass. Quoridor has no
+                    // draws in our ruleset, so never score it as 0; fall through
+                    // to the distance race heuristic.
                 }
             }
             // no table available (solve budget-gated/skipped): naive heuristic race
@@ -2026,12 +2023,10 @@ impl AceSearch {
         self.cached_stamp = nst;
     }
 
-    /// Entry: pathfix/RaceProof(a) — exact race endgame at ROOT. Both hands
-    /// empty ⇒ solve the now-fixed wall graph and play the PROVABLY optimal
-    /// move (fastest win / slowest loss). rv==0 (a built table = PROVEN DRAW)
-    /// or any inconsistency falls through to the normal search: with the
-    /// draw-aware evaluate() the search holds the draw at every depth while
-    /// keeping heuristic ordering among the equally-drawing moves.
+    /// Entry: pathfix/RaceProof(a) — exact race endgame at ROOT. Cheap-cert
+    /// engines resolve the no-wall race with the path-aware classifier plus
+    /// tiny forward minimax only for volatile child states; faithful modes keep
+    /// the old full race table.
     pub fn think(
         &mut self,
         time_ms: u64,
@@ -2040,6 +2035,80 @@ impl AceSearch {
         log: bool,
         engine_label: &str,
     ) -> ThinkResult {
+        if self.cheap_cert
+            && self.g.wl[0] == 0
+            && self.g.wl[1] == 0
+            && self.g.pawn[0] >= 9
+            && self.g.pawn[1] < 72
+        {
+            let rt0 = Instant::now();
+            let me = self.g.turn;
+            let mut buf = [0i16; 16];
+            let nm = self.g.gen_pawn_moves(&mut buf, 0);
+            let mut best_m: i16 = -1;
+            let mut best_v: i32 = i32::MIN;
+            let mut best_key = i32::MIN;
+
+            for &m in &buf[..nm] {
+                self.g.make_move(m);
+                let moved = 1 - self.g.turn;
+                let immediate_win =
+                    (moved == 0 && self.g.pawn[0] < 9) || (moved == 1 && self.g.pawn[1] >= 72);
+
+                let my_v = if immediate_win {
+                    1
+                } else {
+                    use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
+                    let child_stm_wins = match hands_empty_race(&self.g) {
+                        RaceVerdict::Win => true,
+                        RaceVerdict::Loss => false,
+                        RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
+                    };
+                    let mut d_me = [255u8; 81];
+                    let mut d_opp = [255u8; 81];
+                    self.g.compute_dist(me, &mut d_me);
+                    self.g.compute_dist(1 - me, &mut d_opp);
+                    if child_stm_wins {
+                        -(1 + d_opp[self.g.pawn[1 - me]] as i32)
+                    } else {
+                        1 + d_me[self.g.pawn[me]] as i32
+                    }
+                };
+                self.g.unmake_move();
+
+                let key = if my_v > 0 {
+                    1_000_000 - my_v
+                } else {
+                    -1_000_000 - my_v
+                };
+                if key > best_key {
+                    best_key = key;
+                    best_m = m;
+                    best_v = my_v;
+                }
+            }
+
+            if best_m >= 0 {
+                self.rp_root_solves += 1;
+                self.refresh_dist(0);
+                let rk = best_v.abs();
+                return ThinkResult {
+                    mv: best_m,
+                    score: if best_v > 0 {
+                        RACE_MATE - rk
+                    } else {
+                        -(RACE_MATE - rk)
+                    },
+                    depth: 99,
+                    nodes: nm as u64,
+                    ms: rt0.elapsed().as_millis() as u64,
+                    white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
+                    black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
+                    depth_log: Vec::new(),
+                };
+            }
+        }
+
         if self.race_proof
             && self.g.wl[0] == 0
             && self.g.wl[1] == 0
@@ -2129,7 +2198,7 @@ impl AceSearch {
         // out of the search deadline when the gate can fire — it runs after
         // the search loop and its raceTbl(force=true) call ignores deadline.
         let mut gate_reserve_ms = 0u64;
-        if self.race_proof && self.g.wl[self.g.turn] == 1 {
+        if self.race_proof && !self.cheap_cert && self.g.wl[self.g.turn] == 1 {
             let cap = (0.3 * time_ms as f64) as u64;
             gate_reserve_ms = self
                 .rc_build_ms
@@ -2345,12 +2414,13 @@ impl AceSearch {
         {
             self.g.make_move(last_best);
             let rp_ok = if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
-                // root-level: always allowed to build
-                match self.race_tbl(true) {
-                    // stm is the OPPONENT: <= 0 = we are not lost
-                    Some(slot) => self.race_value(slot) <= 0,
-                    None => true,
-                }
+                use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
+                let opp_wins = match hands_empty_race(&self.g) {
+                    RaceVerdict::Win => true,
+                    RaceVerdict::Loss => false,
+                    RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
+                };
+                !opp_wins
             } else {
                 // gen13 refutation: demote only if the opponent's win is certified.
                 let deadline_ms = 25u64.max(time_ms * 15 / 100);

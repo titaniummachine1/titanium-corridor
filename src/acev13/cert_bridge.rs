@@ -100,6 +100,29 @@ pub fn certify_board(
     side: Option<Player>,
 ) -> Option<Player> {
     let mut g = ace_from_board(board);
+    let immediate = g.winner();
+    if immediate >= 0 {
+        let winner = player_from_ace(immediate as usize);
+        return if side.is_none_or(|s| s == winner) {
+            Some(winner)
+        } else {
+            None
+        };
+    }
+    if g.wl[0] == 0 && g.wl[1] == 0 {
+        let stm_wins = match hands_empty_race(&g) {
+            RaceVerdict::Win => true,
+            RaceVerdict::Loss => false,
+            RaceVerdict::NeedsProof => race_minimax(&mut g) > 0,
+        };
+        let winner_idx = if stm_wins { g.turn } else { 1 - g.turn };
+        let winner = player_from_ace(winner_idx);
+        return if side.is_none_or(|s| s == winner) {
+            Some(winner)
+        } else {
+            None
+        };
+    }
     let deadline = if deadline_ms > 0 {
         Some(Instant::now() + Duration::from_millis(deadline_ms))
     } else {
@@ -403,11 +426,66 @@ mod tests {
         b
     }
 
+    fn board_pos_from_ace(cell: usize) -> (u8, u8) {
+        ((8 - cell / 9) as u8, (cell % 9) as u8)
+    }
+
+    #[test]
+    fn hands_empty_classifier_matches_exact_when_decisive() {
+        let mut decisive = 0usize;
+        let mut volatile = 0usize;
+
+        for p0 in 0..81 {
+            if p0 < 9 {
+                continue;
+            }
+            for p1 in 0..81 {
+                if p1 >= 72 || p0 == p1 {
+                    continue;
+                }
+                for stm in [Player::One, Player::Two] {
+                    let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
+                    let mut g = ace_from_board(&board);
+                    let verdict = hands_empty_race(&g);
+                    if verdict == RaceVerdict::NeedsProof {
+                        volatile += 1;
+                        continue;
+                    }
+
+                    decisive += 1;
+                    let exact = if race_minimax(&mut g) > 0 {
+                        RaceVerdict::Win
+                    } else {
+                        RaceVerdict::Loss
+                    };
+                    assert_eq!(
+                        verdict, exact,
+                        "p0={p0} p1={p1} stm={stm:?} classifier must match exact race solver"
+                    );
+                }
+            }
+        }
+
+        assert!(decisive > 0, "test must cover deterministic certificates");
+        assert!(volatile > 0, "test must cover proof-required close races");
+    }
+
     #[test]
     fn parallel_race_equal_distance_stm_wins() {
         // Different columns ⇒ paths don't overlap; equal distance ⇒ stm wins.
         let g = ace_from_board(&race_board((3, 1), (5, 7), Player::One));
         assert_eq!(hands_empty_race(&g), RaceVerdict::Win);
+    }
+
+    #[test]
+    fn certify_board_no_walls_uses_race_winner_and_side_filter() {
+        let board = race_board((3, 1), (5, 7), Player::One);
+        assert_eq!(certify_board(&board, 1, 0, None), Some(Player::One));
+        assert_eq!(
+            certify_board(&board, 1, 0, Some(Player::One)),
+            Some(Player::One)
+        );
+        assert_eq!(certify_board(&board, 1, 0, Some(Player::Two)), None);
     }
 
     #[test]

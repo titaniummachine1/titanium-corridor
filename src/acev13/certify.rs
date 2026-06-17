@@ -106,6 +106,23 @@ fn race_winner_stm(turn: usize, d0: u8, d1: u8) -> usize {
     }
 }
 
+/// Exact no-wall race winner. This is the hard boundary between the expensive
+/// wall-campaign certifier and the already-solved pawn race: once both hands are
+/// empty, never recurse through certificate nodes.
+fn no_wall_race_winner(g: &mut AceGame) -> usize {
+    use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
+    let stm_wins = match hands_empty_race(g) {
+        RaceVerdict::Win => true,
+        RaceVerdict::Loss => false,
+        RaceVerdict::NeedsProof => race_minimax(g) > 0,
+    };
+    if stm_wins {
+        g.turn
+    } else {
+        1 - g.turn
+    }
+}
+
 /// Wall geometry: top-left cell of the 2×2 block a slot covers.
 #[inline]
 fn wall_cell_a(slot: usize) -> usize {
@@ -135,9 +152,22 @@ struct Solver<'a> {
     nodes: u64,
     /// `(hashLo, hashHi*2 + allowEq)` → subgame value (S wins?).
     memo: std::collections::HashMap<(u32, u64), bool>,
+    /// No-wall race terminal cache reached from the 1-2 wall campaign.
+    /// Key includes frozen placed walls, pawns, and side-to-move via Ace hash.
+    race_memo: std::collections::HashMap<(u32, u32), usize>,
 }
 
 impl<'a> Solver<'a> {
+    fn no_wall_race_winner_cached(&mut self) -> usize {
+        let key = (self.g.hash_lo, self.g.hash_hi);
+        if let Some(&winner) = self.race_memo.get(&key) {
+            return winner;
+        }
+        let winner = no_wall_race_winner(self.g);
+        self.race_memo.insert(key, winner);
+        winner
+    }
+
     /// `jw` = the previous move was an O wall (enables S's recommit move).
     fn rec(&mut self, jw: bool) -> RecResult {
         self.nodes += 1;
@@ -157,6 +187,9 @@ impl<'a> Solver<'a> {
         let w = self.g.winner();
         if w >= 0 {
             return Ok(w as usize == s);
+        }
+        if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
+            return Ok(self.no_wall_race_winner_cached() == s);
         }
 
         // S's legal-move set depends on jw (recommit rule), so key it at S nodes.
@@ -400,6 +433,22 @@ pub fn certify(game: &mut AceGame, opts: &CertifyOpts) -> CertifyReport {
             nodes: 0,
         };
     }
+    if game.wl[0] + game.wl[1] > 3 {
+        return CertifyReport {
+            proven: None,
+            nodes: 0,
+        };
+    }
+    if game.wl[0] == 0 && game.wl[1] == 0 {
+        let winner = no_wall_race_winner(game);
+        return CertifyReport {
+            proven: match opts.side {
+                Some(s @ (0 | 1)) if s != winner => None,
+                _ => Some(winner),
+            },
+            nodes: 0,
+        };
+    }
     let mut d0 = [0u8; 81];
     let mut d1 = [0u8; 81];
     game.compute_dist(0, &mut d0);
@@ -428,6 +477,7 @@ pub fn certify(game: &mut AceGame, opts: &CertifyOpts) -> CertifyReport {
                 slack: opts.slack,
                 nodes: 0,
                 memo: std::collections::HashMap::new(),
+                race_memo: std::collections::HashMap::new(),
             };
             let v = solver.rec(false);
             (v, solver.nodes)
@@ -481,4 +531,63 @@ pub fn upfront_one_wall_survives(game: &mut AceGame, s: usize) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn race_game(p0: usize, p1: usize, turn: usize) -> AceGame {
+        let mut g = AceGame::new();
+        g.pawn = [p0, p1];
+        g.wl = [0, 0];
+        g.turn = turn;
+        g
+    }
+
+    #[test]
+    fn no_wall_root_uses_race_shortcut_even_with_zero_budget() {
+        // Board coords (3,1) vs (5,7): disjoint shortest paths, equal distance,
+        // side to move wins by pure tempo math. ACE cell = (8-row)*9+col.
+        let mut g = race_game(46, 34, 0);
+        let report = certify(
+            &mut g,
+            &CertifyOpts {
+                budget: 0,
+                side: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(report.proven, Some(0));
+        assert_eq!(report.nodes, 0);
+    }
+
+    #[test]
+    fn no_wall_root_respects_forced_side_filter() {
+        let mut g = race_game(46, 34, 0);
+        let report = certify(
+            &mut g,
+            &CertifyOpts {
+                budget: 0,
+                side: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(report.proven, None);
+        assert_eq!(report.nodes, 0);
+    }
+
+    #[test]
+    fn high_wall_positions_are_outside_certificate_scope() {
+        let mut g = AceGame::new();
+        let report = certify(
+            &mut g,
+            &CertifyOpts {
+                budget: 200_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(report.proven, None);
+        assert_eq!(report.nodes, 0);
+    }
 }

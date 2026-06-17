@@ -661,12 +661,9 @@ impl AceSearch {
                     if rv < 0 {
                         return -(RACE_MATE + rv); // proven loss in -rv plies (slower = higher)
                     }
-                    // rv==0 with a built table: the retrograde fixpoint resolved
-                    // every forced win/loss, so this live state (ab's terminal
-                    // check guarantees neither pawn is home here) is a PROVEN
-                    // DRAW under optimal play — score 0; the naive ±3000 formula
-                    // on a proven draw is phantom optimism (ZeroFence class).
-                    return 0;
+                    // rv==0 is unresolved by this table pass. Quoridor has no
+                    // draws in our ruleset, so never score it as 0; fall through
+                    // to the distance race heuristic.
                 }
             }
             // no table available (solve budget-gated/skipped): naive heuristic race
@@ -1343,10 +1340,8 @@ impl AceSearch {
 
     /// Entry: pathfix/RaceProof(a) — exact race endgame at ROOT. Both hands
     /// empty ⇒ solve the now-fixed wall graph and play the PROVABLY optimal
-    /// move (fastest win / slowest loss). rv==0 (a built table = PROVEN DRAW)
-    /// or any inconsistency falls through to the normal search: with the
-    /// draw-aware evaluate() the search holds the draw at every depth while
-    /// keeping heuristic ordering among the equally-drawing moves.
+    /// move (fastest win / slowest loss). rv==0 is unresolved here and falls
+    /// through to normal search; Quoridor positions are never scored as draws.
     pub fn think(
         &mut self,
         time_ms: u64,

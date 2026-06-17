@@ -6,7 +6,8 @@
 //! assigns every forced state its exact value:
 //!   tbl[(p0*81+p1)*2+turn]:  +k = side to move wins in k plies (optimal),
 //!                            -k = side to move loses in k plies (slowest),
-//!                             0 = unresolved (proven draw / stalemate pocket).
+//!                             0 = unresolved by this table pass; caller must
+//!                                 not treat it as a draw in Quoridor.
 //! Successors come from the engine's own `gen_pawn_moves` on the CURRENT
 //! blocked[] board, so jump rules match the search exactly.
 
@@ -151,7 +152,7 @@ pub fn solve_race_config(g: &mut AceGame, s: &mut RaceScratch, tbl: &mut [i16]) 
         }
         n_live = keep;
         if assigned == 0 {
-            break; // fixpoint: leftovers are genuine draws/pockets -> stay 0
+            break; // fixpoint: leave unresolved as 0; caller must fall back
         }
         k += 1;
     }
