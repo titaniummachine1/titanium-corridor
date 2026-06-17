@@ -1144,6 +1144,10 @@ enum MatchEngine {
     /// Grafted + Lague partial-iteration (keep best move from a time-aborted
     /// deepest iteration). A/B target vs plain grafted to measure the trick.
     AceV13GraftedPartial,
+    /// Grafted + frozen v13 HalfPW (A/B vs titanium-v15 training weights).
+    AceV13GraftedFrozen,
+    /// Production graft with RaceProof/cert gates disabled. Experimental A/B only.
+    AceV13GraftedNoRaceProof,
 }
 
 impl MatchEngine {
@@ -1155,6 +1159,10 @@ impl MatchEngine {
             // v14 / ace-v13-grafted are legacy aliases for the same build.
             "titanium-v15" | "titanium-v14" | "ace-v13-grafted" | "grafted" => {
                 Some(MatchEngine::AceV13Grafted)
+            }
+            "titanium-v15-frozen" => Some(MatchEngine::AceV13GraftedFrozen),
+            "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
+                Some(MatchEngine::AceV13GraftedNoRaceProof)
             }
             "ace-v13" => Some(MatchEngine::AceV13),
             "ace-v13-cert" => Some(MatchEngine::AceV13Cert),
@@ -1178,6 +1186,10 @@ impl MatchEngine {
                 "Titanium v15 (gen13 + O1 movegen + cert + adaptive-TT + partial-iter)"
             }
             MatchEngine::AceV13GraftedPartial => "ace-v13 grafted + Lague partial-iteration",
+            MatchEngine::AceV13GraftedFrozen => {
+                "Titanium v15 frozen (gen13 + O1 movegen + cert + adaptive-TT, v13 HalfPW)"
+            }
+            MatchEngine::AceV13GraftedNoRaceProof => "Titanium v15 without RaceProof/cert gates",
         }
     }
 }
@@ -1210,13 +1222,19 @@ impl Seat {
             | MatchEngine::AceV13AdaptiveTt
             | MatchEngine::AceV13DeadZone
             | MatchEngine::AceV13Grafted
-            | MatchEngine::AceV13GraftedPartial => {
+            | MatchEngine::AceV13GraftedPartial
+            | MatchEngine::AceV13GraftedFrozen
+            | MatchEngine::AceV13GraftedNoRaceProof => {
                 let mut g = AceGame::new();
                 for m in opening {
                     g.make_move(algebraic_to_ace(m));
                 }
                 let search = match engine {
                     MatchEngine::AceV13Grafted => AceSearch::grafted(g, tt_bits),
+                    MatchEngine::AceV13GraftedFrozen => AceSearch::grafted_frozen(g, tt_bits),
+                    MatchEngine::AceV13GraftedNoRaceProof => {
+                        AceSearch::grafted_no_raceproof(g, tt_bits)
+                    }
                     MatchEngine::AceV13GraftedPartial => {
                         let mut s = AceSearch::grafted(g, tt_bits);
                         s.set_partial_iter(true);
@@ -1364,9 +1382,11 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             | "ace-v11-ti-pmc" | "ace-pmc"
             // ACE v13 reference engines (JS-equivalent baselines)
             | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
-            | "ace-v13-pure" | "ace-v13-grafted" | "ace-v13-ti-pure"
+            | "ace-v13-pure" | "ace-v13-grafted" | "ace-v13-grafted-no-raceproof"
+            | "ace-v13-ti-pure"
             // Titanium production engines (use acev13 search core)
-            | "titanium-v14" | "titanium-v15" => Some(w[1].as_str()),
+            | "titanium-v14" | "titanium-v15" | "titanium-v15-frozen"
+            | "titanium-v15-no-raceproof" => Some(w[1].as_str()),
             _ => None,
         }
     })
@@ -1387,11 +1407,38 @@ fn ace_engine_mode(flag: &str) -> &'static str {
 /// True for any engine that lives in the `crate::acev13` module — both the
 /// ACE v13 reference engines and the Titanium v14/v15 production engines.
 fn uses_acev13_module(flag: &str) -> bool {
-    flag.starts_with("ace-v13") || flag == "titanium-v14" || flag == "titanium-v15"
+    flag.starts_with("ace-v13")
+        || flag == "titanium-v14"
+        || flag == "titanium-v15"
+        || flag == "titanium-v15-frozen"
+        || flag == "titanium-v15-no-raceproof"
 }
 
 fn is_ace_engine(args: &[String]) -> bool {
     ace_engine_flag(args).is_some()
+}
+
+fn score_text(score: i32) -> String {
+    const MATE: i32 = 100_000;
+    const RACE_MATE: i32 = 32_000;
+    let abs = score.abs();
+    if abs >= MATE - 1_000 {
+        let plies = MATE - abs;
+        if score > 0 {
+            format!("mate in {}", plies.max(0))
+        } else {
+            format!("mated in {}", plies.max(0))
+        }
+    } else if abs >= RACE_MATE - 1_000 && abs <= RACE_MATE {
+        let plies = RACE_MATE - abs;
+        if score > 0 {
+            format!("race win in {}", plies.max(0))
+        } else {
+            format!("race loss in {}", plies.max(0))
+        }
+    } else {
+        format!("cp {score}")
+    }
 }
 
 fn run_genmove_ace(args: &[String]) {
@@ -1477,14 +1524,17 @@ fn run_genmove_ace(args: &[String]) {
                                 depth_json.push(',');
                             }
                             let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
+                            let score_text = score_text(e.score);
                             depth_json.push_str(&format!(
-                                "{{\"depth\":{},\"score\":{},\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
-                                e.depth, e.score, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
+                                "{{\"depth\":{},\"score\":{},\"scoreText\":\"{}\",\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+                                e.depth, e.score, score_text, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
                             ));
                         }
+                        let root_score_text = score_text(info.score);
                         eprintln!(
-                            "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
+                            "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
                             label, label, info.depth, info.nodes, info.score,
+                            root_score_text,
                             info.white_dist, info.black_dist, info.ms, depth_json
                         );
                     }

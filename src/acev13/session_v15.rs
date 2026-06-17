@@ -25,7 +25,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use super::{ace_to_algebraic, algebraic_to_ace, ACE_NO_MOVE, AceGame, AceSearch};
+use super::{ace_to_algebraic, algebraic_to_ace, AceGame, AceSearch, ACE_NO_MOVE};
 
 // ── Inter-thread messages ─────────────────────────────────────────────────────
 
@@ -41,7 +41,10 @@ enum Cmd {
     /// Ponder was correct: think for `time_ms` from the current (ponder) position.
     PonderHit(u64),
     /// Ponder was wrong: reset to `new_game` then think for `time_ms`.
-    MoveMiss { new_game: AceGame, time_ms: u64 },
+    MoveMiss {
+        new_game: AceGame,
+        time_ms: u64,
+    },
     Quit,
 }
 
@@ -54,9 +57,13 @@ enum Reply {
 
 fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
     let mut search = match engine_flag {
-        "ace-v13-pure"    => AceSearch::new(g),
+        "ace-v13-pure" => AceSearch::new(g),
         "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
-        _                 => AceSearch::grafted(g, None),
+        "titanium-v15-frozen" => AceSearch::grafted_frozen(g, None),
+        "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
+            AceSearch::grafted_no_raceproof(g, None)
+        }
+        _ => AceSearch::grafted(g, None),
     };
     if engine_flag.contains("pmc") {
         search.enable_eme();
@@ -197,10 +204,15 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
-            Err(e) => { err!(e); break; }
+            Err(e) => {
+                err!(e);
+                break;
+            }
         };
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         let parts: Vec<&str> = trimmed.splitn(4, ' ').collect();
 
         match parts[0] {
@@ -213,7 +225,11 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
             }
             "position" => {
                 let moves: Vec<String> = if parts.len() > 1 {
-                    parts[1..].join(" ").split_whitespace().map(String::from).collect()
+                    parts[1..]
+                        .join(" ")
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -241,7 +257,10 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                             current_g = g.clone();
                             let _ = cmd_tx.send(Cmd::SetGame(g));
                         }
-                        Err(msg) => { err!(msg); continue; }
+                        Err(msg) => {
+                            err!(msg);
+                            continue;
+                        }
                     }
                 }
                 applied = moves;
@@ -314,7 +333,8 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
             }
             "ponderhit" => {
                 // ponderhit TIME_MS  — ponder move was correct
-                let time_ms: u64 = parts.get(1)
+                let time_ms: u64 = parts
+                    .get(1)
                     .and_then(|s| s.parse::<f64>().ok())
                     .map(|s| (s * 1000.0).max(1.0) as u64)
                     .unwrap_or(5000);
@@ -345,7 +365,8 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     err!("movemiss requires MOVE TIME_MS");
                     continue;
                 };
-                let time_ms: u64 = parts.get(2)
+                let time_ms: u64 = parts
+                    .get(2)
                     .and_then(|s| s.parse::<f64>().ok())
                     .map(|s| (s * 1000.0).max(1.0) as u64)
                     .unwrap_or(5000);

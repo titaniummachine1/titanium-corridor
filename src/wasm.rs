@@ -1,34 +1,25 @@
-//! wasm-bindgen bindings for the website game (Phase 1).
+//! wasm-bindgen bindings for the website (GitHub Pages + static hosting).
 //!
-//! Build:
-//!   wasm-pack build --release --no-default-features --features wasm
-//! or
-//!   cargo build --release --lib --target wasm32-unknown-unknown \
-//!       --no-default-features --features wasm
+//! Build (from repo root):
+//!   cd site/web && npm run build:wasm
 //!
-//! JS usage:
-//!   const e = new WasmEngine();
-//!   e.position("e2 e8");          // algebraic moves from startpos
-//!   e.make_move("e3");
-//!   const best = e.go(1000, 0);   // movetime ms, max_nodes (0 = default)
-//!   const moves = e.legal_moves(); // space-separated
+//! `WasmEngine` — warm titanium-v15 grafted session (NNUE + O1 movegen).
+//! `WasmAceEngine` — one-shot ACE genmove for ACE tier sliders.
 
 use wasm_bindgen::prelude::*;
 
-use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::core::board::Move;
-use crate::search::alphabeta::{run_search, SearchConfig, DEFAULT_MAX_ID_DEPTH, DEFAULT_MAX_NODES};
-use crate::search::session::GameSearchSession;
-use crate::util::perft::format_move;
+use crate::acev13::{
+    ace_genmove, ace_to_algebraic, algebraic_to_ace, AceGame, AceParams, AceSearch, ACE_NO_MOVE,
+};
 
 fn acev13_params_from_mode(
     engine_mode: &str,
     movetime_ms: u32,
     max_depth: i32,
-) -> crate::acev13::AceParams {
-    let ti_movegen = engine_mode.contains("-ti");
+) -> AceParams {
+    let ti_movegen = engine_mode.contains("-ti") || engine_mode == "ace-v13";
     let eme = engine_mode.contains("pmc");
-    crate::acev13::AceParams {
+    AceParams {
         time_ms: (movetime_ms as u64).max(1),
         max_depth: if max_depth > 0 { max_depth } else { 30 },
         full: false,
@@ -57,6 +48,17 @@ fn is_acev13_mode(engine_mode: &str) -> bool {
     engine_mode.starts_with("ace-v13") || engine_mode == "ace-v13"
 }
 
+fn replay_moves(moves: &str) -> Result<AceGame, JsError> {
+    let mut g = AceGame::new();
+    for text in moves.split_whitespace().filter(|s| !s.is_empty()) {
+        if g.winner() >= 0 {
+            return Err(JsError::new(&format!("illegal replay past terminal: {text}")));
+        }
+        g.make_move(algebraic_to_ace(text));
+    }
+    Ok(g)
+}
+
 /// ACE Rust port in WASM — one-shot genmove from a move list (GitHub Pages; no native binary).
 #[wasm_bindgen]
 pub struct WasmAceEngine;
@@ -83,7 +85,7 @@ impl WasmAceEngine {
             .collect();
         let result = if is_acev13_mode(engine_mode) {
             let params = acev13_params_from_mode(engine_mode, movetime_ms, max_depth);
-            crate::acev13::ace_genmove(&list, params, engine_mode).map(|(alg, _)| alg)
+            ace_genmove(&list, params, engine_mode).map(|(alg, _)| alg)
         } else {
             let params = ace_params_from_mode(engine_mode, movetime_ms, max_depth);
             crate::ace::ace_genmove(&list, params, engine_mode).map(|(alg, _)| alg)
@@ -95,79 +97,86 @@ impl WasmAceEngine {
     }
 }
 
+/// Warm titanium-v15 session — TT / history persist between plies (GitHub Pages Titanium).
 #[wasm_bindgen]
 pub struct WasmEngine {
-    session: GameSearchSession,
+    search: AceSearch,
+    engine_label: String,
 }
 
 #[wasm_bindgen]
 impl WasmEngine {
+    /// `frozen = true` → pinned pre-train NNUE (`titanium-v15-frozen`).
     #[wasm_bindgen(constructor)]
-    pub fn new() -> WasmEngine {
+    pub fn new(frozen: bool) -> WasmEngine {
+        let g = AceGame::new();
+        let (search, engine_label) = if frozen {
+            (
+                *AceSearch::grafted_frozen(g, None),
+                "titanium-v15-frozen".to_string(),
+            )
+        } else {
+            (
+                *AceSearch::grafted(g, None),
+                "titanium-v15".to_string(),
+            )
+        };
         WasmEngine {
-            session: GameSearchSession::new(),
+            search,
+            engine_label,
         }
     }
 
     /// Reset to startpos (clears TT/killers/history).
     pub fn reset(&mut self) {
-        self.session.reset();
+        self.search.set_position(AceGame::new());
     }
 
     /// Set position from startpos via space-separated algebraic moves.
-    /// Returns number of moves applied, or throws on illegal move.
     pub fn position(&mut self, moves: &str) -> Result<usize, JsError> {
-        let list: Vec<String> = moves.split_whitespace().map(|s| s.to_string()).collect();
-        self.session
-            .set_position(&list)
-            .map_err(|e| JsError::new(&e))
+        let g = replay_moves(moves)?;
+        let n = moves.split_whitespace().filter(|s| !s.is_empty()).count();
+        self.search.set_position(g);
+        Ok(n)
     }
 
     /// Apply one algebraic move. Returns false if illegal/terminal.
     pub fn make_move(&mut self, mv: &str) -> bool {
-        self.session.apply_algebraic(mv)
+        if self.search.g.winner() >= 0 {
+            return false;
+        }
+        self.search.apply_move(algebraic_to_ace(mv));
+        true
     }
 
     /// Search; returns best move in algebraic notation, or "(none)".
-    /// `max_nodes = 0` → default node cap.
-    pub fn go(&mut self, movetime_ms: u32, max_nodes: u32) -> String {
-        if self.session.board.is_terminal().is_some() {
+    /// `max_nodes` is ignored — v15 uses wall-clock only (matches native session).
+    pub fn go(&mut self, movetime_ms: u32, _max_nodes: u32) -> String {
+        if self.search.g.winner() >= 0 {
             return "(none)".to_string();
         }
-        let config = SearchConfig {
-            time_ms: (movetime_ms as u64).max(1),
-            max_nodes: if max_nodes == 0 {
-                DEFAULT_MAX_NODES
-            } else {
-                max_nodes as u64
-            },
-            log: false,
-            book_hint: None,
-            max_id_depth: DEFAULT_MAX_ID_DEPTH,
-        };
-        match run_search(&mut self.session, config) {
-            Some(report) => format_move(report.best_move),
-            None => "(none)".to_string(),
+        let result = self.search.think(
+            (movetime_ms as u64).max(1),
+            30,
+            false,
+            false,
+            &self.engine_label,
+        );
+        if result.mv == ACE_NO_MOVE {
+            "(none)".to_string()
+        } else {
+            ace_to_algebraic(result.mv)
         }
     }
 
-    /// Space-separated legal moves for the side to move.
-    pub fn legal_moves(&mut self) -> String {
-        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-        let mut session_bfs = crate::path::BfsScratch::default();
-        let n = generate_legal_moves_slice(&mut self.session.board, &mut buf, &mut session_bfs);
-        buf[..n]
-            .iter()
-            .map(|&m| format_move(m))
-            .collect::<Vec<_>>()
-            .join(" ")
+    /// Space-separated legal moves (not used by the site worker; kept for API compat).
+    pub fn legal_moves(&self) -> String {
+        String::new()
     }
 
-    /// 0 = player to move wins not decided; 1/2 = winner; encoded as i32: -1 none, 0, 1.
+    /// -1 = ongoing; 0/1 = winner player index.
     pub fn winner(&self) -> i32 {
-        match self.session.board.is_terminal() {
-            None => -1,
-            Some(p) => p as i32,
-        }
+        let w = self.search.g.winner();
+        if w < 0 { -1 } else { w }
     }
 }

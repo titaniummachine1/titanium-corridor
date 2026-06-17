@@ -150,14 +150,17 @@ pub fn ace_genmove(
     if g.winner() >= 0 {
         return None;
     }
-    let mut search = if params.ti_movegen && params.cat {
-        AceSearch::with_ti_movegen_and_cat(g)
-    } else if params.ti_movegen {
-        AceSearch::with_ti_movegen(g)
-    } else if params.cat {
-        AceSearch::with_cat(g)
-    } else {
-        AceSearch::new(g)
+    let mut search = match engine_label {
+        "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => AceSearch::grafted(g, None),
+        "titanium-v15-frozen" => AceSearch::grafted_frozen(g, None),
+        "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
+            AceSearch::grafted_no_raceproof(g, None)
+        }
+        "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
+        _ if params.ti_movegen && params.cat => AceSearch::with_ti_movegen_and_cat(g),
+        _ if params.ti_movegen => AceSearch::with_ti_movegen(g),
+        _ if params.cat => AceSearch::with_cat(g),
+        _ => AceSearch::new(g),
     };
     if params.eme {
         search.enable_eme();

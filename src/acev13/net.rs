@@ -2,14 +2,16 @@
 //!
 //! Philosophy: NN = geometric prior, search = tactical proof. See `field_planes.rs`.
 //!
+//! Two embedded blobs:
+//!   `net_weights.bin`        — v15 live (micro-train + deploy updates this)
+//!   `net_weights_frozen.bin` — pinned v13 baseline (ti-pure anchor + v15-frozen)
+//!
 //! Blob layout (little-endian f64):
 //!   Wskip[16] B1[32] W2[32] W1C[36864] PO[2592] PX[2592]
 //!   goal_inv_p0, goal_inv_p1, pawn_fwd_p0, pawn_fwd_p1,
 //!   corridor_delta_p0, corridor_delta_p1, path_cross_p0, path_cross_p1,
 //!   choke_p0, choke_p1, contested  (each 81×32 except contested is shared)
-
 use std::sync::OnceLock;
-
 pub const NET_H: usize = 32;
 pub const WSKIP_LEN: usize = 16;
 const W1C_LEN: usize = 9 * 128 * NET_H;
@@ -17,12 +19,10 @@ const PO_LEN: usize = 81 * NET_H;
 const PX_LEN: usize = 81 * NET_H;
 const FIELD_PLANE_LEN: usize = 81 * NET_H;
 const FIELD_PLANE_SETS: usize = 11;
-
 pub const NET_WEIGHT_F64S: usize =
     WSKIP_LEN + NET_H + NET_H + W1C_LEN + PO_LEN + PX_LEN + FIELD_PLANE_LEN * FIELD_PLANE_SETS;
-
 static NET_BYTES: &[u8] = include_bytes!("net_weights.bin");
-
+static NET_FROZEN_BYTES: &[u8] = include_bytes!("net_weights_frozen.bin");
 pub struct Net {
     pub ws: [f64; 16],
     pub b1: [f64; NET_H],
@@ -53,7 +53,6 @@ pub struct Net {
     /// Square on both players' shortest-route families.
     pub contested: Vec<f64>,
 }
-
 fn read_f64s(bytes: &[u8], offset: &mut usize, count: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
@@ -63,57 +62,61 @@ fn read_f64s(bytes: &[u8], offset: &mut usize, count: usize) -> Vec<f64> {
     }
     out
 }
-
+fn load_net_from_bytes(bytes: &[u8]) -> Net {
+    assert_eq!(
+        bytes.len(),
+        NET_WEIGHT_F64S * 8,
+        "net_weights blob size mismatch — run training/freeze_baseline_weights.py"
+    );
+    let mut offset = 0;
+    let ws_v = read_f64s(bytes, &mut offset, WSKIP_LEN);
+    let b1_v = read_f64s(bytes, &mut offset, NET_H);
+    let w2_v = read_f64s(bytes, &mut offset, NET_H);
+    let w1c = read_f64s(bytes, &mut offset, W1C_LEN);
+    let po = read_f64s(bytes, &mut offset, PO_LEN);
+    let px = read_f64s(bytes, &mut offset, PX_LEN);
+    let goal_inv_p0 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let goal_inv_p1 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let pawn_fwd_p0 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let pawn_fwd_p1 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let corridor_delta_p0 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let corridor_delta_p1 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let path_cross_p0 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let path_cross_p1 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let choke_p0 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let choke_p1 = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    let contested = read_f64s(bytes, &mut offset, FIELD_PLANE_LEN);
+    Net {
+        ws: ws_v.try_into().unwrap(),
+        b1: b1_v.try_into().unwrap(),
+        w2: w2_v.try_into().unwrap(),
+        w1c,
+        po,
+        px,
+        goal_inv_p0,
+        goal_inv_p1,
+        pawn_fwd_p0,
+        pawn_fwd_p1,
+        corridor_delta_p0,
+        corridor_delta_p1,
+        path_cross_p0,
+        path_cross_p1,
+        choke_p0,
+        choke_p1,
+        contested,
+    }
+}
+/// Training / deployed weights (`net_weights.bin`).
 pub fn net() -> &'static Net {
     static NET: OnceLock<Net> = OnceLock::new();
-    NET.get_or_init(|| {
-        assert_eq!(
-            NET_BYTES.len(),
-            NET_WEIGHT_F64S * 8,
-            "net_weights.bin size mismatch — run training/extend_field_planes.py"
-        );
-        let mut offset = 0;
-        let ws_v = read_f64s(NET_BYTES, &mut offset, WSKIP_LEN);
-        let b1_v = read_f64s(NET_BYTES, &mut offset, NET_H);
-        let w2_v = read_f64s(NET_BYTES, &mut offset, NET_H);
-        let w1c = read_f64s(NET_BYTES, &mut offset, W1C_LEN);
-        let po = read_f64s(NET_BYTES, &mut offset, PO_LEN);
-        let px = read_f64s(NET_BYTES, &mut offset, PX_LEN);
-        let goal_inv_p0 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let goal_inv_p1 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let pawn_fwd_p0 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let pawn_fwd_p1 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let corridor_delta_p0 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let corridor_delta_p1 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let path_cross_p0 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let path_cross_p1 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let choke_p0 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let choke_p1 = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        let contested = read_f64s(NET_BYTES, &mut offset, FIELD_PLANE_LEN);
-        Net {
-            ws: ws_v.try_into().unwrap(),
-            b1: b1_v.try_into().unwrap(),
-            w2: w2_v.try_into().unwrap(),
-            w1c,
-            po,
-            px,
-            goal_inv_p0,
-            goal_inv_p1,
-            pawn_fwd_p0,
-            pawn_fwd_p1,
-            corridor_delta_p0,
-            corridor_delta_p1,
-            path_cross_p0,
-            path_cross_p1,
-            choke_p0,
-            choke_p1,
-            contested,
-        }
-    })
+    NET.get_or_init(|| load_net_from_bytes(NET_BYTES))
 }
-
+/// Original v13 baseline — same search as v15, frozen HalfPW (`net_weights_frozen.bin`).
+pub fn net_frozen() -> &'static Net {
+    static NET: OnceLock<Net> = OnceLock::new();
+    NET.get_or_init(|| load_net_from_bytes(NET_FROZEN_BYTES))
+}
 // ── Symmetry tables (match the JS NET_MIRC / NET_MIRS / NET_BKT loops) ────────
-
 const fn build_mirc() -> [usize; 81] {
     let mut arr = [0usize; 81];
     let mut i = 0;
@@ -123,7 +126,6 @@ const fn build_mirc() -> [usize; 81] {
     }
     arr
 }
-
 const fn build_mirs() -> [usize; 64] {
     let mut arr = [0usize; 64];
     let mut i = 0;
@@ -133,7 +135,6 @@ const fn build_mirs() -> [usize; 64] {
     }
     arr
 }
-
 const fn build_bkt() -> [usize; 81] {
     let mut arr = [0usize; 81];
     let mut i = 0;
@@ -143,7 +144,6 @@ const fn build_bkt() -> [usize; 81] {
     }
     arr
 }
-
 pub static NET_MIRC: [usize; 81] = build_mirc();
 pub static NET_MIRS: [usize; 64] = build_mirs();
 pub static NET_BKT: [usize; 81] = build_bkt();
