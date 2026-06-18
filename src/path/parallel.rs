@@ -207,8 +207,8 @@ pub fn pbff_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) 
     (false, visited)
 }
 
-/// Second-player bitboard flood with visited-bit reuse (“bit theft”): on first
-/// contact with the cached first-player region the whole region is annexed (and
+/// Second-player bitboard flood with **cached reachable-mask splice** (visited-bit reuse;
+/// informal “bit theft”): on first contact with the first player's visited region the whole region is annexed (and
 /// goal-tested — POC fix #4), so shared corridors are never re-flooded.
 #[inline]
 pub fn pbff_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u128) -> bool {

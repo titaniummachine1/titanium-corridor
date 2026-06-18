@@ -44,8 +44,8 @@ pub fn flood_fill(start_sq: u8, masks: DirMasks) -> u128 {
     pack_flood_mask(flood_fill_flood_bits(start_sq, masks))
 }
 
-/// Flood with bit theft: on first contact with `cache` (a flood component the
-/// other player already visited) annex the whole region — pawn connectivity is
+/// Flood with cached reachable-mask splice: on first contact with `cache` (visited cells
+/// from the other player's flood) annex the whole region — pawn connectivity is
 /// undirected — and goal-test the annexed pool immediately, since those cells
 /// never re-enter the frontier.
 #[inline]

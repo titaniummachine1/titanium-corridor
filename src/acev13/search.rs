@@ -845,7 +845,8 @@ impl AceSearch {
         self.is_pondering = on;
     }
 
-    /// Path-valid wall slot count (geometric; ignores wall budget and side to move).
+    /// Path-valid wall slot count for `ws[14]` (geometric; ignores wall budget / side).
+    /// Path-valid = tentative placement keeps both players connected to goal (`pbff_wall_legal`).
     pub fn geometric_legal_wall_count(&mut self) -> u32 {
         if let Some(bridge) = self.bridge.as_mut() {
             return count_geometric_legal_walls(&mut bridge.board, &mut bridge.bfs) as u32;
