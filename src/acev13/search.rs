@@ -204,6 +204,19 @@ mod score_label_tests {
     }
 }
 
+pub fn think_result_progress_json(engine_label: &str, result: &ThinkResult) -> String {
+    ace_progress_json(
+        engine_label,
+        &result.depth_log,
+        result.depth,
+        result.nodes,
+        result.score,
+        result.white_dist,
+        result.black_dist,
+        result.ms,
+    )
+}
+
 fn ace_progress_json(
     engine_label: &str,
     depth_log: &[AceDepthLogEntry],

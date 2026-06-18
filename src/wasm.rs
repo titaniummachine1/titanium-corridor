@@ -11,6 +11,7 @@ use wasm_bindgen::prelude::*;
 use crate::acev13::{
     ace_to_algebraic, algebraic_to_ace, AceGame, AceParams, AceSearch, ThinkResult, ACE_NO_MOVE,
 };
+use crate::acev13::search::think_result_progress_json;
 
 fn acev13_params_from_mode(engine_mode: &str, movetime_ms: u32, max_depth: i32) -> AceParams {
     let ti_movegen = engine_mode.contains("-ti") || engine_mode == "ace-v13";
@@ -92,6 +93,11 @@ fn acev13_genmove_with_progress(
     }
     if result.mv == 0 && search.g.winner() >= 0 {
         return None;
+    }
+    // Guarantee the browser receives final depth/nodes even if streaming throttled.
+    if let Some(f) = on_progress.as_ref() {
+        let json = think_result_progress_json(engine_label, &result);
+        let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&json));
     }
     Some((ace_to_algebraic(result.mv), result))
 }
