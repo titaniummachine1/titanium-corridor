@@ -15,10 +15,33 @@ L3  path legality       parallel u128 flood + bit theft (lazy WallTrialCtx)
 | Layer | File | Function |
 | ----- | ---- | -------- |
 | L1∧L2∧TOPO masks | `movegen/o1/lookup.rs` | `wall_masks(board)` |
-| Wall emit | `movegen/legal.rs` | `collect_wall_orientation` (isolated → flood) |
+| Wall emit | `movegen/legal.rs` | `collect_wall_orientation` (off-topology accept; anchored → flood) |
 | L3 flood | `path/parallel.rs` | `both_players_reach_goals_grids` |
 
 **Walls use shift algebra only** — no runtime wall tables (tried; rejected as fake or unsound).
+
+### Isolated-wall LUT audit (rejected as redundant)
+
+A stricter compile-time lookup was tested for walls whose closed lattice segment
+touches neither an occupied wall nor the board edge. Horizontal and vertical
+slots share one 128-bit occupancy space; each candidate has a precomputed
+`u128` contact mask and edge bit, analogous to the pawn LUT neighborhood masks.
+
+The predicate is sound, but it is a strict subset of the existing TOPO
+two-of-three shortcut. A deterministic audit over 64 legal random games checked
+231,601 physically legal candidates against unconditional `pbff_wall_legal`:
+
+| Classification | Candidates |
+| --- | ---: |
+| Strictly isolated | 60,833 |
+| Existing TOPO fast accept | 152,548 |
+| Existing BFF checks | 79,053 |
+| Mismatches / isolated candidates outside TOPO | **0 / 0** |
+
+Adding an isolated-wall branch would therefore avoid **zero** additional BFF
+calls while adding a mask load and branch. It remains proof/test geometry, not
+production move generation. Adversarial cage/barrier fixtures and exhaustive
+local occupancy tests live in `movegen::legal` and `wall_masks`.
 
 ### L3 flood: step dilation vs Kogge-Stone occluded fill (rejected)
 

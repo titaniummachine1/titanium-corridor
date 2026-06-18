@@ -19,6 +19,90 @@ const COL_7: u64 = COL_0 << 7;
 const ROW_0: u64 = 0xFF;
 const ROW_7: u64 = 0xFF << 56;
 
+#[cfg(test)]
+const fn walls_touch(a: usize, b: usize) -> bool {
+    let a_h = a < 64;
+    let b_h = b < 64;
+    let ai = a % 64;
+    let bi = b % 64;
+    let ar = (ai / 8) as i16;
+    let ac = (ai % 8) as i16;
+    let br = (bi / 8) as i16;
+    let bc = (bi % 8) as i16;
+
+    if a_h && b_h {
+        return ar == br && (ac - bc).abs() <= 2;
+    }
+    if !a_h && !b_h {
+        return ac == bc && (ar - br).abs() <= 2;
+    }
+
+    let (hr, hc, vr, vc) = if a_h {
+        (ar, ac, br, bc)
+    } else {
+        (br, bc, ar, ac)
+    };
+    let vx = vc + 1;
+    let hy = hr + 1;
+    vx >= hc && vx <= hc + 2 && hy >= vr && hy <= vr + 2
+}
+
+#[cfg(test)]
+const fn build_wall_touch_masks() -> [u128; 128] {
+    let mut masks = [0u128; 128];
+    let mut a = 0usize;
+    while a < 128 {
+        let mut b = 0usize;
+        while b < 128 {
+            if walls_touch(a, b) {
+                masks[a] |= 1u128 << b;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    masks
+}
+
+#[cfg(test)]
+const fn build_edge_touch() -> [bool; 128] {
+    let mut edge = [false; 128];
+    let mut wall = 0usize;
+    while wall < 128 {
+        let slot = wall % 64;
+        let row = slot / 8;
+        let col = slot % 8;
+        edge[wall] = if wall < 64 {
+            col == 0 || col == 7
+        } else {
+            row == 0 || row == 7
+        };
+        wall += 1;
+    }
+    edge
+}
+
+/// Wall-lattice contact masks. Horizontal slots are bits 0..63; vertical
+/// slots are bits 64..127. The candidate itself and physical collisions are
+/// included, although normal callers already apply the L1/L2 collision mask.
+#[cfg(test)]
+pub const WALL_TOUCH_MASKS: [u128; 128] = build_wall_touch_masks();
+#[cfg(test)]
+pub const WALL_EDGE_TOUCH: [bool; 128] = build_edge_touch();
+
+#[cfg(test)]
+#[inline]
+pub fn wall_occupied_mask(board: &Board) -> u128 {
+    board.horizontal_walls as u128 | ((board.vertical_walls as u128) << 64)
+}
+
+#[cfg(test)]
+#[inline]
+pub fn wall_is_strictly_isolated(board: &Board, slot: usize, horizontal: bool) -> bool {
+    let wall = slot + if horizontal { 0 } else { 64 };
+    !WALL_EDGE_TOUCH[wall] && wall_occupied_mask(board) & WALL_TOUCH_MASKS[wall] == 0
+}
+
 #[inline]
 fn east1(x: u64) -> u64 {
     (x << 1) & !COL_0
@@ -117,6 +201,47 @@ pub fn wall_needs_flood_v_mask(board: &Board) -> u64 {
 mod tests {
     use super::*;
     use crate::core::board::Board;
+
+    #[test]
+    fn wall_touch_masks_match_lattice_examples() {
+        let h = |r: usize, c: usize| r * 8 + c;
+        let v = |r: usize, c: usize| 64 + r * 8 + c;
+        assert_ne!(WALL_TOUCH_MASKS[h(3, 3)] & (1u128 << h(3, 5)), 0);
+        assert_eq!(WALL_TOUCH_MASKS[h(3, 3)] & (1u128 << h(3, 6)), 0);
+        assert_ne!(WALL_TOUCH_MASKS[h(3, 3)] & (1u128 << v(2, 2)), 0);
+        assert_eq!(WALL_TOUCH_MASKS[h(3, 3)] & (1u128 << v(0, 0)), 0);
+        assert!(WALL_EDGE_TOUCH[h(4, 0)]);
+        assert!(WALL_EDGE_TOUCH[v(7, 4)]);
+        assert!(!WALL_EDGE_TOUCH[h(4, 4)]);
+    }
+
+    #[test]
+    fn isolation_masks_exhaust_local_occupancy_patterns() {
+        for wall in 0..128usize {
+            let touching = WALL_TOUCH_MASKS[wall] & !(1u128 << wall);
+            let bits: Vec<_> = (0..128)
+                .filter(|&bit| touching & (1u128 << bit) != 0)
+                .collect();
+            assert!(
+                bits.len() <= 16,
+                "wall {wall} has {} touching slots",
+                bits.len()
+            );
+            for pattern in 0usize..(1usize << bits.len()) {
+                let mut occupied = 0u128;
+                for (i, &bit) in bits.iter().enumerate() {
+                    if pattern & (1usize << i) != 0 {
+                        occupied |= 1u128 << bit;
+                    }
+                }
+                let mut board = Board::new();
+                board.horizontal_walls = occupied as u64;
+                board.vertical_walls = (occupied >> 64) as u64;
+                let isolated = wall_is_strictly_isolated(&board, wall % 64, wall < 64);
+                assert_eq!(isolated, pattern == 0 && !WALL_EDGE_TOUCH[wall]);
+            }
+        }
+    }
 
     #[test]
     fn wall_physical_matches_scalar_collides() {

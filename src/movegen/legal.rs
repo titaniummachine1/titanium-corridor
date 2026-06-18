@@ -676,6 +676,129 @@ fn apply_offsets(mut row: u8, mut col: u8, offsets: &[(i8, i8)]) -> (u8, u8) {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct ShortcutAudit {
+        checked: usize,
+        strict_isolated: usize,
+        topology_fast: usize,
+        bff_checks: usize,
+    }
+
+    fn audit_shortcuts(board: &Board, audit: &mut ShortcutAudit) {
+        let masks = wall_masks(board);
+        let mut ctx = WallTrialCtx::new(board);
+        for (orientation, candidates, needs_flood) in [
+            (WallOrientation::Horizontal, masks.l12_h, masks.topo_h),
+            (WallOrientation::Vertical, masks.l12_v, masks.topo_v),
+        ] {
+            let horizontal = orientation == WallOrientation::Horizontal;
+            let mut remaining = candidates;
+            while remaining != 0 {
+                let slot = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                let row = (slot / 8) as u8;
+                let col = (slot % 8) as u8;
+                let exact = ctx.wall_keeps_paths_open(row, col, orientation);
+                let topology_fast = needs_flood & (1u64 << slot) == 0;
+                let current = topology_fast || exact;
+                if topology_fast {
+                    audit.topology_fast += 1;
+                } else {
+                    audit.bff_checks += 1;
+                }
+                assert_eq!(
+                    current,
+                    exact,
+                    "topology shortcut mismatch: candidate={row},{col},{orientation:?} h={:#018x} v={:#018x} pawns={:?}",
+                    board.horizontal_walls,
+                    board.vertical_walls,
+                    board.pawns,
+                );
+                if crate::movegen::wall_masks::wall_is_strictly_isolated(board, slot, horizontal) {
+                    audit.strict_isolated += 1;
+                    assert!(
+                        exact,
+                        "isolated counterexample: candidate={row},{col},{orientation:?} h={:#018x} v={:#018x} pawns={:?}",
+                        board.horizontal_walls,
+                        board.vertical_walls,
+                        board.pawns,
+                    );
+                    assert_eq!(
+                        needs_flood & (1u64 << slot),
+                        0,
+                        "strict isolation must already be covered by topology shortcut"
+                    );
+                }
+                audit.checked += 1;
+            }
+        }
+    }
+
+    fn replay(moves: &[&str]) -> Board {
+        let mut board = Board::new();
+        for &mv in moves {
+            board.apply_algebraic(mv);
+        }
+        board
+    }
+
+    #[test]
+    fn isolated_and_topology_shortcuts_match_exact_bff_globally() {
+        let mut audit = ShortcutAudit::default();
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        for _game in 0..64 {
+            let mut board = Board::new();
+            for _ply in 0..48 {
+                audit_shortcuts(&board, &mut audit);
+                if board.is_terminal().is_some() {
+                    break;
+                }
+                let mut scratch = BfsScratch::new();
+                let mut moves = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+                let n = generate_legal_moves_slice(&mut board, &mut moves, &mut scratch);
+                if n == 0 {
+                    break;
+                }
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let mv = moves[(seed as usize) % n];
+                let _ = board.make_move(mv);
+            }
+        }
+        eprintln!(
+            "shortcut audit checked={} strict_isolated={} topology_fast={} bff_checks={}",
+            audit.checked, audit.strict_isolated, audit.topology_fast, audit.bff_checks
+        );
+        assert!(
+            audit.checked >= 10_000,
+            "only checked {} wall candidates",
+            audit.checked
+        );
+    }
+
+    #[test]
+    fn isolated_and_topology_shortcuts_match_adversarial_bff() {
+        let fixtures: &[&[&str]] = &[
+            &[
+                "e2", "e8", "e3", "e7", "e4", "e6", "e5", "e4", "e3h", "e5h", "c3h", "c5h", "g3h",
+            ],
+            &[
+                "e2", "e8", "e3", "e7", "e4", "e6", "c3h", "e7h", "e3h", "c7h", "f4", "g7h", "f5",
+                "h8h", "f6", "b6v", "g3h", "h7v", "a3h",
+            ],
+            &[
+                "e2", "e8", "e3", "e7", "e4", "e6", "e3h", "e4h", "d4", "c4h", "e5v", "a5h", "h8h",
+                "d6", "b5v", "f3v", "e7v", "c3h", "d7h", "b2v", "h6h",
+            ],
+        ];
+        let mut audit = ShortcutAudit::default();
+        for moves in fixtures {
+            audit_shortcuts(&replay(moves), &mut audit);
+        }
+        assert!(audit.checked > 100);
+    }
+
     #[test]
     fn start_has_three_pawn_moves_for_white() {
         let board = Board::new();
