@@ -193,6 +193,7 @@ pub fn reduction_counterfactual_probe(
     depth: i32,
     target_ordinal: Option<u64>,
     event_limit: usize,
+    min_event_depth: i32,
 ) -> Option<(ThinkResult, Vec<ReductionProbeEvent>)> {
     let mut g = AceGame::new();
     for text in moves {
@@ -202,7 +203,7 @@ pub fn reduction_counterfactual_probe(
         return None;
     }
     let mut search = AceSearch::grafted(g, Some(18));
-    search.enable_reduction_probe(target_ordinal, event_limit);
+    search.enable_reduction_probe(target_ordinal, event_limit, min_event_depth);
     let result = search.think(3_600_000, depth, true, false, "reduction-probe");
     Some((result, search.reduction_probe_events().to_vec()))
 }

@@ -119,6 +119,7 @@ fn run_reduction_probe(args: &[String]) {
     let mut depth = 5i32;
     let mut target = None;
     let mut limit = 64usize;
+    let mut min_event_depth = 0i32;
     let mut moves = Vec::new();
     let mut i = 2usize;
     while i < args.len() {
@@ -141,6 +142,13 @@ fn run_reduction_probe(args: &[String]) {
                     .unwrap_or(limit);
                 i += 2;
             }
+            "--min-event-depth" => {
+                min_event_depth = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(min_event_depth);
+                i += 2;
+            }
             value if looks_like_algebraic_move(value) => {
                 moves.push(value.to_string());
                 i += 1;
@@ -149,7 +157,7 @@ fn run_reduction_probe(args: &[String]) {
         }
     }
     let Some((result, events)) =
-        titanium::acev13::reduction_counterfactual_probe(&moves, depth, target, limit)
+        titanium::acev13::reduction_counterfactual_probe(&moves, depth, target, limit, min_event_depth)
     else {
         println!("{{\"schema\":\"reduction-probe-v1\",\"status\":\"terminal\"}}");
         return;

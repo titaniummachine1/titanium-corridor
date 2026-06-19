@@ -381,6 +381,7 @@ pub struct AceSearch {
     reduction_probe_target: Option<u64>,
     reduction_probe_next: u64,
     reduction_probe_limit: usize,
+    reduction_probe_min_depth: i32,
     reduction_probe_events: Vec<ReductionProbeEvent>,
     reduction_sidecar: Option<ReductionSidecar>,
     reduction_shadow_stats: ReductionShadowStats,
@@ -538,6 +539,7 @@ impl AceSearch {
             reduction_probe_target: None,
             reduction_probe_next: 0,
             reduction_probe_limit: 0,
+            reduction_probe_min_depth: 0,
             reduction_probe_events: Vec::new(),
             reduction_sidecar: None,
             reduction_shadow_stats: ReductionShadowStats::default(),
@@ -635,11 +637,14 @@ impl AceSearch {
 
     /// Enable offline observation of complete native LMR move pipelines.
     /// `target=None` records baseline events; `Some(n)` applies +1 only to event n.
-    pub fn enable_reduction_probe(&mut self, target: Option<u64>, limit: usize) {
+    /// `min_depth` skips events at local depth < min_depth so shallow-tree events
+    /// (which dominate post-order traversal) do not fill the limit before useful ones.
+    pub fn enable_reduction_probe(&mut self, target: Option<u64>, limit: usize, min_depth: i32) {
         self.reduction_probe_enabled = true;
         self.reduction_probe_target = target;
         self.reduction_probe_next = 0;
         self.reduction_probe_limit = limit;
+        self.reduction_probe_min_depth = min_depth;
         self.reduction_probe_events.clear();
     }
 
@@ -2207,7 +2212,9 @@ impl AceSearch {
                     self.reduction_shadow_stats.inference_nanos +=
                         started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 }
-                let probe_ordinal = if self.reduction_probe_enabled {
+                let probe_ordinal = if self.reduction_probe_enabled
+                    && depth >= self.reduction_probe_min_depth
+                {
                     let ordinal = self.reduction_probe_next;
                     self.reduction_probe_next += 1;
                     Some(ordinal)
