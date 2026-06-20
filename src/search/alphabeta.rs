@@ -2410,4 +2410,42 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn endgame_cert_default_on_and_disable_falls_back() {
+        fn tempo_win_board() -> Board {
+            let mut board = Board::new();
+            board.pawns = [(3, 1), (5, 7)];
+            board.walls_remaining = [2, 0];
+            board.side_to_move = Player::One;
+            board.hash = crate::core::zobrist::hash_board(&board);
+            board
+        }
+
+        let base = SearchConfig {
+            time_ms: 2_000,
+            max_nodes: 2_000_000,
+            log: false,
+            book_hint: None,
+            max_id_depth: 4,
+            cert_enabled: None,
+        };
+        let with_cert = search_best_move(&mut tempo_win_board(), base).expect("cert on");
+        assert!(
+            with_cert.root_score > MAX_EVAL,
+            "cert ON should floor a proven tempo win above static eval, got {}",
+            with_cert.root_score
+        );
+
+        let off = SearchConfig {
+            cert_enabled: Some(false),
+            ..base
+        };
+        let without_cert = search_best_move(&mut tempo_win_board(), off).expect("cert off");
+        assert!(
+            without_cert.root_score.abs() <= MAX_EVAL,
+            "cert OFF should stay in ordinary eval band, got {}",
+            without_cert.root_score
+        );
+    }
 }
