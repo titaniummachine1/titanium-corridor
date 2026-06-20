@@ -295,10 +295,7 @@ fn ace_progress_json(
 }
 
 #[cfg(feature = "wasm")]
-fn emit_ace_progress_wasm(
-    json: &str,
-    wasm_cb: Option<&js_sys::Function>,
-) {
+fn emit_ace_progress_wasm(json: &str, wasm_cb: Option<&js_sys::Function>) {
     if let Some(f) = wasm_cb {
         let _ = f.call1(
             &wasm_bindgen::JsValue::NULL,
@@ -968,9 +965,7 @@ impl AceSearch {
 
     /// Wall-cache profiling counters (TiBridge path only).
     pub fn wall_cache_stats(&self) -> Option<GeometricWallCacheStats> {
-        self.bridge
-            .as_ref()
-            .map(|b| b.wall_cache_stats)
+        self.bridge.as_ref().map(|b| b.wall_cache_stats)
     }
 
     /// Dump the raw net inputs + the resulting eval as JSON. Lets the Python NNUE
@@ -1406,18 +1401,14 @@ impl AceSearch {
         // no walls the win-certificate reduces to the race outcome, so this returns
         // the same verdict as `certify` at a fraction of the node cost.
         if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
-            use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
-            let stm_wins = match hands_empty_race(&self.g) {
-                RaceVerdict::Win => true,
-                RaceVerdict::Loss => false,
-                RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
-            };
-            // Classifier is from the side-to-move's view; `s` may be either side.
-            return if s == self.g.turn {
-                stm_wins
-            } else {
-                !stm_wins
-            };
+            use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+            if let Some(stm_wins) = hands_empty_race_stm_wins(&mut self.g) {
+                return if s == self.g.turn {
+                    stm_wins
+                } else {
+                    !stm_wins
+                };
+            }
         }
         let key = (
             self.g.hash_lo,
@@ -1576,16 +1567,13 @@ impl AceSearch {
                 // No walls left: Quoridor is a forced pawn race, never a draw.
                 // Most races are settled by tempo/path math; only close
                 // overlapping paths pay the tiny forward minimax proof.
-                use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
-                let stm_wins = match hands_empty_race(&self.g) {
-                    RaceVerdict::Win => true,
-                    RaceVerdict::Loss => false,
-                    RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
-                };
-                if stm_wins {
-                    return RACE_MATE - d_me_i.max(1);
+                use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+                if let Some(stm_wins) = hands_empty_race_stm_wins(&mut self.g) {
+                    if stm_wins {
+                        return RACE_MATE - d_me_i.max(1);
+                    }
+                    return -(RACE_MATE - d_opp_i.max(1));
                 }
-                return -(RACE_MATE - d_opp_i.max(1));
             }
             if self.race_proof {
                 // pathfix/RaceProof(a): exact k=0 verdict; cached tables always usable
@@ -2216,15 +2204,14 @@ impl AceSearch {
                     self.reduction_shadow_stats.inference_nanos +=
                         started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 }
-                let probe_ordinal = if self.reduction_probe_enabled
-                    && depth >= self.reduction_probe_min_depth
-                {
-                    let ordinal = self.reduction_probe_next;
-                    self.reduction_probe_next += 1;
-                    Some(ordinal)
-                } else {
-                    None
-                };
+                let probe_ordinal =
+                    if self.reduction_probe_enabled && depth >= self.reduction_probe_min_depth {
+                        let ordinal = self.reduction_probe_next;
+                        self.reduction_probe_next += 1;
+                        Some(ordinal)
+                    } else {
+                        None
+                    };
                 let extra_reduction = probe_ordinal
                     .is_some_and(|ordinal| self.reduction_probe_target == Some(ordinal));
                 let rd = (new_depth - red - i32::from(extra_reduction)).max(0);
@@ -2478,12 +2465,8 @@ impl AceSearch {
                 let my_v = if immediate_win {
                     1
                 } else {
-                    use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
-                    let child_stm_wins = match hands_empty_race(&self.g) {
-                        RaceVerdict::Win => true,
-                        RaceVerdict::Loss => false,
-                        RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
-                    };
+                    use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+                    let child_stm_wins = hands_empty_race_stm_wins(&mut self.g).unwrap_or(false);
                     let mut d_me = [255u8; 81];
                     let mut d_opp = [255u8; 81];
                     self.g.compute_dist(me, &mut d_me);
@@ -2851,13 +2834,11 @@ impl AceSearch {
         {
             self.g.make_move(last_best);
             let rp_ok = if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
-                use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
-                let opp_wins = match hands_empty_race(&self.g) {
-                    RaceVerdict::Win => true,
-                    RaceVerdict::Loss => false,
-                    RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
-                };
-                !opp_wins
+                use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+                match hands_empty_race_stm_wins(&mut self.g) {
+                    Some(opp_wins) => !opp_wins,
+                    None => true, // unknown ⇒ do not demote without proof
+                }
             } else if self.cert_eval_leaves_only {
                 // Walls remain: search + EME cover tempo; skip recursive certify here.
                 true

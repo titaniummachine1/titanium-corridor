@@ -110,12 +110,8 @@ fn race_winner_stm(turn: usize, d0: u8, d1: u8) -> usize {
 /// wall-campaign certifier and the already-solved pawn race: once both hands are
 /// empty, never recurse through certificate nodes.
 fn no_wall_race_winner(g: &mut AceGame) -> usize {
-    use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
-    let stm_wins = match hands_empty_race(g) {
-        RaceVerdict::Win => true,
-        RaceVerdict::Loss => false,
-        RaceVerdict::NeedsProof => race_minimax(g) > 0,
-    };
+    use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+    let stm_wins = hands_empty_race_stm_wins(g).unwrap_or(false);
     if stm_wins {
         g.turn
     } else {

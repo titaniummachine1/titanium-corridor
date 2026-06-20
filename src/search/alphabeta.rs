@@ -698,11 +698,17 @@ fn endgame_cert_floor(
                 return Some(loss);
             }
             RaceVerdict::NeedsProof => {
-                // Forward race minimax: only visits ~50-200 reachable states from
-                // this volatile position vs the oracle's full 13k build.
-                let v = crate::acev13::cert_bridge::race_minimax(&mut g);
-                CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(if v > 0 { win } else { loss });
+                match crate::acev13::cert_bridge::race_minimax(&mut g) {
+                    crate::acev13::cert_bridge::RaceProof::Win => {
+                        CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Some(win);
+                    }
+                    crate::acev13::cert_bridge::RaceProof::Loss => {
+                        CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Some(loss);
+                    }
+                    crate::acev13::cert_bridge::RaceProof::Unknown => return None,
+                }
             }
         }
     }

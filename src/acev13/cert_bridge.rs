@@ -113,7 +113,13 @@ pub fn certify_board(
         let stm_wins = match hands_empty_race(&g) {
             RaceVerdict::Win => true,
             RaceVerdict::Loss => false,
-            RaceVerdict::NeedsProof => race_minimax(&mut g) > 0,
+            RaceVerdict::NeedsProof => match race_minimax(&mut g) {
+                RaceProof::Win => true,
+                RaceProof::Loss => false,
+                RaceProof::Unknown => {
+                    return None;
+                }
+            },
         };
         let winner_idx = if stm_wins { g.turn } else { 1 - g.turn };
         let winner = player_from_ace(winner_idx);
@@ -144,40 +150,137 @@ pub fn certify_board(
 
 // ── Forward race minimax (replaces the 13k-state retrograde oracle) ───────────
 //
-// Used ONLY for the NeedsProof edge case: paths overlap AND delta < 2.
-// The oracle builds all 13,122 (p0,p1,turn) states eagerly; here we only need
-// the ~50-200 states reachable from the volatile position, so lazy forward
-// minimax with a small HashMap is strictly cheaper.
-//
-// Soundness: in a wall-free pawn race, optimal play NEVER leaves the shortest-
-// path set — deviating increases your distance while the opponent stays on
-// schedule.  Jumps are included automatically: gen_pawn_moves emits them and
-// they always satisfy `d_goal[to] < d_goal[pawn]` (land ≥1 step closer).
+// Used ONLY for the NeedsProof edge case: paths overlap AND |adj| ≤ 1.
+// Lazy forward search with a small memo; cycle/back-edge and depth-cap return
+// [`RaceProof::Unknown`] so callers fall back to normal alpha-beta (not draw).
 
-/// Solve a hands-empty pawn race for the side to move.
-/// Returns `+1` (stm wins) or `-1` (stm loses). Never 0 — a race always ends.
-pub fn race_minimax(g: &mut AceGame) -> i8 {
-    let mut memo = std::collections::HashMap::with_capacity(64);
-    race_rec(g, &mut memo)
+/// Exact zero-wall race proof from side-to-move perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaceProof {
+    /// Side to move wins with certainty.
+    Win,
+    /// Side to move loses with certainty.
+    Loss,
+    /// No safe exact certificate (cycle, depth cap, or incomplete search).
+    /// **Not a draw** — callers must decline endgame certification.
+    Unknown,
 }
 
-fn race_rec(g: &mut AceGame, memo: &mut std::collections::HashMap<u32, i8>) -> i8 {
+pub const RACE_STATE_COUNT: usize = 81 * 81 * 2;
+const RACE_VISITING_WORDS: usize = (RACE_STATE_COUNT + 63) / 64;
+/// Resolver ply cap: 2× max observed legitimate depth on empty board (see tests).
+pub const RACE_RESOLVER_DEPTH_CAP: u32 = 128;
+
+#[inline]
+pub fn race_state_index(p0: usize, p1: usize, turn: usize) -> usize {
+    debug_assert!(p0 < 81 && p1 < 81 && turn < 2);
+    (p0 * 81 + p1) * 2 + turn
+}
+
+#[inline]
+fn visiting_test(words: &[u64; RACE_VISITING_WORDS], idx: usize) -> bool {
+    words[idx / 64] & (1u64 << (idx % 64)) != 0
+}
+
+#[inline]
+fn visiting_set(words: &mut [u64; RACE_VISITING_WORDS], idx: usize) {
+    words[idx / 64] |= 1u64 << (idx % 64);
+}
+
+#[inline]
+fn visiting_clear(words: &mut [u64; RACE_VISITING_WORDS], idx: usize) {
+    words[idx / 64] &= !(1u64 << (idx % 64));
+}
+
+/// Three-valued minimax over child proofs (each child is from **opponent** stm).
+pub fn aggregate_opponent_child_proofs(children: &[RaceProof]) -> RaceProof {
+    if children.is_empty() {
+        return RaceProof::Loss;
+    }
+    let mut has_stm_win = false;
+    let mut all_opponent_win = true;
+    for &child in children {
+        match child {
+            RaceProof::Loss => has_stm_win = true,
+            RaceProof::Win => {}
+            RaceProof::Unknown => all_opponent_win = false,
+        }
+    }
+    if has_stm_win {
+        RaceProof::Win
+    } else if all_opponent_win {
+        RaceProof::Loss
+    } else {
+        RaceProof::Unknown
+    }
+}
+
+struct RaceResolver {
+    visiting: [u64; RACE_VISITING_WORDS],
+    memo: std::collections::HashMap<u32, RaceProof>,
+    depth: u32,
+    depth_cap: u32,
+}
+
+impl RaceResolver {
+    fn new(depth_cap: u32) -> Self {
+        Self {
+            visiting: [0u64; RACE_VISITING_WORDS],
+            memo: std::collections::HashMap::with_capacity(64),
+            depth: 0,
+            depth_cap,
+        }
+    }
+}
+
+/// Solve a hands-empty pawn race for the side to move.
+///
+/// Uses distance-decreasing pawn moves only (existing restricted subgame).
+/// Returns [`RaceProof::Unknown`] on active-path cycle or depth cap — never draw.
+pub fn race_minimax(g: &mut AceGame) -> RaceProof {
+    race_minimax_with_cap(g, RACE_RESOLVER_DEPTH_CAP)
+}
+
+pub fn race_minimax_with_cap(g: &mut AceGame, depth_cap: u32) -> RaceProof {
+    let mut resolver = RaceResolver::new(depth_cap);
+    race_rec(g, &mut resolver)
+}
+
+/// Convenience for callers that need `Option<bool>` (None = decline certification).
+#[inline]
+pub fn race_minimax_stm_wins(g: &mut AceGame) -> Option<bool> {
+    match race_minimax(g) {
+        RaceProof::Win => Some(true),
+        RaceProof::Loss => Some(false),
+        RaceProof::Unknown => None,
+    }
+}
+
+fn race_rec(g: &mut AceGame, resolver: &mut RaceResolver) -> RaceProof {
     let stm = g.turn;
     let pawn = g.pawn[stm];
 
-    // Defensive guard: stm already at goal (we detect goal moves before recursing,
-    // but be safe against the root being called on an already-won position).
     if (stm == 0 && pawn < 9) || (stm == 1 && pawn >= 72) {
-        return 1;
+        return RaceProof::Win;
     }
 
-    // Key: 81 cells × 81 cells × 2 turns ≤ 13,122 states, fits in u32.
-    let key = (g.pawn[0] * 162 + g.pawn[1] * 2 + g.turn) as u32;
-    if let Some(&v) = memo.get(&key) {
-        return v;
+    if resolver.depth >= resolver.depth_cap {
+        return RaceProof::Unknown;
     }
 
-    // Distance from every cell to stm's goal through the frozen wall graph.
+    let idx = race_state_index(g.pawn[0], g.pawn[1], g.turn);
+    if visiting_test(&resolver.visiting, idx) {
+        return RaceProof::Unknown;
+    }
+
+    let key = idx as u32;
+    if let Some(&cached) = resolver.memo.get(&key) {
+        return cached;
+    }
+
+    visiting_set(&mut resolver.visiting, idx);
+    resolver.depth += 1;
+
     let mut d_goal = [255u8; 81];
     g.compute_dist(stm, &mut d_goal);
     let my_dist = d_goal[pawn];
@@ -185,28 +288,36 @@ fn race_rec(g: &mut AceGame, memo: &mut std::collections::HashMap<u32, i8>) -> i
     let mut buf = [0i16; 16];
     let cnt = g.gen_pawn_moves(&mut buf, 0);
 
-    let mut result = -1i8; // pessimistic default: lose
+    let mut child_proofs: [RaceProof; 16] = [RaceProof::Unknown; 16];
+    let mut child_count = 0usize;
 
     for i in 0..cnt {
         let to = buf[i] as usize;
-        // Strict shortest-path filter: only moves that spend 1 tempo (strictly decrease distance).
         if d_goal[to] < my_dist {
-            // Goal move → instant win.
             if (stm == 0 && to < 9) || (stm == 1 && to >= 72) {
-                result = 1;
-                break;
+                visiting_clear(&mut resolver.visiting, idx);
+                resolver.depth -= 1;
+                return RaceProof::Win;
             }
             g.make_move(buf[i]);
-            let child = race_rec(g, memo);
+            child_proofs[child_count] = race_rec(g, resolver);
             g.unmake_move();
-            if child < 0 {
-                result = 1; // opponent loses from here → we win
-                break;
-            }
+            child_count += 1;
         }
     }
 
-    memo.insert(key, result);
+    resolver.depth -= 1;
+    visiting_clear(&mut resolver.visiting, idx);
+
+    let result = if child_count == 0 {
+        RaceProof::Loss
+    } else {
+        aggregate_opponent_child_proofs(&child_proofs[..child_count])
+    };
+
+    if matches!(result, RaceProof::Win | RaceProof::Loss) {
+        resolver.memo.insert(key, result);
+    }
     result
 }
 
@@ -263,6 +374,16 @@ fn paths_overlap(g: &AceGame, d_goal0: &[u8; 81], d_goal1: &[u8; 81]) -> bool {
         }
     }
     false
+}
+
+/// Classifier + resolver: `Some(stm_wins)` when exact, `None` when certification
+/// must be declined (resolver returned [`RaceProof::Unknown`]).
+pub fn hands_empty_race_stm_wins(g: &mut AceGame) -> Option<bool> {
+    match hands_empty_race(g) {
+        RaceVerdict::Win => Some(true),
+        RaceVerdict::Loss => Some(false),
+        RaceVerdict::NeedsProof => race_minimax_stm_wins(g),
+    }
 }
 
 /// Outcome of the wall-free (hands-empty) race classifier.
@@ -510,10 +631,10 @@ mod tests {
                     }
 
                     decisive += 1;
-                    let exact = if race_minimax(&mut g) > 0 {
-                        RaceVerdict::Win
-                    } else {
-                        RaceVerdict::Loss
+                    let exact = match race_minimax(&mut g) {
+                        RaceProof::Win => RaceVerdict::Win,
+                        RaceProof::Loss => RaceVerdict::Loss,
+                        RaceProof::Unknown => RaceVerdict::NeedsProof,
                     };
                     assert_eq!(
                         verdict, exact,
@@ -703,8 +824,7 @@ mod tests {
             }
             panic!(
                 "proposed rule has {} false wins and {} false losses (showing up to 20)",
-                stats.proposed_false_wins,
-                stats.proposed_false_losses
+                stats.proposed_false_wins, stats.proposed_false_losses
             );
         }
         assert_eq!(stats.proposed_false_wins, 0);
@@ -829,7 +949,252 @@ mod tests {
             }
         }
         eprintln!("zero-wall extension benchmark: {stats:#?}");
-        // Document how many volatile positions each classifier visits.
         assert!(stats.states_checked > 10_000);
+    }
+
+    // ── Cycle-safe race resolver tests ────────────────────────────────────────
+
+    #[test]
+    fn race_state_key_distinguishes_side_to_move() {
+        let k0 = race_state_index(40, 50, 0);
+        let k1 = race_state_index(40, 50, 1);
+        assert_ne!(k0, k1);
+        assert_eq!(k0, race_state_index(40, 50, 0));
+    }
+
+    #[test]
+    fn aggregate_cycle_plus_winning_move() {
+        assert_eq!(
+            aggregate_opponent_child_proofs(&[RaceProof::Unknown, RaceProof::Loss]),
+            RaceProof::Win
+        );
+    }
+
+    #[test]
+    fn aggregate_unknown_prevents_false_loss() {
+        assert_eq!(
+            aggregate_opponent_child_proofs(&[RaceProof::Win, RaceProof::Unknown]),
+            RaceProof::Unknown
+        );
+    }
+
+    #[test]
+    fn aggregate_all_opponent_losses_is_stm_loss() {
+        assert_eq!(
+            aggregate_opponent_child_proofs(&[RaceProof::Win, RaceProof::Win]),
+            RaceProof::Loss
+        );
+    }
+
+    #[test]
+    fn race_active_path_repetition_returns_unknown() {
+        let mut visiting = [0u64; RACE_VISITING_WORDS];
+        let idx = race_state_index(40, 50, 0);
+        visiting_set(&mut visiting, idx);
+        assert!(visiting_test(&visiting, idx));
+    }
+
+    #[test]
+    fn race_depth_cap_returns_unknown() {
+        let board = race_board((3, 4), (5, 4), Player::One);
+        let mut g = ace_from_board(&board);
+        assert_eq!(
+            race_minimax_with_cap(&mut g, 0),
+            RaceProof::Unknown,
+            "depth cap must not certify"
+        );
+    }
+
+    #[test]
+    fn race_resolver_max_depth_on_empty_board() {
+        let mut max_depth = 0u32;
+        for p0 in 9..81 {
+            for p1 in 0..72 {
+                if p0 == p1 {
+                    continue;
+                }
+                for stm in [Player::One, Player::Two] {
+                    let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
+                    let mut g = ace_from_board(&board);
+                    if hands_empty_race(&g) != RaceVerdict::NeedsProof {
+                        continue;
+                    }
+                    let mut resolver = RaceResolver::new(RACE_RESOLVER_DEPTH_CAP);
+                    max_depth = max_depth.max(measure_race_depth(&mut g, &mut resolver));
+                }
+            }
+        }
+        eprintln!("race_minimax max observed depth (NeedsProof): {max_depth}");
+        assert!(max_depth <= RACE_RESOLVER_DEPTH_CAP);
+        assert!(max_depth > 0);
+    }
+
+    fn measure_race_depth(g: &mut AceGame, resolver: &mut RaceResolver) -> u32 {
+        let saved_cap = resolver.depth_cap;
+        resolver.depth_cap = u32::MAX / 2;
+        let d = race_rec_depth_only(g, resolver, 0);
+        resolver.depth_cap = saved_cap;
+        d
+    }
+
+    fn race_rec_depth_only(g: &mut AceGame, resolver: &mut RaceResolver, cur: u32) -> u32 {
+        let stm = g.turn;
+        let pawn = g.pawn[stm];
+        if (stm == 0 && pawn < 9) || (stm == 1 && pawn >= 72) {
+            return cur;
+        }
+        let idx = race_state_index(g.pawn[0], g.pawn[1], g.turn);
+        if visiting_test(&resolver.visiting, idx) {
+            return cur;
+        }
+        visiting_set(&mut resolver.visiting, idx);
+        let mut d_goal = [255u8; 81];
+        g.compute_dist(stm, &mut d_goal);
+        let my_dist = d_goal[pawn];
+        let mut buf = [0i16; 16];
+        let cnt = g.gen_pawn_moves(&mut buf, 0);
+        let mut best = cur;
+        for i in 0..cnt {
+            let to = buf[i] as usize;
+            if d_goal[to] < my_dist {
+                g.make_move(buf[i]);
+                best = best.max(race_rec_depth_only(g, resolver, cur + 1));
+                g.unmake_move();
+            }
+        }
+        visiting_clear(&mut resolver.visiting, idx);
+        best
+    }
+
+    /// Pre-528d20b raw-tempo classifier (for regression counting only).
+    fn old_raw_tempo_race(g: &AceGame) -> RaceVerdict {
+        let mut d0 = [0u8; 81];
+        let mut d1 = [0u8; 81];
+        g.compute_dist(0, &mut d0);
+        g.compute_dist(1, &mut d1);
+        let big0 = d0[g.pawn[0]];
+        let big1 = d1[g.pawn[1]];
+        if big0 == 255 || big1 == 255 {
+            return RaceVerdict::NeedsProof;
+        }
+        let (our, opp) = if g.turn == 0 {
+            (big0 as i32, big1 as i32)
+        } else {
+            (big1 as i32, big0 as i32)
+        };
+        let tempo = opp - our;
+        if tempo > 1 {
+            return RaceVerdict::Win;
+        }
+        if tempo < -1 {
+            return RaceVerdict::Loss;
+        }
+        if paths_overlap(g, &d0, &d1) {
+            return RaceVerdict::NeedsProof;
+        }
+        if tempo < 0 {
+            RaceVerdict::Loss
+        } else {
+            RaceVerdict::Win
+        }
+    }
+
+    #[test]
+    fn seventy_two_turn_adjusted_shortcuts_skip_resolver() {
+        let mut shortcuts = 0usize;
+        for p0 in 9..81 {
+            for p1 in 0..72 {
+                if p0 == p1 {
+                    continue;
+                }
+                for stm in [Player::One, Player::Two] {
+                    let g = ace_from_board(&race_board(
+                        board_pos_from_ace(p0),
+                        board_pos_from_ace(p1),
+                        stm,
+                    ));
+                    if old_raw_tempo_race(&g) != RaceVerdict::NeedsProof {
+                        continue;
+                    }
+                    if hands_empty_race(&g) == RaceVerdict::NeedsProof {
+                        continue;
+                    }
+                    shortcuts += 1;
+                }
+            }
+        }
+        assert_eq!(shortcuts, 72, "528d20b shortcuts vs raw-tempo resolver");
+    }
+
+    #[derive(Default, Debug)]
+    struct ExhaustiveResolverAudit {
+        volatile: usize,
+        exact_win: usize,
+        exact_loss: usize,
+        resolver_win: usize,
+        resolver_loss: usize,
+        resolver_unknown: usize,
+        false_win: usize,
+        false_loss: usize,
+    }
+
+    #[test]
+    fn exhaustive_resolver_audit_no_false_certificates() {
+        use crate::acev13::oracle::oracle_solve_board;
+        let oracle_table = oracle_solve_board(&[0u8; 81]);
+        let mut audit = ExhaustiveResolverAudit::default();
+
+        for p0 in 9..81 {
+            for p1 in 0..72 {
+                if p0 == p1 {
+                    continue;
+                }
+                for stm in [Player::One, Player::Two] {
+                    let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
+                    let mut g = ace_from_board(&board);
+                    let id = (p0 * 81 + p1) * 2 + (stm as usize);
+                    let exact_val = oracle_table[id];
+                    let classifier = hands_empty_race(&g);
+
+                    if classifier != RaceVerdict::NeedsProof {
+                        if matches!(classifier, RaceVerdict::Win) && exact_val <= 0 {
+                            audit.false_win += 1;
+                        }
+                        if matches!(classifier, RaceVerdict::Loss) && exact_val >= 0 {
+                            audit.false_loss += 1;
+                        }
+                        continue;
+                    }
+
+                    audit.volatile += 1;
+                    if exact_val > 0 {
+                        audit.exact_win += 1;
+                    } else if exact_val < 0 {
+                        audit.exact_loss += 1;
+                    }
+
+                    match race_minimax(&mut g) {
+                        RaceProof::Win => {
+                            audit.resolver_win += 1;
+                            if exact_val <= 0 {
+                                audit.false_win += 1;
+                            }
+                        }
+                        RaceProof::Loss => {
+                            audit.resolver_loss += 1;
+                            if exact_val >= 0 {
+                                audit.false_loss += 1;
+                            }
+                        }
+                        RaceProof::Unknown => audit.resolver_unknown += 1,
+                    }
+                }
+            }
+        }
+
+        eprintln!("exhaustive resolver audit: {audit:#?}");
+        assert_eq!(audit.false_win, 0);
+        assert_eq!(audit.false_loss, 0);
+        assert!(audit.volatile > 0);
     }
 }
