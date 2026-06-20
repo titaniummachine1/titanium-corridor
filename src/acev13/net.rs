@@ -88,10 +88,19 @@ fn load_net_from_bytes(bytes: &[u8]) -> Net {
         route_active,
     }
 }
-/// Training / deployed weights (`net_weights.bin`).
+/// Training / deployed weights (`net_weights.bin`, overridable via `TITANIUM_NET_WEIGHTS_PATH`).
 pub fn net() -> &'static Net {
     static NET: OnceLock<Net> = OnceLock::new();
-    NET.get_or_init(|| load_net_from_bytes(NET_BYTES))
+    NET.get_or_init(|| {
+        if let Ok(path) = std::env::var("TITANIUM_NET_WEIGHTS_PATH") {
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!("TITANIUM_NET_WEIGHTS_PATH read failed ({path}): {e}")
+            });
+            load_net_from_bytes(&bytes)
+        } else {
+            load_net_from_bytes(NET_BYTES)
+        }
+    })
 }
 /// Original v13 baseline — same search as v15, frozen HalfPW (`net_weights_frozen.bin`).
 pub fn net_frozen() -> &'static Net {

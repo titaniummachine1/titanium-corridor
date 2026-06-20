@@ -29,6 +29,7 @@ use crate::util::clock::{Duration, Instant};
 
 use crate::acev13::certify::{certify, CertifyOpts};
 use crate::acev13::game::{AceGame, ZOBRIST};
+use crate::acev13::packed_state::FEATURE_SCHEMA;
 use crate::acev13::net::{net, net_frozen, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
 use crate::acev13::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
 use crate::acev13::reduction_sidecar::ReductionSidecar;
@@ -977,6 +978,15 @@ impl AceSearch {
     /// Canonical field keys: `goal_inv_p0_field`, `pawn_fwd_p0_field`, `corridor_delta_p0_field`,
     /// `path_cross_p0_field` (and `_p1` variants). Legacy aliases `d0_field`, `player0_field`, …
     /// are duplicated in the JSON for old JSONL; trainer reads either via `rec_field()`.
+    /// Same JSON as [`Self::eval_dump_json`] with packed-batch metadata prefix fields.
+    pub fn eval_dump_json_packed(&mut self, row: u32) -> String {
+        let body = self.eval_dump_json();
+        format!(
+            "{{\"row\":{row},\"ok\":true,\"feature_schema\":\"{FEATURE_SCHEMA}\",\"protocol\":\"eval-packed-v1\",{}",
+            &body[1..]
+        )
+    }
+
     pub fn eval_dump_json(&mut self) -> String {
         self.position_changed();
         self.refresh_dist(0);

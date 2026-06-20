@@ -33,6 +33,7 @@ pub mod fields_viz;
 pub mod game;
 pub mod net;
 pub mod oracle;
+pub mod packed_state;
 pub mod perft;
 pub mod race;
 pub mod reduction_sidecar;
@@ -41,6 +42,10 @@ pub mod session;
 pub mod session_v15;
 
 pub use game::AceGame;
+pub use packed_state::{
+    ace_game_from_packed, decode_packed_state, pack_state, FEATURE_SCHEMA, PACKED_STATE_LEN,
+    POSITION_SCHEMA_VERSION,
+};
 pub use perft::{
     default_timeout, oracle_nodes, perft_ace_ti_timed, perft_ace_timed, perft_engine_timed,
     perft_titanium_timed, TimedPerftResult, ACE_PERFT4_STARTPOS,

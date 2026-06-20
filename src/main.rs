@@ -67,6 +67,7 @@ fn main() {
         "cat" => run_cat(&args),
         "eval" => run_eval(&args),
         "eval-batch" => run_eval_batch(),
+        "eval-packed-batch" => run_eval_packed_batch(),
         "reduction-probe" => run_reduction_probe(&args),
         "reduction-shadow" => run_reduction_shadow(&args),
         "fields" => run_fields(&args),
@@ -110,6 +111,7 @@ fn print_usage() {
     );
     println!("  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare");
     println!("  titanium eval [moves...] [--json]     — HalfPW net eval dump (trainer parity)");
+    println!("  titanium eval-packed-batch            — stdin: u32 row + 24-byte packed state records");
     println!(
         "  titanium fields [moves...] [--check]  — ASCII distance/corridor field grids + invariants"
     );
@@ -156,9 +158,13 @@ fn run_reduction_probe(args: &[String]) {
             _ => i += 1,
         }
     }
-    let Some((result, events)) =
-        titanium::acev13::reduction_counterfactual_probe(&moves, depth, target, limit, min_event_depth)
-    else {
+    let Some((result, events)) = titanium::acev13::reduction_counterfactual_probe(
+        &moves,
+        depth,
+        target,
+        limit,
+        min_event_depth,
+    ) else {
         println!("{{\"schema\":\"reduction-probe-v1\",\"status\":\"terminal\"}}");
         return;
     };
@@ -609,6 +615,43 @@ fn run_eval_batch() {
         }
         let mut s = AceSearch::grafted(g, None);
         println!("{}", s.eval_dump_json());
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Batch eval from canonical packed states — stdin records: u32 LE row index + 24-byte packed state.
+fn run_eval_packed_batch() {
+    use std::io::Read;
+    use titanium::acev13::{ace_game_from_packed, AceSearch, PACKED_STATE_LEN};
+
+    let mut stdin = std::io::stdin().lock();
+    let mut record = [0u8; 4 + PACKED_STATE_LEN];
+    loop {
+        match stdin.read_exact(&mut record) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                eprintln!("eval-packed-batch read error: {e}");
+                std::process::exit(1);
+            }
+        }
+        let row = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        let packed = &record[4..4 + PACKED_STATE_LEN];
+        match ace_game_from_packed(packed) {
+            Ok(g) => {
+                let mut s = AceSearch::grafted(g, None);
+                println!("{}", s.eval_dump_json_packed(row));
+            }
+            Err(err) => {
+                println!(
+                    "{{\"row\":{row},\"ok\":false,\"protocol\":\"eval-packed-v1\",\"error\":\"{}\"}}",
+                    json_escape(&err)
+                );
+            }
+        }
     }
 }
 
