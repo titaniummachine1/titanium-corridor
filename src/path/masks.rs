@@ -1,6 +1,6 @@
 //! Direction bitmasks for bitwise flood fill on the pawn grid.
 
-use crate::acev13::game::AceGame;
+use crate::titanium::game::GameState;
 use crate::core::board::Board;
 use crate::util::grid::{can_step, flood_bit_sq, square_index};
 
@@ -37,8 +37,8 @@ impl DirMasks {
         m
     }
 
-    /// Wall topology in ACE cell order (row 0 = top) — no Board rebuild or row remap.
-    pub fn from_ace_game(g: &AceGame) -> Self {
+    /// Wall topology in Titanium internal cell order (row 0 = top) — no Board rebuild or row remap.
+    pub fn from_ace_game(g: &GameState) -> Self {
         let mut m = Self::default();
         for sq in 0..81usize {
             let bit = flood_bit_sq(sq as u8);

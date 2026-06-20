@@ -23,7 +23,7 @@
 //! built table is optionally re-verified by [`oracle_certify`] (local
 //! consistency of every state proves the whole table).
 
-use crate::acev13::game::AceGame;
+use crate::titanium::game::GameState;
 use std::collections::HashMap;
 
 /// Number of `(p0, p1, turn)` states: 81 × 81 × 2.
@@ -40,7 +40,7 @@ fn state_id(p0: usize, p1: usize, t: usize) -> usize {
 /// `blocked` (wall-edge bitmask per cell). Returns the value table (`ORACLE_STATES`
 /// entries; `+k`/`-k`/`0`).
 pub fn oracle_solve_board(blocked: &[u8; 81]) -> Vec<i16> {
-    let mut og = AceGame::new();
+    let mut og = GameState::new();
     og.blocked = *blocked;
 
     let mut v = vec![0i16; ORACLE_STATES];
@@ -136,7 +136,7 @@ pub fn oracle_solve_board(blocked: &[u8; 81]) -> Vec<i16> {
 /// Verify local consistency of every live state — a passing certificate proves
 /// the whole table. Returns `Err(reason)` on the first inconsistency.
 pub fn oracle_certify(blocked: &[u8; 81], v: &[i16]) -> Result<(), String> {
-    let mut og = AceGame::new();
+    let mut og = GameState::new();
     og.blocked = *blocked;
     let mut buf = [0i16; 16];
 
@@ -268,7 +268,7 @@ impl Oracle {
     /// Solved table for `g`'s wall config (built + cached on first sight).
     /// Panics if a freshly built table fails its consistency certificate —
     /// that would mean the solver itself is wrong, never a runtime input error.
-    fn table(&mut self, g: &AceGame) -> &Vec<i16> {
+    fn table(&mut self, g: &GameState) -> &Vec<i16> {
         let key = (pack_walls(&g.hw), pack_walls(&g.vw));
         if self.map.contains_key(&key) {
             self.hits += 1;
@@ -290,7 +290,7 @@ impl Oracle {
 
     /// Exact verdict for the side to move at `g` (hands MUST be empty):
     /// `+k`/`-k`/`0`.
-    pub fn query(&mut self, g: &AceGame) -> i16 {
+    pub fn query(&mut self, g: &GameState) -> i16 {
         let id = state_id(g.pawn[0], g.pawn[1], g.turn);
         self.table(g)[id]
     }
@@ -299,7 +299,7 @@ impl Oracle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acev13::cert_bridge::ace_from_board;
+    use crate::titanium::cert_bridge::titanium_game_from_board;
     use crate::core::board::{Board, Player};
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
         board.pawns = [(7, 4), (1, 0)];
         board.walls_remaining = [0, 0];
         board.hash = crate::core::zobrist::hash_board(&board);
-        let g = ace_from_board(&board);
+        let g = titanium_game_from_board(&board);
         let mut oracle = Oracle::default();
         assert_eq!(oracle.query(&g), 1, "mate in 1 must be exact +1");
     }
@@ -335,7 +335,7 @@ mod tests {
         board.pawns = [(3, 4), (5, 4)];
         board.walls_remaining = [0, 0];
         board.hash = crate::core::zobrist::hash_board(&board);
-        let g = ace_from_board(&board);
+        let g = titanium_game_from_board(&board);
         let mut oracle = Oracle::default();
         let verdict = oracle.query(&g);
         assert!(

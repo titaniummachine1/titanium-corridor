@@ -6,7 +6,7 @@
 //! win-certificate solver (`certify.rs`), and incremental HalfPW accumulator
 //! onto the gen13 search core.  It is NOT just an ACE port — it is the
 //! Titanium engine, using ACE v13 as its search algorithm foundation.
-//! Session: `run_ace_session_stdio` (warm TT, `go TIME_SEC`).  Optional
+//! Session: `run_titanium_session_stdio` (warm TT, `go TIME_SEC`).  Optional
 //! `run_v15_session_stdio` (infinite search) is compiled but not routed.
 //!
 //! ## ACE v13 reference engines
@@ -41,28 +41,28 @@ pub mod search;
 pub mod session;
 pub mod session_v15;
 
-pub use game::AceGame;
+pub use game::GameState;
 pub use packed_state::{
-    ace_game_from_packed, decode_packed_state, pack_state, FEATURE_SCHEMA, PACKED_STATE_LEN,
+    titanium_game_from_packed, decode_packed_state, pack_state, FEATURE_SCHEMA, PACKED_STATE_LEN,
     POSITION_SCHEMA_VERSION,
 };
 pub use perft::{
-    default_timeout, oracle_nodes, perft_ace_ti_timed, perft_ace_timed, perft_engine_timed,
-    perft_titanium_timed, TimedPerftResult, ACE_PERFT4_STARTPOS,
+    default_timeout, oracle_nodes, perft_titanium_native_timed, perft_titanium_ti_timed,
+    perft_titanium_timed, perft_engine_timed, TimedPerftResult, TITANIUM_PERFT4_STARTPOS,
 };
 pub use search::{
-    board_move_to_ace, AceSearch, ReductionProbeEvent, ReductionShadowStats, ThinkResult,
+    board_move_to_move_id, TitaniumSearch, ReductionProbeEvent, ReductionShadowStats, ThinkResult,
 };
-pub use session::run_ace_session_stdio;
+pub use session::run_titanium_session_stdio;
 pub use session_v15::run_v15_session_stdio;
 
 /// Sentinel — pawn move id `0` is legal (cell a9); do not use `0` for "no move".
-pub const ACE_NO_MOVE: i16 = -1;
+pub const TITANIUM_NO_MOVE: i16 = -1;
 
 use crate::core::board::{Move as BoardMove, WallOrientation};
 
 /// ACE move encoding → Titanium board move (row flip between coordinate systems).
-pub fn ace_move_to_board(m: i16) -> BoardMove {
+pub fn move_id_to_board(m: i16) -> BoardMove {
     if m < 100 {
         BoardMove::Pawn {
             row: 8 - (m / 9) as u8,
@@ -84,7 +84,7 @@ pub fn ace_move_to_board(m: i16) -> BoardMove {
 }
 
 /// Algebraic ("e2", "e3h") → ACE move encoding.
-pub fn algebraic_to_ace(text: &str) -> i16 {
+pub fn algebraic_to_move_id(text: &str) -> i16 {
     let b = text.as_bytes();
     let col = (b[0] - b'a') as i16;
     let row = (b[1] - b'1') as i16;
@@ -101,7 +101,7 @@ pub fn algebraic_to_ace(text: &str) -> i16 {
 }
 
 /// ACE move encoding → algebraic.
-pub fn ace_to_algebraic(m: i16) -> String {
+pub fn move_id_to_algebraic(m: i16) -> String {
     if m < 100 {
         let r = m / 9;
         let c = m % 9;
@@ -116,7 +116,7 @@ pub fn ace_to_algebraic(m: i16) -> String {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct AceParams {
+pub struct TitaniumParams {
     pub time_ms: u64,
     pub max_depth: i32,
     /// Disable the easy-move early stop (search the full time budget).
@@ -131,7 +131,7 @@ pub struct AceParams {
     pub eme: bool,
 }
 
-impl Default for AceParams {
+impl Default for TitaniumParams {
     fn default() -> Self {
         Self {
             time_ms: 4000,
@@ -146,29 +146,29 @@ impl Default for AceParams {
 }
 
 /// CLI entry — plays `moves` (algebraic) from startpos, thinks, returns best move.
-pub fn ace_genmove(
+pub fn titanium_genmove(
     moves: &[String],
-    params: AceParams,
+    params: TitaniumParams,
     engine_label: &str,
 ) -> Option<(String, ThinkResult)> {
-    let mut g = AceGame::new();
+    let mut g = GameState::new();
     for text in moves {
-        g.make_move(algebraic_to_ace(text));
+        g.make_move(algebraic_to_move_id(text));
     }
     if g.winner() >= 0 {
         return None;
     }
     let mut search = match engine_label {
-        "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => AceSearch::grafted(g, None),
-        "titanium-v15-frozen" => AceSearch::grafted_frozen(g, None),
+        "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => TitaniumSearch::grafted(g, None),
+        "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
-            AceSearch::grafted_no_raceproof(g, None)
+            TitaniumSearch::grafted_no_raceproof(g, None)
         }
-        "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
-        _ if params.ti_movegen && params.cat => AceSearch::with_ti_movegen_and_cat(g),
-        _ if params.ti_movegen => AceSearch::with_ti_movegen(g),
-        _ if params.cat => AceSearch::with_cat(g),
-        _ => AceSearch::new(g),
+        "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
+        _ if params.ti_movegen && params.cat => TitaniumSearch::with_ti_movegen_and_cat(g),
+        _ if params.ti_movegen => TitaniumSearch::with_ti_movegen(g),
+        _ if params.cat => TitaniumSearch::with_cat(g),
+        _ => TitaniumSearch::new(g),
     };
     if params.eme {
         search.enable_eme();
@@ -180,13 +180,13 @@ pub fn ace_genmove(
         params.log,
         engine_label,
     );
-    if result.mv == ACE_NO_MOVE {
+    if result.mv == TITANIUM_NO_MOVE {
         return None;
     }
     if result.mv == 0 && search.g.winner() >= 0 {
         return None;
     }
-    Some((ace_to_algebraic(result.mv), result))
+    Some((move_id_to_algebraic(result.mv), result))
 }
 
 /// Offline-only deterministic LMR probe. Each invocation starts from a fresh,
@@ -200,14 +200,14 @@ pub fn reduction_counterfactual_probe(
     event_limit: usize,
     min_event_depth: i32,
 ) -> Option<(ThinkResult, Vec<ReductionProbeEvent>)> {
-    let mut g = AceGame::new();
+    let mut g = GameState::new();
     for text in moves {
-        g.make_move(algebraic_to_ace(text));
+        g.make_move(algebraic_to_move_id(text));
     }
     if g.winner() >= 0 {
         return None;
     }
-    let mut search = AceSearch::grafted(g, Some(18));
+    let mut search = TitaniumSearch::grafted(g, Some(18));
     search.enable_reduction_probe(target_ordinal, event_limit, min_event_depth);
     let result = search.think(3_600_000, depth, true, false, "reduction-probe");
     Some((result, search.reduction_probe_events().to_vec()))
@@ -219,14 +219,14 @@ pub fn reduction_shadow_probe(
     depth: i32,
     sidecar_path: &std::path::Path,
 ) -> Result<(ThinkResult, ReductionShadowStats), String> {
-    let mut g = AceGame::new();
+    let mut g = GameState::new();
     for text in moves {
-        g.make_move(algebraic_to_ace(text));
+        g.make_move(algebraic_to_move_id(text));
     }
     if g.winner() >= 0 {
         return Err("terminal position".into());
     }
-    let mut search = AceSearch::grafted(g, Some(18));
+    let mut search = TitaniumSearch::grafted(g, Some(18));
     search.enable_reduction_shadow(sidecar_path)?;
     let result = search.think(3_600_000, depth, true, false, "reduction-shadow");
     Ok((result, search.reduction_shadow_stats()))
@@ -239,22 +239,22 @@ mod tests {
     #[test]
     fn move_translation_round_trips() {
         // pawn: e1 = our (0,4) = ACE cell 76
-        assert_eq!(algebraic_to_ace("e1"), 76);
-        assert_eq!(ace_to_algebraic(76), "e1");
+        assert_eq!(algebraic_to_move_id("e1"), 76);
+        assert_eq!(move_id_to_algebraic(76), "e1");
         // pawn: e9 = our (8,4) = ACE cell 4
-        assert_eq!(algebraic_to_ace("e9"), 4);
-        assert_eq!(ace_to_algebraic(4), "e9");
+        assert_eq!(algebraic_to_move_id("e9"), 4);
+        assert_eq!(move_id_to_algebraic(4), "e9");
         // wall: d8v = our wall (7,3) = ACE vw slot 3
-        assert_eq!(algebraic_to_ace("d8v"), 203);
-        assert_eq!(ace_to_algebraic(203), "d8v");
+        assert_eq!(algebraic_to_move_id("d8v"), 203);
+        assert_eq!(move_id_to_algebraic(203), "d8v");
         // wall: a1h = our wall (0,0) = ACE hw slot 56
-        assert_eq!(algebraic_to_ace("a1h"), 156);
-        assert_eq!(ace_to_algebraic(156), "a1h");
+        assert_eq!(algebraic_to_move_id("a1h"), 156);
+        assert_eq!(move_id_to_algebraic(156), "a1h");
     }
 
     #[test]
     fn startpos_has_pawn_and_wall_moves() {
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let mut buf = [0i16; 160];
         let n = g.gen_pawn_moves(&mut buf, 0);
         assert_eq!(n, 3);
@@ -272,13 +272,13 @@ mod tests {
 
     #[test]
     fn a8_goal_pawn_encodes_as_zero_not_no_move() {
-        assert_eq!(algebraic_to_ace("a9"), 0);
-        assert_eq!(ace_to_algebraic(0), "a9");
+        assert_eq!(algebraic_to_move_id("a9"), 0);
+        assert_eq!(move_id_to_algebraic(0), "a9");
         let moves: Vec<String> = "e2 e8 e3 e7 e4 e6 d3h d6h f3h f6h d5v h3v e4h h6h h1h e3v d4 c4h b3h f6 c4 g6 f1h g5 b4 h5 d1h h4 b5 b6h c5h h3 a5 g3 b7v f3 a6 g5v a7 b2v a8 f2"
             .split_whitespace()
             .map(String::from)
             .collect();
-        let params = AceParams {
+        let params = TitaniumParams {
             time_ms: 500,
             max_depth: 4,
             full: false,
@@ -287,10 +287,10 @@ mod tests {
             log: false,
             eme: false,
         };
-        let (alg, result) = ace_genmove(&moves, params, "ace-v13-ti").expect("best move");
+        let (alg, result) = titanium_genmove(&moves, params, "ace-v13-ti").expect("best move");
         assert_eq!(alg, "a9");
         assert_eq!(result.mv, 0);
-        assert_ne!(result.mv, ACE_NO_MOVE);
+        assert_ne!(result.mv, TITANIUM_NO_MOVE);
     }
 
     #[test]
@@ -303,13 +303,13 @@ mod tests {
             "e2", "e8", "e3", "e7", "e4", "e6", "d3h", "d6h", "f3h", "f6h", "b3h", "b6h", "h3h",
             "d4v", "a2h",
         ];
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let mut board = Board::new();
         for m in moves {
-            g.make_move(algebraic_to_ace(m));
+            g.make_move(algebraic_to_move_id(m));
             board.apply_algebraic(m);
         }
-        let slot = (algebraic_to_ace("h6h") - 100) as usize;
+        let slot = (algebraic_to_move_id("h6h") - 100) as usize;
         assert!(
             g.wall_legal(0, slot),
             "ACE must accept h6h (off-topology fast path)"
@@ -336,13 +336,13 @@ mod tests {
             "e2", "e8", "e3", "e7", "e4", "e6", "e3h", "e6h", "c3h", "c6h", "g3h", "g6h", "a3h",
             "e4v", "h3v",
         ];
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let mut board = Board::new();
         for m in moves {
-            g.make_move(algebraic_to_ace(m));
+            g.make_move(algebraic_to_move_id(m));
             board.apply_algebraic(m);
         }
-        let slot = (algebraic_to_ace("a6h") - 100) as usize;
+        let slot = (algebraic_to_move_id("a6h") - 100) as usize;
         let row = 7 - (slot / 8) as u8;
         let col = (slot % 8) as u8;
         let ti_legal: Vec<_> = generate_legal_moves(&board)
@@ -405,18 +405,18 @@ mod tests {
             .split_whitespace()
             .map(String::from)
             .collect::<Vec<_>>();
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         for mv in &moves {
-            g.make_move(algebraic_to_ace(mv));
+            g.make_move(algebraic_to_move_id(mv));
         }
-        let mut baseline = AceSearch::grafted(g, Some(18));
+        let mut baseline = TitaniumSearch::grafted(g, Some(18));
         let expected = baseline.think(3_600_000, 4, true, false, "baseline");
 
         let path = std::env::temp_dir().join(format!(
             "titanium-neutral-sidecar-{}.bin",
             std::process::id()
         ));
-        std::fs::write(&path, crate::acev13::reduction_sidecar::neutral_test_blob()).unwrap();
+        std::fs::write(&path, crate::titanium::reduction_sidecar::neutral_test_blob()).unwrap();
         let (actual, stats) = reduction_shadow_probe(&moves, 4, &path).unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(

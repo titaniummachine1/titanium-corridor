@@ -2,20 +2,20 @@
 //! Titanium `core::board::Board` position.
 //!
 //! The certificate solver ([`super::certify::certify`]) is a 1:1 port of
-//! `certify_win.js` and operates on [`AceGame`]. Rather than re-port the
+//! `certify_win.js` and operates on [`GameState`]. Rather than re-port the
 //! soundness-critical AND/OR search onto `Board`, we convert the position into a
-//! throwaway `AceGame` and call the existing, oracle-tested solver. The ONLY new
+//! throwaway `GameState` and call the existing, oracle-tested solver. The ONLY new
 //! trust-sensitive code is the converter below — and it is unit-tested against
-//! `AceGame`'s own winner / distance / legal-move surface for parity.
+//! `GameState`'s own winner / distance / legal-move surface for parity.
 //!
-//! Coordinate mapping (same as `acev13::mod`):
+//! Coordinate mapping (same as `titanium::mod`):
 //!   pawn cell      ace = (8 - row) * 9 + col          (Titanium row 0 = ACE row 8)
 //!   wall ace slot  = (7 - wrow) * 8 + wcol            (Titanium wall bit = wrow*8+wcol)
 //!   player index   identical (One→0, Two→1)
 //!   turn hash term present iff side-to-move == 1 (ACE base hash is turn-0)
 
-use crate::acev13::certify::{certify, CertifyOpts};
-use crate::acev13::game::{AceGame, BORDER, DELTA, DIRBIT, ZOBRIST};
+use crate::titanium::certify::{certify, CertifyOpts};
+use crate::titanium::game::{GameState, BORDER, DELTA, DIRBIT, ZOBRIST};
 use crate::core::board::{Board, Player};
 use crate::util::clock::{Duration, Instant};
 
@@ -25,11 +25,11 @@ fn ace_cell(row: u8, col: u8) -> usize {
     (8 - row as usize) * 9 + col as usize
 }
 
-/// Build a throwaway `AceGame` mirroring `board`'s position, with a correct
+/// Build a throwaway `GameState` mirroring `board`'s position, with a correct
 /// incremental-zobrist base so the solver's memo keys are sound.
-pub fn ace_from_board(board: &Board) -> AceGame {
+pub fn titanium_game_from_board(board: &Board) -> GameState {
     let z = &ZOBRIST;
-    let mut g = AceGame::new();
+    let mut g = GameState::new();
     g.hw = [0u8; 64];
     g.vw = [0u8; 64];
     g.blocked = [0u8; 81];
@@ -99,7 +99,7 @@ pub fn certify_board(
     deadline_ms: u64,
     side: Option<Player>,
 ) -> Option<Player> {
-    let mut g = ace_from_board(board);
+    let mut g = titanium_game_from_board(board);
     let immediate = g.winner();
     if immediate >= 0 {
         let winner = player_from_ace(immediate as usize);
@@ -239,18 +239,18 @@ impl RaceResolver {
 ///
 /// Uses distance-decreasing pawn moves only (existing restricted subgame).
 /// Returns [`RaceProof::Unknown`] on active-path cycle or depth cap — never draw.
-pub fn race_minimax(g: &mut AceGame) -> RaceProof {
+pub fn race_minimax(g: &mut GameState) -> RaceProof {
     race_minimax_with_cap(g, RACE_RESOLVER_DEPTH_CAP)
 }
 
-pub fn race_minimax_with_cap(g: &mut AceGame, depth_cap: u32) -> RaceProof {
+pub fn race_minimax_with_cap(g: &mut GameState, depth_cap: u32) -> RaceProof {
     let mut resolver = RaceResolver::new(depth_cap);
     race_rec(g, &mut resolver)
 }
 
 /// Convenience for callers that need `Option<bool>` (None = decline certification).
 #[inline]
-pub fn race_minimax_stm_wins(g: &mut AceGame) -> Option<bool> {
+pub fn race_minimax_stm_wins(g: &mut GameState) -> Option<bool> {
     match race_minimax(g) {
         RaceProof::Win => Some(true),
         RaceProof::Loss => Some(false),
@@ -258,7 +258,7 @@ pub fn race_minimax_stm_wins(g: &mut AceGame) -> Option<bool> {
     }
 }
 
-fn race_rec(g: &mut AceGame, resolver: &mut RaceResolver) -> RaceProof {
+fn race_rec(g: &mut GameState, resolver: &mut RaceResolver) -> RaceProof {
     let stm = g.turn;
     let pawn = g.pawn[stm];
 
@@ -327,7 +327,7 @@ fn race_rec(g: &mut AceGame, resolver: &mut RaceResolver) -> RaceProof {
 
 /// Walls-only BFS distance from `src` to every cell (255 = unreachable).
 /// Mirror of `compute_dist` but seeded from an arbitrary cell.
-fn bfs_from_cell(g: &AceGame, src: usize) -> [u8; 81] {
+fn bfs_from_cell(g: &GameState, src: usize) -> [u8; 81] {
     let mut out = [255u8; 81];
     out[src] = 0;
     let mut queue = [0i16; 81];
@@ -360,7 +360,7 @@ fn bfs_from_cell(g: &AceGame, src: usize) -> [u8; 81] {
 /// sets are disjoint the pawns never contend for a square → no jump can occur →
 /// the race is a pure parallel tempo race. `d_goal{0,1}` are `compute_dist`
 /// fields (cell→goal); `D{0,1}` are the players' shortest distances.
-fn paths_overlap(g: &AceGame, d_goal0: &[u8; 81], d_goal1: &[u8; 81]) -> bool {
+fn paths_overlap(g: &GameState, d_goal0: &[u8; 81], d_goal1: &[u8; 81]) -> bool {
     let s0 = bfs_from_cell(g, g.pawn[0]);
     let s1 = bfs_from_cell(g, g.pawn[1]);
     let big0 = d_goal0[g.pawn[0]] as u16;
@@ -380,7 +380,7 @@ fn paths_overlap(g: &AceGame, d_goal0: &[u8; 81], d_goal1: &[u8; 81]) -> bool {
 
 /// Classifier + resolver: `Some(stm_wins)` when exact, `None` when certification
 /// must be declined (resolver returned [`RaceProof::Unknown`]).
-pub fn hands_empty_race_stm_wins(g: &mut AceGame) -> Option<bool> {
+pub fn hands_empty_race_stm_wins(g: &mut GameState) -> Option<bool> {
     match hands_empty_race(g) {
         RaceVerdict::Win => Some(true),
         RaceVerdict::Loss => Some(false),
@@ -412,7 +412,7 @@ pub enum RaceVerdict {
 /// * `−1 ≤ adj ≤ 1` with overlapping shortest-path sets: jump may decide →
 ///   [`RaceVerdict::NeedsProof`] (caller runs [`race_minimax`]).
 /// * `−1 ≤ adj ≤ 1` with separated paths: [`separated_pure_race_verdict`].
-pub fn hands_empty_race(g: &AceGame) -> RaceVerdict {
+pub fn hands_empty_race(g: &GameState) -> RaceVerdict {
     let adj = turn_adjusted_tempo_advantage(g);
     if adj >= 2 {
         return if g.turn == 0 {
@@ -444,7 +444,7 @@ pub fn hands_empty_race(g: &AceGame) -> RaceVerdict {
 // ── Turn-adjusted tempo (audit / proposed rule) ───────────────────────────────
 
 /// Wall-graph distances for both players (255 = unreachable).
-pub fn wall_graph_distances(g: &AceGame) -> (u8, u8) {
+pub fn wall_graph_distances(g: &GameState) -> (u8, u8) {
     let mut d0 = [0u8; 81];
     let mut d1 = [0u8; 81];
     g.compute_dist(0, &mut d0);
@@ -456,7 +456,7 @@ pub fn wall_graph_distances(g: &AceGame) -> (u8, u8) {
 ///
 /// `raw = black_distance − white_distance` using wall-graph BFS (ignores pawns).
 /// Adds one tempo when White is to move, subtracts one when Black is to move.
-pub fn turn_adjusted_tempo_advantage(g: &AceGame) -> i32 {
+pub fn turn_adjusted_tempo_advantage(g: &GameState) -> i32 {
     let (white_dist, black_dist) = wall_graph_distances(g);
     if white_dist == 255 || black_dist == 255 {
         return 0;
@@ -471,7 +471,7 @@ pub fn turn_adjusted_tempo_advantage(g: &AceGame) -> i32 {
 
 /// Pure parallel race once pawn interaction is impossible (paths separated).
 /// Equal remaining distances are won by the side to move.
-pub fn separated_pure_race_verdict(g: &AceGame) -> RaceVerdict {
+pub fn separated_pure_race_verdict(g: &GameState) -> RaceVerdict {
     let (white_dist, black_dist) = wall_graph_distances(g);
     if white_dist == 255 || black_dist == 255 {
         return RaceVerdict::NeedsProof;
@@ -489,13 +489,13 @@ pub fn separated_pure_race_verdict(g: &AceGame) -> RaceVerdict {
 }
 
 /// Proposed turn-adjusted classifier — mirrors [`hands_empty_race`] for audit diffs.
-pub fn proposed_hands_empty_race(g: &AceGame) -> RaceVerdict {
+pub fn proposed_hands_empty_race(g: &GameState) -> RaceVerdict {
     hands_empty_race(g)
 }
 
 /// Exact stm win/loss from retrograde oracle value (`+k`/`-k`/`0`).
-pub fn exact_race_verdict(g: &AceGame, oracle_table: &[i16]) -> RaceVerdict {
-    use crate::acev13::oracle::ORACLE_STATES;
+pub fn exact_race_verdict(g: &GameState, oracle_table: &[i16]) -> RaceVerdict {
+    use crate::titanium::oracle::ORACLE_STATES;
     let id = (g.pawn[0] * 81 + g.pawn[1]) * 2 + g.turn;
     assert!(id < ORACLE_STATES);
     match oracle_table[id].cmp(&0) {
@@ -510,21 +510,21 @@ mod tests {
     use super::*;
     use crate::core::board::Board;
 
-    /// The converter must reproduce AceGame's winner / pawn cells / distances
+    /// The converter must reproduce GameState's winner / pawn cells / distances
     /// for the same position reached by replaying moves on both sides.
     #[test]
     fn converter_matches_replayed_acegame() {
-        use crate::acev13::algebraic_to_ace;
+        use crate::titanium::algebraic_to_move_id;
         let line = [
             "e2", "e8", "e3", "e7", "e4", "e6", "d3h", "d6h", "f3h", "f6h",
         ];
         let mut board = Board::new();
-        let mut replayed = AceGame::new();
+        let mut replayed = GameState::new();
         for m in line {
             board.apply_algebraic(m);
-            replayed.make_move(algebraic_to_ace(m));
+            replayed.make_move(algebraic_to_move_id(m));
         }
-        let converted = ace_from_board(&board);
+        let converted = titanium_game_from_board(&board);
         assert_eq!(converted.pawn, replayed.pawn, "pawn cells");
         assert_eq!(converted.wl, replayed.wl, "walls left");
         assert_eq!(converted.turn, replayed.turn, "side to move");
@@ -553,10 +553,10 @@ mod tests {
     #[test]
     fn converter_matches_replay_on_random_positions() {
         // Soundness guard: the converter must reproduce a freshly-replayed
-        // AceGame for ARBITRARY reachable positions, not just one line — a wrong
+        // GameState for ARBITRARY reachable positions, not just one line — a wrong
         // blocked[]/pawn/turn would feed the oracle/certificate a wrong board and
         // make it "prove" a win that isn't real. Fuzz many random legal games.
-        use crate::acev13::algebraic_to_ace;
+        use crate::titanium::algebraic_to_move_id;
         use crate::movegen::generate_legal_moves;
         use crate::util::perft::format_move;
 
@@ -570,7 +570,7 @@ mod tests {
 
         for _ in 0..400 {
             let mut board = Board::new();
-            let mut replayed = AceGame::new();
+            let mut replayed = GameState::new();
             let plies = 4 + (next() % 30) as usize;
             for _ in 0..plies {
                 if board.is_terminal().is_some() {
@@ -583,9 +583,9 @@ mod tests {
                 let mv = moves[(next() as usize) % moves.len()];
                 let alg = format_move(mv);
                 board.apply_move(mv);
-                replayed.make_move(algebraic_to_ace(&alg));
+                replayed.make_move(algebraic_to_move_id(&alg));
             }
-            let converted = ace_from_board(&board);
+            let converted = titanium_game_from_board(&board);
             assert_eq!(converted.pawn, replayed.pawn, "pawn cells");
             assert_eq!(converted.wl, replayed.wl, "walls left");
             assert_eq!(converted.turn, replayed.turn, "side to move");
@@ -625,7 +625,7 @@ mod tests {
                 }
                 for stm in [Player::One, Player::Two] {
                     let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
-                    let mut g = ace_from_board(&board);
+                    let mut g = titanium_game_from_board(&board);
                     let verdict = hands_empty_race(&g);
                     if verdict == RaceVerdict::NeedsProof {
                         volatile += 1;
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn parallel_race_equal_distance_stm_wins() {
         // Different columns ⇒ paths don't overlap; equal distance ⇒ stm wins.
-        let g = ace_from_board(&race_board((3, 1), (5, 7), Player::One));
+        let g = titanium_game_from_board(&race_board((3, 1), (5, 7), Player::One));
         assert_eq!(hands_empty_race(&g), RaceVerdict::Win);
     }
 
@@ -671,14 +671,14 @@ mod tests {
     #[test]
     fn parallel_race_opponent_closer_stm_loses() {
         // Different columns (no overlap); One dist 7, Two dist 6 ⇒ One loses.
-        let g = ace_from_board(&race_board((1, 1), (6, 7), Player::One));
+        let g = titanium_game_from_board(&race_board((1, 1), (6, 7), Player::One));
         assert_eq!(hands_empty_race(&g), RaceVerdict::Loss);
     }
 
     #[test]
     fn same_column_close_race_needs_proof() {
         // Same column ⇒ paths overlap; equal distance (lead ≤1) ⇒ volatile.
-        let g = ace_from_board(&race_board((3, 4), (5, 4), Player::One));
+        let g = titanium_game_from_board(&race_board((3, 4), (5, 4), Player::One));
         assert_eq!(hands_empty_race(&g), RaceVerdict::NeedsProof);
     }
 
@@ -686,7 +686,7 @@ mod tests {
     fn two_tempo_lead_is_deterministic_even_when_overlapping() {
         // Same column (overlap) but One dist 2 vs Two dist 5 ⇒ lead ≥2 absorbs
         // any jump ⇒ deterministic win, no proof.
-        let g = ace_from_board(&race_board((6, 4), (5, 4), Player::One));
+        let g = titanium_game_from_board(&race_board((6, 4), (5, 4), Player::One));
         assert_eq!(hands_empty_race(&g), RaceVerdict::Win);
     }
 
@@ -733,7 +733,7 @@ mod tests {
             return None;
         }
         let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
-        let g = ace_from_board(&board);
+        let g = titanium_game_from_board(&board);
         let id = (p0 * 81 + p1) * 2 + (stm as usize);
         let exact_val = oracle_table[id];
         let exact = match exact_val.cmp(&0) {
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn exhaustive_zero_wall_turn_adjusted_audit() {
-        use crate::acev13::oracle::oracle_solve_board;
+        use crate::titanium::oracle::oracle_solve_board;
 
         let oracle_table = oracle_solve_board(&[0u8; 81]);
         let mut stats = RaceAuditStats::default();
@@ -844,7 +844,7 @@ mod tests {
                 if p0 == p1 {
                     continue;
                 }
-                let g_w = ace_from_board(&race_board(
+                let g_w = titanium_game_from_board(&race_board(
                     board_pos_from_ace(p0),
                     board_pos_from_ace(p1),
                     Player::One,
@@ -853,7 +853,7 @@ mod tests {
                 if bd as i32 - wd as i32 == 1 && turn_adjusted_tempo_advantage(&g_w) == 2 {
                     plus_one_white_stm = Some((p0, p1));
                 }
-                let g_b = ace_from_board(&race_board(
+                let g_b = titanium_game_from_board(&race_board(
                     board_pos_from_ace(p0),
                     board_pos_from_ace(p1),
                     Player::Two,
@@ -864,7 +864,7 @@ mod tests {
             }
         }
         let (p0, p1) = plus_one_white_stm.expect("white +1 lead example");
-        let g = ace_from_board(&race_board(
+        let g = titanium_game_from_board(&race_board(
             board_pos_from_ace(p0),
             board_pos_from_ace(p1),
             Player::One,
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(hands_empty_race(&g), RaceVerdict::Win);
 
         let (p0, p1) = plus_one_black_stm.expect("white +1 lead black-to-move example");
-        let g = ace_from_board(&race_board(
+        let g = titanium_game_from_board(&race_board(
             board_pos_from_ace(p0),
             board_pos_from_ace(p1),
             Player::Two,
@@ -882,24 +882,24 @@ mod tests {
         assert_eq!(hands_empty_race(&g), RaceVerdict::NeedsProof);
 
         // Equal distance, White to move → adj=1 → resolve (same column overlaps).
-        let g = ace_from_board(&race_board((3, 4), (5, 4), Player::One));
+        let g = titanium_game_from_board(&race_board((3, 4), (5, 4), Player::One));
         assert_eq!(turn_adjusted_tempo_advantage(&g), 1);
         assert_eq!(hands_empty_race(&g), RaceVerdict::NeedsProof);
 
         // Equal distance, Black to move → adj=-1 → resolve.
-        let g = ace_from_board(&race_board((3, 4), (5, 4), Player::Two));
+        let g = titanium_game_from_board(&race_board((3, 4), (5, 4), Player::Two));
         assert_eq!(turn_adjusted_tempo_advantage(&g), -1);
         assert_eq!(hands_empty_race(&g), RaceVerdict::NeedsProof);
 
         // Equal distance, separated paths, White to move → pure race win.
-        let g = ace_from_board(&race_board((3, 1), (5, 7), Player::One));
+        let g = titanium_game_from_board(&race_board((3, 1), (5, 7), Player::One));
         assert_eq!(turn_adjusted_tempo_advantage(&g), 1);
         assert_eq!(hands_empty_race(&g), RaceVerdict::Win);
     }
 
     #[test]
     fn separated_pure_race_matches_oracle_when_no_overlap() {
-        use crate::acev13::oracle::oracle_solve_board;
+        use crate::titanium::oracle::oracle_solve_board;
         let oracle_table = oracle_solve_board(&[0u8; 81]);
         for p0 in 9..81 {
             for p1 in 0..72 {
@@ -908,7 +908,7 @@ mod tests {
                 }
                 for stm in [Player::One, Player::Two] {
                     let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
-                    let g = ace_from_board(&board);
+                    let g = titanium_game_from_board(&board);
                     let mut d0 = [0u8; 81];
                     let mut d1 = [0u8; 81];
                     g.compute_dist(0, &mut d0);
@@ -937,7 +937,7 @@ mod tests {
 
     #[test]
     fn benchmark_extension_avoidance_vs_current() {
-        use crate::acev13::oracle::oracle_solve_board;
+        use crate::titanium::oracle::oracle_solve_board;
         let oracle_table = oracle_solve_board(&[0u8; 81]);
         let mut stats = RaceAuditStats::default();
         for p0 in 9..81 {
@@ -1022,7 +1022,7 @@ mod tests {
     #[test]
     fn race_depth_cap_returns_unknown() {
         let board = race_board((3, 4), (5, 4), Player::One);
-        let mut g = ace_from_board(&board);
+        let mut g = titanium_game_from_board(&board);
         assert_eq!(
             race_minimax_with_cap(&mut g, 0),
             RaceProof::Unknown,
@@ -1040,7 +1040,7 @@ mod tests {
                 }
                 for stm in [Player::One, Player::Two] {
                     let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
-                    let mut g = ace_from_board(&board);
+                    let mut g = titanium_game_from_board(&board);
                     if hands_empty_race(&g) != RaceVerdict::NeedsProof {
                         continue;
                     }
@@ -1054,7 +1054,7 @@ mod tests {
         assert!(max_depth > 0);
     }
 
-    fn measure_race_depth(g: &mut AceGame, resolver: &mut RaceResolver) -> u32 {
+    fn measure_race_depth(g: &mut GameState, resolver: &mut RaceResolver) -> u32 {
         let saved_cap = resolver.depth_cap;
         resolver.depth_cap = u32::MAX / 2;
         let d = race_rec_depth_only(g, resolver, 0);
@@ -1062,7 +1062,7 @@ mod tests {
         d
     }
 
-    fn race_rec_depth_only(g: &mut AceGame, resolver: &mut RaceResolver, cur: u32) -> u32 {
+    fn race_rec_depth_only(g: &mut GameState, resolver: &mut RaceResolver, cur: u32) -> u32 {
         let stm = g.turn;
         let pawn = g.pawn[stm];
         if (stm == 0 && pawn < 9) || (stm == 1 && pawn >= 72) {
@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     /// Pre-528d20b raw-tempo classifier (for regression counting only).
-    fn old_raw_tempo_race(g: &AceGame) -> RaceVerdict {
+    fn old_raw_tempo_race(g: &GameState) -> RaceVerdict {
         let mut d0 = [0u8; 81];
         let mut d1 = [0u8; 81];
         g.compute_dist(0, &mut d0);
@@ -1133,7 +1133,7 @@ mod tests {
                     continue;
                 }
                 for stm in [Player::One, Player::Two] {
-                    let g = ace_from_board(&race_board(
+                    let g = titanium_game_from_board(&race_board(
                         board_pos_from_ace(p0),
                         board_pos_from_ace(p1),
                         stm,
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn exhaustive_resolver_audit_no_false_certificates() {
-        use crate::acev13::oracle::oracle_solve_board;
+        use crate::titanium::oracle::oracle_solve_board;
         let oracle_table = oracle_solve_board(&[0u8; 81]);
         let mut audit = ExhaustiveResolverAudit::default();
 
@@ -1176,7 +1176,7 @@ mod tests {
                 }
                 for stm in [Player::One, Player::Two] {
                     let board = race_board(board_pos_from_ace(p0), board_pos_from_ace(p1), stm);
-                    let mut g = ace_from_board(&board);
+                    let mut g = titanium_game_from_board(&board);
                     let id = (p0 * 81 + p1) * 2 + (stm as usize);
                     let exact_val = oracle_table[id];
                     let classifier = hands_empty_race(&g);

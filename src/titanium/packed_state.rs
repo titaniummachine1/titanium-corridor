@@ -2,7 +2,7 @@
 //! Byte layout matches `training/titanium_training/store/state.py` and
 //! `tools/position_store_importer/src/position_state.rs`.
 
-use crate::acev13::game::{AceGame, ZOBRIST};
+use crate::titanium::game::{GameState, ZOBRIST};
 
 pub const POSITION_SCHEMA_VERSION: u8 = 1;
 pub const PACKED_STATE_LEN: usize = 24;
@@ -64,7 +64,7 @@ pub fn decode_packed_state(data: &[u8]) -> Result<PackedFields, String> {
     })
 }
 
-pub fn pack_state(g: &AceGame) -> [u8; PACKED_STATE_LEN] {
+pub fn pack_state(g: &GameState) -> [u8; PACKED_STATE_LEN] {
     let mut hw_mask: u64 = 0;
     let mut vw_mask: u64 = 0;
     for slot in 0..64 {
@@ -87,7 +87,7 @@ pub fn pack_state(g: &AceGame) -> [u8; PACKED_STATE_LEN] {
     out
 }
 
-fn recompute_hash(g: &mut AceGame) {
+fn recompute_hash(g: &mut GameState) {
     let z = &ZOBRIST;
     let mut lo = z.pawn_lo[0][g.pawn[0]] ^ z.pawn_lo[1][g.pawn[1]];
     let mut hi = z.pawn_hi[0][g.pawn[0]] ^ z.pawn_hi[1][g.pawn[1]];
@@ -109,10 +109,10 @@ fn recompute_hash(g: &mut AceGame) {
     g.hash_hi = hi;
 }
 
-pub fn ace_game_from_packed(data: &[u8]) -> Result<AceGame, String> {
+pub fn titanium_game_from_packed(data: &[u8]) -> Result<GameState, String> {
     let fields = decode_packed_state(data)?;
-    let mut g = AceGame::new();
-    // Python player0 races to row 8 (Ace pawn[1]); Python player1 races to row 0 (Ace pawn[0]).
+    let mut g = GameState::new();
+    // Dataset player0 → Titanium internal pawn[1]; dataset player1 → pawn[0].
     g.pawn[0] = fields.player1_cell as usize;
     g.pawn[1] = fields.player0_cell as usize;
     g.wl[0] = fields.player1_walls as i32;
@@ -140,21 +140,21 @@ pub fn ace_game_from_packed(data: &[u8]) -> Result<AceGame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acev13::{algebraic_to_ace, AceGame};
+    use crate::titanium::{algebraic_to_move_id, GameState};
 
-    fn game_from_moves(moves: &[&str]) -> AceGame {
-        let mut g = AceGame::new();
+    fn game_from_moves(moves: &[&str]) -> GameState {
+        let mut g = GameState::new();
         for mv in moves {
-            g.make_move(algebraic_to_ace(mv));
+            g.make_move(algebraic_to_move_id(mv));
         }
         g
     }
 
     #[test]
     fn pack_round_trip_startpos() {
-        let g = AceGame::new();
+        let g = GameState::new();
         let packed = pack_state(&g);
-        let g2 = ace_game_from_packed(&packed).unwrap();
+        let g2 = titanium_game_from_packed(&packed).unwrap();
         assert_eq!(g.pawn, g2.pawn);
         assert_eq!(g.wl, g2.wl);
         assert_eq!(g.turn, g2.turn);
@@ -173,7 +173,7 @@ mod tests {
         for moves in cases {
             let g = game_from_moves(moves);
             let packed = pack_state(&g);
-            let g2 = ace_game_from_packed(&packed).unwrap();
+            let g2 = titanium_game_from_packed(&packed).unwrap();
             assert_eq!(g.pawn, g2.pawn, "moves={moves:?}");
             assert_eq!(g.hw, g2.hw, "moves={moves:?}");
             assert_eq!(g.vw, g2.vw, "moves={moves:?}");
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn rejects_bad_version_and_length() {
         assert!(decode_packed_state(&[0u8; 8]).is_err());
-        let mut bad = pack_state(&AceGame::new());
+        let mut bad = pack_state(&GameState::new());
         bad[0] = 2;
         assert!(decode_packed_state(&bad).is_err());
     }
@@ -197,7 +197,7 @@ mod tests {
         let g2 = game_from_moves(&["e2", "e8", "e3"]);
         let packed2 = pack_state(&g2);
         assert_eq!(packed2[5], 1);
-        let restored = ace_game_from_packed(&packed2).unwrap();
+        let restored = titanium_game_from_packed(&packed2).unwrap();
         assert_eq!(restored.turn, 1);
     }
 }

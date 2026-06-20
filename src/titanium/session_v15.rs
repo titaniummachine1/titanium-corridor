@@ -25,13 +25,13 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use super::{ace_to_algebraic, algebraic_to_ace, AceGame, AceSearch, ACE_NO_MOVE};
+use super::{move_id_to_algebraic, algebraic_to_move_id, GameState, TitaniumSearch, TITANIUM_NO_MOVE};
 
 // ── Inter-thread messages ─────────────────────────────────────────────────────
 
 enum Cmd {
     /// Replace the engine position (no I/O reply needed — I/O thread handles "ready").
-    SetGame(AceGame),
+    SetGame(GameState),
     /// Timed search: think for `time_ms` and reply BestMove.
     GoTimed(u64),
     /// Start pondering on the current position (pre-apply `ponder_mv` if given).
@@ -42,7 +42,7 @@ enum Cmd {
     PonderHit(u64),
     /// Ponder was wrong: reset to `new_game` then think for `time_ms`.
     MoveMiss {
-        new_game: AceGame,
+        new_game: GameState,
         time_ms: u64,
     },
     Quit,
@@ -55,15 +55,15 @@ enum Reply {
 
 // ── Search daemon ─────────────────────────────────────────────────────────────
 
-fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
+fn build_search(engine_flag: &str, g: GameState) -> Box<TitaniumSearch> {
     let mut search = match engine_flag {
-        "ace-v13-pure" => AceSearch::new(g),
-        "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
-        "titanium-v15-frozen" => AceSearch::grafted_frozen(g, None),
+        "ace-v13-pure" => TitaniumSearch::new(g),
+        "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
+        "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
-            AceSearch::grafted_no_raceproof(g, None)
+            TitaniumSearch::grafted_no_raceproof(g, None)
         }
-        _ => AceSearch::grafted(g, None),
+        _ => TitaniumSearch::grafted(g, None),
     };
     if engine_flag.contains("pmc") {
         search.enable_eme();
@@ -72,7 +72,7 @@ fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
 }
 
 fn search_daemon(engine_flag: String, rx: Receiver<Cmd>, tx: Sender<Reply>) {
-    let mut search = build_search(&engine_flag, AceGame::new());
+    let mut search = build_search(&engine_flag, GameState::new());
     let mut last_score: i32 = 0;
     let label = engine_flag.as_str();
 
@@ -91,17 +91,17 @@ fn search_daemon(engine_flag: String, rx: Receiver<Cmd>, tx: Sender<Reply>) {
                 let _ = tx.send(Reply::BestMove(r.mv));
             }
             Cmd::GoInfinite(ponder_mv) => {
-                if ponder_mv != ACE_NO_MOVE {
+                if ponder_mv != TITANIUM_NO_MOVE {
                     search.apply_move(ponder_mv);
                 }
                 // Ponder mode: tt_gen and history are frozen across all chunks
                 // so the TT entries built during pondering stay fresh and history
                 // accumulates. Cleared to false before every real think() call.
                 search.set_pondering(true);
-                let mut last_mv = ACE_NO_MOVE;
+                let mut last_mv = TITANIUM_NO_MOVE;
                 loop {
                     let r = search.think(100, 30, false, false, label);
-                    if r.mv != ACE_NO_MOVE {
+                    if r.mv != TITANIUM_NO_MOVE {
                         last_mv = r.mv;
                         last_score = r.score;
                     }
@@ -134,7 +134,7 @@ fn search_daemon(engine_flag: String, rx: Receiver<Cmd>, tx: Sender<Reply>) {
                         Ok(Cmd::SetGame(g)) => {
                             // Position update mid-ponder — restart.
                             search.set_position(g);
-                            last_mv = ACE_NO_MOVE;
+                            last_mv = TITANIUM_NO_MOVE;
                         }
                         Ok(_) | Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -142,7 +142,7 @@ fn search_daemon(engine_flag: String, rx: Receiver<Cmd>, tx: Sender<Reply>) {
             }
             Cmd::StopAndGet => {
                 // Not pondering — nothing to return.
-                let _ = tx.send(Reply::BestMove(ACE_NO_MOVE));
+                let _ = tx.send(Reply::BestMove(TITANIUM_NO_MOVE));
             }
             Cmd::PonderHit(time_ms) => {
                 let r = search.think(time_ms, 30, false, true, label);
@@ -173,9 +173,9 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
     let mut stdout = io::stdout();
     let mut applied: Vec<String> = Vec::new();
     // Track game state in I/O thread for position management.
-    let mut current_g = AceGame::new();
-    // Move the engine was asked to ponder on (ACE_NO_MOVE if none).
-    let mut ponder_mv: i16 = ACE_NO_MOVE;
+    let mut current_g = GameState::new();
+    // Move the engine was asked to ponder on (TITANIUM_NO_MOVE if none).
+    let mut ponder_mv: i16 = TITANIUM_NO_MOVE;
 
     macro_rules! ok {
         ($msg:expr) => {{
@@ -190,13 +190,13 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
         }};
     }
 
-    fn replay_moves(moves: &[String]) -> Result<AceGame, String> {
-        let mut g = AceGame::new();
+    fn replay_moves(moves: &[String]) -> Result<GameState, String> {
+        let mut g = GameState::new();
         for text in moves {
             if g.winner() >= 0 {
                 return Err(format!("move {text} past terminal position"));
             }
-            g.make_move(algebraic_to_ace(text));
+            g.make_move(algebraic_to_move_id(text));
         }
         Ok(g)
     }
@@ -217,10 +217,10 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
 
         match parts[0] {
             "reset" => {
-                current_g = AceGame::new();
+                current_g = GameState::new();
                 applied.clear();
-                ponder_mv = ACE_NO_MOVE;
-                let _ = cmd_tx.send(Cmd::SetGame(AceGame::new()));
+                ponder_mv = TITANIUM_NO_MOVE;
+                let _ = cmd_tx.send(Cmd::SetGame(GameState::new()));
                 ok!("ready");
             }
             "position" => {
@@ -243,7 +243,7 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                             err = Some(format!("move {text} past terminal position"));
                             break;
                         }
-                        current_g.make_move(algebraic_to_ace(text));
+                        current_g.make_move(algebraic_to_move_id(text));
                     }
                     if let Some(msg) = err {
                         err!(msg);
@@ -264,7 +264,7 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     }
                 }
                 applied = moves;
-                ponder_mv = ACE_NO_MOVE;
+                ponder_mv = TITANIUM_NO_MOVE;
                 let _ = writeln!(stdout, "ready {}", applied.len());
                 let _ = stdout.flush();
             }
@@ -277,10 +277,10 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     err!("terminal position");
                     continue;
                 }
-                let mv = algebraic_to_ace(mv_str);
+                let mv = algebraic_to_move_id(mv_str);
                 current_g.make_move(mv);
                 applied.push((*mv_str).to_string());
-                ponder_mv = ACE_NO_MOVE;
+                ponder_mv = TITANIUM_NO_MOVE;
                 let _ = cmd_tx.send(Cmd::SetGame(current_g.clone()));
                 ok!("ready");
             }
@@ -294,9 +294,9 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     // go infinite [PONDER_MOVE]
                     let pm_str = parts.get(2).copied().unwrap_or("");
                     ponder_mv = if pm_str.is_empty() {
-                        ACE_NO_MOVE
+                        TITANIUM_NO_MOVE
                     } else {
-                        algebraic_to_ace(pm_str)
+                        algebraic_to_move_id(pm_str)
                     };
                     let _ = cmd_tx.send(Cmd::GoInfinite(ponder_mv));
                     // No reply expected — daemon starts pondering.
@@ -306,10 +306,10 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     let _ = cmd_tx.send(Cmd::GoTimed(time_ms));
                     match reply_rx.recv() {
                         Ok(Reply::BestMove(mv)) => {
-                            if mv == ACE_NO_MOVE {
+                            if mv == TITANIUM_NO_MOVE {
                                 ok!("bestmove (none)");
                             } else {
-                                ok!(format!("bestmove {}", ace_to_algebraic(mv)));
+                                ok!(format!("bestmove {}", move_id_to_algebraic(mv)));
                             }
                         }
                         Ok(Reply::Error(msg)) => err!(msg),
@@ -321,10 +321,10 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                 let _ = cmd_tx.send(Cmd::StopAndGet);
                 match reply_rx.recv() {
                     Ok(Reply::BestMove(mv)) => {
-                        if mv == ACE_NO_MOVE {
+                        if mv == TITANIUM_NO_MOVE {
                             ok!("bestmove (none)");
                         } else {
-                            ok!(format!("bestmove {}", ace_to_algebraic(mv)));
+                            ok!(format!("bestmove {}", move_id_to_algebraic(mv)));
                         }
                     }
                     Ok(Reply::Error(msg)) => err!(msg),
@@ -339,20 +339,20 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     .map(|s| (s * 1000.0).max(1.0) as u64)
                     .unwrap_or(5000);
                 // Update I/O position: the ponder move was played.
-                if ponder_mv != ACE_NO_MOVE {
+                if ponder_mv != TITANIUM_NO_MOVE {
                     if current_g.winner() < 0 {
                         current_g.make_move(ponder_mv);
-                        applied.push(ace_to_algebraic(ponder_mv));
+                        applied.push(move_id_to_algebraic(ponder_mv));
                     }
-                    ponder_mv = ACE_NO_MOVE;
+                    ponder_mv = TITANIUM_NO_MOVE;
                 }
                 let _ = cmd_tx.send(Cmd::PonderHit(time_ms));
                 match reply_rx.recv() {
                     Ok(Reply::BestMove(mv)) => {
-                        if mv == ACE_NO_MOVE {
+                        if mv == TITANIUM_NO_MOVE {
                             ok!("bestmove (none)");
                         } else {
-                            ok!(format!("bestmove {}", ace_to_algebraic(mv)));
+                            ok!(format!("bestmove {}", move_id_to_algebraic(mv)));
                         }
                     }
                     Ok(Reply::Error(msg)) => err!(msg),
@@ -372,20 +372,20 @@ pub fn run_v15_session_stdio(engine_flag: &str) {
                     .unwrap_or(5000);
                 // Rewind to pre-ponder position, then apply actual move.
                 // We do this by replaying applied (which doesn't include ponder_mv).
-                let actual_mv = algebraic_to_ace(mv_str);
+                let actual_mv = algebraic_to_move_id(mv_str);
                 if current_g.winner() < 0 {
                     current_g.make_move(actual_mv);
                     applied.push((*mv_str).to_string());
                 }
-                ponder_mv = ACE_NO_MOVE;
+                ponder_mv = TITANIUM_NO_MOVE;
                 let new_game = current_g.clone();
                 let _ = cmd_tx.send(Cmd::MoveMiss { new_game, time_ms });
                 match reply_rx.recv() {
                     Ok(Reply::BestMove(mv)) => {
-                        if mv == ACE_NO_MOVE {
+                        if mv == TITANIUM_NO_MOVE {
                             ok!("bestmove (none)");
                         } else {
-                            ok!(format!("bestmove {}", ace_to_algebraic(mv)));
+                            ok!(format!("bestmove {}", move_id_to_algebraic(mv)));
                         }
                     }
                     Ok(Reply::Error(msg)) => err!(msg),

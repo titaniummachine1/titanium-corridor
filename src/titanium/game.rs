@@ -93,7 +93,7 @@ pub static BORDER: [u8; 81] = build_border();
 // ── Game state ────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct AceGame {
+pub struct GameState {
     pub pawn: [usize; 2],
     pub wl: [i32; 2],
     pub turn: usize,
@@ -115,13 +115,13 @@ pub struct AceGame {
     seen: [u8; 81],
 }
 
-impl Default for AceGame {
+impl Default for GameState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AceGame {
+impl GameState {
     pub fn new() -> Self {
         let z = &ZOBRIST;
         Self {

@@ -4,7 +4,7 @@
 //! — no Titanium `Board` rebuild and no row-flip remap. Each layer is one
 //! `expand_frontier` u128 step (same binary / bitboard flood family as CAT / movegen `pbff_*`).
 
-use crate::acev13::game::AceGame;
+use crate::titanium::game::GameState;
 use crate::path::flood::expand_frontier;
 use crate::path::masks::DirMasks;
 use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, square_index, FLOOD_PLAYABLE};
@@ -55,7 +55,7 @@ fn flood_scatter(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
 }
 
 /// Inverse flood: distance from each cell to `player`'s goal row (ACE index).
-pub fn fill_ace_dist_to_goal(g: &AceGame, player: usize, ace_dist: &mut [u8; 81]) {
+pub fn fill_ace_dist_to_goal(g: &GameState, player: usize, ace_dist: &mut [u8; 81]) {
     let masks = DirMasks::from_ace_game(g);
     fill_ace_dist_to_goal_with_masks(player, masks, ace_dist);
 }
@@ -73,7 +73,7 @@ pub fn fill_ace_dist_to_goal_with_masks(player: usize, masks: DirMasks, ace_dist
 }
 
 /// Forward flood: steps from `ace_start` pawn square (ACE index).
-pub fn fill_ace_dist_from_pawn(g: &AceGame, ace_start: usize, ace_dist: &mut [u8; 81]) {
+pub fn fill_ace_dist_from_pawn(g: &GameState, ace_start: usize, ace_dist: &mut [u8; 81]) {
     let masks = DirMasks::from_ace_game(g);
     flood_scatter(flood_bit_sq(ace_start as u8), masks, ace_dist);
 }
@@ -150,7 +150,7 @@ pub fn shortest_route_bits(
 /// support (the grid's +2-tempo alternatives). No forward distance scatter is
 /// needed, which keeps this suitable for every leaf evaluation.
 pub fn fill_sparse_route_masks(
-    g: &AceGame,
+    g: &GameState,
     pawn: usize,
     to_goal: &[u8; 81],
     route: &mut [u8; 81],
@@ -247,7 +247,7 @@ pub const CROSS_DELTA_MAX: u8 = 1;
 /// Number of shortest / near-shortest routes through each cell (path overlap hot-spot).
 /// Reuses existing distance fields + one O(81) DP — no extra flood.
 pub fn fill_path_crossing(
-    g: &AceGame,
+    g: &GameState,
     dist_from: &[u8; 81],
     dist_to: &[u8; 81],
     shortest: u8,
@@ -339,7 +339,7 @@ pub fn fill_contested(
 /// Route forcedness per cell: local branching factor `1/(1+forward_continuations)`.
 /// Stored u8 is `round(16 × value)`; eval divides by 16 (0 cont → 16/16 = 1.0, 1 → 8/16 = 0.5, …).
 pub fn fill_choke_points(
-    g: &AceGame,
+    g: &GameState,
     dist_from: &[u8; 81],
     dist_to: &[u8; 81],
     shortest: u8,
@@ -363,7 +363,7 @@ pub fn fill_choke_points(
 
 /// Convenience: all NNUE geometry fields for one player.
 pub fn fill_player_geometry(
-    g: &AceGame,
+    g: &GameState,
     player: usize,
     goal_field: &mut [u8; 81],
     pawn_field: &mut [u8; 81],
@@ -380,12 +380,12 @@ pub fn fill_player_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acev13::algebraic_to_ace;
+    use crate::titanium::algebraic_to_move_id;
 
-    fn pos(moves: &[&str]) -> AceGame {
-        let mut g = AceGame::new();
+    fn pos(moves: &[&str]) -> GameState {
+        let mut g = GameState::new();
         for m in moves {
-            g.make_move(algebraic_to_ace(m));
+            g.make_move(algebraic_to_move_id(m));
         }
         g
     }
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn ace_flood_matches_queue_bfs() {
         for g in [
-            AceGame::new(),
+            GameState::new(),
             pos(&["e2", "e8", "e3", "e7", "d3h", "f5v"]),
             pos(&["e2", "e8", "e3", "e7", "d4h"]),
         ] {
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn shared_masks_match_independent_goal_floods() {
-        for g in [AceGame::new(), pos(&["e2", "e8", "e3", "e7", "d3h", "f5v"])] {
+        for g in [GameState::new(), pos(&["e2", "e8", "e3", "e7", "d3h", "f5v"])] {
             let masks = DirMasks::from_ace_game(&g);
             for player in [0usize, 1] {
                 let mut independent = [0u8; 81];
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn path_crossing_positive_on_open_corridor() {
-        let g = AceGame::new();
+        let g = GameState::new();
         let mut goal = [0u8; 81];
         let mut from = [0u8; 81];
         fill_ace_dist_to_goal(&g, 0, &mut goal);
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn sparse_route_masks_partition_short_and_plus_one_cells() {
-        let g = AceGame::new();
+        let g = GameState::new();
         let mut goal = [0u8; 81];
         let mut from = [0u8; 81];
         fill_ace_dist_to_goal(&g, 0, &mut goal);
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn contested_on_shared_shortest_cells() {
-        let g = AceGame::new();
+        let g = GameState::new();
         let mut goal0 = [0u8; 81];
         let mut goal1 = [0u8; 81];
         let mut from0 = [0u8; 81];

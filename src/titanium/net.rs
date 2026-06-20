@@ -93,9 +93,8 @@ pub fn net() -> &'static Net {
     static NET: OnceLock<Net> = OnceLock::new();
     NET.get_or_init(|| {
         if let Ok(path) = std::env::var("TITANIUM_NET_WEIGHTS_PATH") {
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-                panic!("TITANIUM_NET_WEIGHTS_PATH read failed ({path}): {e}")
-            });
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("TITANIUM_NET_WEIGHTS_PATH read failed ({path}): {e}"));
             load_net_from_bytes(&bytes)
         } else {
             load_net_from_bytes(NET_BYTES)

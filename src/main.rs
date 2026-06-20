@@ -78,7 +78,7 @@ fn main() {
         "session" => match ace_engine_flag(&args) {
             // v15 uses the standard warm session (go TIME_SEC). session_v15 infinite
             // search is kept in-tree but disabled — it regressed vs ti-pure baseline.
-            Some(flag) if uses_acev13_module(flag) => titanium::acev13::run_ace_session_stdio(flag),
+            Some(flag) if uses_titanium_module(flag) => titanium::run_titanium_session_stdio(flag),
             Some(flag) => titanium::ace::run_ace_session_stdio(flag),
             None => run_session_stdio(),
         },
@@ -111,7 +111,9 @@ fn print_usage() {
     );
     println!("  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare");
     println!("  titanium eval [moves...] [--json]     — HalfPW net eval dump (trainer parity)");
-    println!("  titanium eval-packed-batch            — stdin: u32 row + 24-byte packed state records");
+    println!(
+        "  titanium eval-packed-batch            — stdin: u32 row + 24-byte packed state records"
+    );
     println!(
         "  titanium fields [moves...] [--check]  — ASCII distance/corridor field grids + invariants"
     );
@@ -158,13 +160,9 @@ fn run_reduction_probe(args: &[String]) {
             _ => i += 1,
         }
     }
-    let Some((result, events)) = titanium::acev13::reduction_counterfactual_probe(
-        &moves,
-        depth,
-        target,
-        limit,
-        min_event_depth,
-    ) else {
+    let Some((result, events)) =
+        titanium::reduction_counterfactual_probe(&moves, depth, target, limit, min_event_depth)
+    else {
         println!("{{\"schema\":\"reduction-probe-v1\",\"status\":\"terminal\"}}");
         return;
     };
@@ -179,7 +177,7 @@ fn run_reduction_probe(args: &[String]) {
             "{{\"schema\":\"reduction-probe-event-v1\",\"ordinal\":{},\"parent_hash\":\"{:08x}{:08x}\",\"child_hash\":\"{:08x}{:08x}\",\"move\":\"{}\",\"depth\":{},\"ply\":{},\"alpha\":{},\"beta\":{},\"move_index\":{},\"base_reduction\":{},\"extra_reduction\":{},\"verification_triggered\":{},\"score\":{},\"nodes\":{},\"total_legal_moves\":{},\"history_score\":{},\"hidden\":[{}]}}",
             event.ordinal, event.parent_hash_hi, event.parent_hash_lo,
             event.child_hash_hi, event.child_hash_lo,
-            titanium::acev13::ace_to_algebraic(event.mv), event.depth, event.ply,
+            titanium::move_id_to_algebraic(event.mv), event.depth, event.ply,
             event.alpha, event.beta, event.move_index, event.base_reduction,
             event.applied_extra_reduction, event.verification_triggered,
             event.score, event.nodes, event.total_legal_moves, event.history_score, hidden,
@@ -188,7 +186,7 @@ fn run_reduction_probe(args: &[String]) {
     println!(
         "{{\"schema\":\"reduction-probe-root-v1\",\"target\":{},\"bestmove\":\"{}\",\"score\":{},\"depth\":{},\"nodes\":{},\"elapsed_ms\":{}}}",
         target.map_or_else(|| "null".to_string(), |v| v.to_string()),
-        titanium::acev13::ace_to_algebraic(result.mv), result.score, result.depth, result.nodes,
+        titanium::move_id_to_algebraic(result.mv), result.score, result.depth, result.nodes,
         result.ms,
     );
 }
@@ -222,10 +220,10 @@ fn run_reduction_shadow(args: &[String]) {
         eprintln!("reduction-shadow requires --sidecar PATH");
         return;
     };
-    match titanium::acev13::reduction_shadow_probe(&moves, depth, &sidecar) {
+    match titanium::reduction_shadow_probe(&moves, depth, &sidecar) {
         Ok((result, stats)) => println!(
             "{{\"schema\":\"reduction-shadow-v1\",\"runtime_changed\":false,\"bestmove\":\"{}\",\"score\":{},\"depth\":{},\"nodes\":{},\"elapsed_ms\":{},\"evaluations\":{},\"hypothetical_activations\":{},\"inference_nanos\":{}}}",
-            titanium::acev13::ace_to_algebraic(result.mv), result.score, result.depth,
+            titanium::move_id_to_algebraic(result.mv), result.score, result.depth,
             result.nodes, result.ms, stats.evaluations, stats.hypothetical_activations,
             stats.inference_nanos,
         ),
@@ -545,19 +543,19 @@ fn run_cat(args: &[String]) {
     println!("{}", cat_snapshot_json(&mut board));
 }
 
-/// Dump the acev13 (grafted) net evaluation for a position — used to verify the
+/// Dump the Titanium v15 (grafted) net evaluation for a position — used to verify the
 /// Python NNUE trainer's forward pass matches the engine bit-for-bit. On mid-game
 /// positions (both sides hold walls, not near mate) this is the pure net output.
 fn run_eval(args: &[String]) {
-    use titanium::acev13::{algebraic_to_ace, AceGame, AceSearch};
-    let mut g = AceGame::new();
+    use titanium::{algebraic_to_move_id, GameState, TitaniumSearch};
+    let mut g = GameState::new();
     for a in args.iter().skip(2) {
         if a.starts_with("--") {
             break;
         }
-        g.make_move(algebraic_to_ace(a));
+        g.make_move(algebraic_to_move_id(a));
     }
-    let mut s = AceSearch::grafted(g, None);
+    let mut s = TitaniumSearch::grafted(g, None);
     if args.iter().any(|a| a == "--json") {
         println!("{}", s.eval_dump_json());
     } else {
@@ -567,15 +565,17 @@ fn run_eval(args: &[String]) {
 
 /// ASCII grids for NNUE distance / corridor fields — eyeball training geometry.
 fn run_fields(args: &[String]) {
-    use titanium::acev13::fields_viz::{compute_nnue_fields, render_fields_text, validate_fields};
-    use titanium::acev13::{algebraic_to_ace, AceGame};
+    use titanium::fields_viz::{
+        compute_nnue_fields, render_fields_text, validate_fields,
+    };
+    use titanium::{algebraic_to_move_id, GameState};
     let check = args.iter().any(|a| a == "--check");
-    let mut g = AceGame::new();
+    let mut g = GameState::new();
     for a in args.iter().skip(2) {
         if a.starts_with("--") {
             continue;
         }
-        g.make_move(algebraic_to_ace(a));
+        g.make_move(algebraic_to_move_id(a));
     }
     let fields = compute_nnue_fields(&g);
     if check {
@@ -598,7 +598,7 @@ fn run_fields(args: &[String]) {
 /// Output: one compact JSON record per line (same format as `eval --json`)
 fn run_eval_batch() {
     use std::io::{self, BufRead};
-    use titanium::acev13::{algebraic_to_ace, AceGame, AceSearch};
+    use titanium::{algebraic_to_move_id, GameState, TitaniumSearch};
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = match line {
@@ -609,11 +609,11 @@ fn run_eval_batch() {
         if line.starts_with('#') {
             continue; // skip comment lines
         }
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         for tok in line.split_whitespace() {
-            g.make_move(algebraic_to_ace(tok));
+            g.make_move(algebraic_to_move_id(tok));
         }
-        let mut s = AceSearch::grafted(g, None);
+        let mut s = TitaniumSearch::grafted(g, None);
         println!("{}", s.eval_dump_json());
     }
 }
@@ -625,7 +625,7 @@ fn json_escape(s: &str) -> String {
 /// Batch eval from canonical packed states — stdin records: u32 LE row index + 24-byte packed state.
 fn run_eval_packed_batch() {
     use std::io::Read;
-    use titanium::acev13::{ace_game_from_packed, AceSearch, PACKED_STATE_LEN};
+    use titanium::{titanium_game_from_packed, TitaniumSearch, PACKED_STATE_LEN};
 
     let mut stdin = std::io::stdin().lock();
     let mut record = [0u8; 4 + PACKED_STATE_LEN];
@@ -640,9 +640,9 @@ fn run_eval_packed_batch() {
         }
         let row = u32::from_le_bytes(record[0..4].try_into().unwrap());
         let packed = &record[4..4 + PACKED_STATE_LEN];
-        match ace_game_from_packed(packed) {
+        match titanium_game_from_packed(packed) {
             Ok(g) => {
-                let mut s = AceSearch::grafted(g, None);
+                let mut s = TitaniumSearch::grafted(g, None);
                 println!("{}", s.eval_dump_json_packed(row));
             }
             Err(err) => {
@@ -1358,13 +1358,13 @@ enum Seat {
         cert: bool,
     },
     Ace {
-        search: Box<titanium::acev13::AceSearch>,
+        search: Box<titanium::TitaniumSearch>,
     },
 }
 
 impl Seat {
     fn new(engine: MatchEngine, opening: &[String], tt_bits: Option<usize>) -> Seat {
-        use titanium::acev13::{algebraic_to_ace, AceGame, AceSearch};
+        use titanium::{algebraic_to_move_id, GameState, TitaniumSearch};
         match engine {
             MatchEngine::TitaniumCert => Seat::Titanium {
                 session: titanium::GameSearchSession::new(),
@@ -1382,28 +1382,30 @@ impl Seat {
             | MatchEngine::AceV13GraftedPartial
             | MatchEngine::AceV13GraftedFrozen
             | MatchEngine::AceV13GraftedNoRaceProof => {
-                let mut g = AceGame::new();
+                let mut g = GameState::new();
                 for m in opening {
-                    g.make_move(algebraic_to_ace(m));
+                    g.make_move(algebraic_to_move_id(m));
                 }
                 let search = match engine {
-                    MatchEngine::AceV13Grafted => AceSearch::grafted(g, tt_bits),
-                    MatchEngine::AceV13GraftedFrozen => AceSearch::grafted_frozen(g, tt_bits),
+                    MatchEngine::AceV13Grafted => TitaniumSearch::grafted(g, tt_bits),
+                    MatchEngine::AceV13GraftedFrozen => TitaniumSearch::grafted_frozen(g, tt_bits),
                     MatchEngine::AceV13GraftedNoRaceProof => {
-                        AceSearch::grafted_no_raceproof(g, tt_bits)
+                        TitaniumSearch::grafted_no_raceproof(g, tt_bits)
                     }
                     MatchEngine::AceV13GraftedPartial => {
-                        let mut s = AceSearch::grafted(g, tt_bits);
+                        let mut s = TitaniumSearch::grafted(g, tt_bits);
                         s.set_partial_iter(true);
                         s
                     }
-                    MatchEngine::AceV13Cert => AceSearch::with_ti_movegen_cheap_cert(g, tt_bits),
-                    MatchEngine::AceV13AdaptiveTt => AceSearch::with_ti_movegen_adaptive_tt(g),
-                    MatchEngine::AceV13DeadZone => AceSearch::with_ti_movegen_deadzone(g),
+                    MatchEngine::AceV13Cert => {
+                        TitaniumSearch::with_ti_movegen_cheap_cert(g, tt_bits)
+                    }
+                    MatchEngine::AceV13AdaptiveTt => TitaniumSearch::with_ti_movegen_adaptive_tt(g),
+                    MatchEngine::AceV13DeadZone => TitaniumSearch::with_ti_movegen_deadzone(g),
                     _ => {
                         // Plain ace-v13 — but still honor --tt-bits so a pure TT-size
                         // experiment (ace-v13 @ N bits vs ace-v13 default) is possible.
-                        let mut s = AceSearch::with_ti_movegen(g);
+                        let mut s = TitaniumSearch::with_ti_movegen(g);
                         if let Some(bits) = tt_bits {
                             s.resize_tt(bits);
                         }
@@ -1434,10 +1436,10 @@ impl Seat {
             }
             Seat::Ace { search } => {
                 let r = search.think(time_ms, 30, false, false, "match");
-                if r.mv == titanium::acev13::ACE_NO_MOVE {
+                if r.mv == titanium::TITANIUM_NO_MOVE {
                     return None;
                 }
-                Some(titanium::acev13::ace_to_algebraic(r.mv))
+                Some(titanium::move_id_to_algebraic(r.mv))
             }
         }
     }
@@ -1446,7 +1448,7 @@ impl Seat {
     /// Titanium seat re-syncs from the move list each `pick`, so it's a no-op).
     fn observe(&mut self, alg: &str) {
         if let Seat::Ace { search } = self {
-            search.apply_move(titanium::acev13::algebraic_to_ace(alg));
+            search.apply_move(titanium::algebraic_to_move_id(alg));
         }
     }
 }
@@ -1525,7 +1527,7 @@ fn run_genmove(args: &[String]) {
 
 // ── ACE v7 port (pure) ───────────────────────────────────────────────────────
 
-/// Returns the engine flag if it routes through the acev13 module (or earlier ace module).
+/// Returns the engine flag if it routes through the Titanium module (or earlier ace module).
 /// This covers both the ACE reference family and the Titanium v14/v15 production engines.
 fn ace_engine_flag(args: &[String]) -> Option<&str> {
     args.windows(2).find_map(|w| {
@@ -1541,7 +1543,7 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
             | "ace-v13-pure" | "ace-v13-grafted" | "ace-v13-grafted-no-raceproof"
             | "ace-v13-ti-pure"
-            // Titanium production engines (use acev13 search core)
+            // Titanium production engines (use titanium search core)
             | "titanium-v14" | "titanium-v15" | "titanium-v15-frozen"
             | "titanium-v15-no-raceproof" => Some(w[1].as_str()),
             _ => None,
@@ -1561,9 +1563,9 @@ fn ace_engine_mode(flag: &str) -> &'static str {
     }
 }
 
-/// True for any engine that lives in the `crate::acev13` module — both the
+/// True for any engine that lives in the `crate::titanium` module — both the
 /// ACE v13 reference engines and the Titanium v14/v15 production engines.
-fn uses_acev13_module(flag: &str) -> bool {
+fn uses_titanium_module(flag: &str) -> bool {
     flag.starts_with("ace-v13")
         || flag == "titanium-v14"
         || flag == "titanium-v15"
@@ -1656,9 +1658,8 @@ fn run_genmove_ace(args: &[String]) {
         i += 1;
     }
 
-    // Both modules expose an identical `AceParams` / `ace_genmove` surface, so
-    // the output handling is shared via a macro (field names match) and only
-    // the module path differs between the v11 (`ace`) and gen13 (`acev13`) ports.
+    // ACE v11 uses `AceParams` / `ace_genmove`; Titanium v15 uses `TitaniumParams` / `titanium_genmove`.
+    // Output handling is shared; only the module path and param types differ.
     macro_rules! emit_genmove {
         ($module:path) => {{
             use $module as ace_mod;
@@ -1702,8 +1703,44 @@ fn run_genmove_ace(args: &[String]) {
         }};
     }
 
-    if uses_acev13_module(label) {
-        emit_genmove!(titanium::acev13);
+    if uses_titanium_module(label) {
+        let params = titanium::TitaniumParams {
+            cat,
+            ti_movegen,
+            eme,
+            time_ms,
+            max_depth,
+            full,
+            log,
+            ..Default::default()
+        };
+        match titanium::titanium_genmove(&moves, params, label) {
+            Some((algebraic, info)) => {
+                if !log {
+                    let mut depth_json = String::new();
+                    for (j, e) in info.depth_log.iter().enumerate() {
+                        if j > 0 {
+                            depth_json.push(',');
+                        }
+                        let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
+                        let score_text = score_text(e.score);
+                        depth_json.push_str(&format!(
+                            "{{\"depth\":{},\"score\":{},\"scoreText\":\"{}\",\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+                            e.depth, e.score, score_text, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
+                        ));
+                    }
+                    let root_score_text = score_text(info.score);
+                    eprintln!(
+                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
+                        label, label, info.depth, info.nodes, info.score,
+                        root_score_text,
+                        info.white_dist, info.black_dist, info.ms, depth_json
+                    );
+                }
+                println!("bestmove {}", algebraic);
+            }
+            None => println!("bestmove (none)"),
+        }
     } else {
         emit_genmove!(titanium::ace);
     }

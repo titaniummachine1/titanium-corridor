@@ -8,15 +8,20 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::acev13::{
-    ace_to_algebraic, algebraic_to_ace, AceGame, AceParams, AceSearch, ThinkResult, ACE_NO_MOVE,
+use crate::titanium::search::think_result_progress_json;
+use crate::titanium::{
+    algebraic_to_move_id, move_id_to_algebraic, GameState, ThinkResult, TitaniumParams,
+    TitaniumSearch, TITANIUM_NO_MOVE,
 };
-use crate::acev13::search::think_result_progress_json;
 
-fn acev13_params_from_mode(engine_mode: &str, movetime_ms: u32, max_depth: i32) -> AceParams {
+fn titanium_v15_params_from_mode(
+    engine_mode: &str,
+    movetime_ms: u32,
+    max_depth: i32,
+) -> TitaniumParams {
     let ti_movegen = engine_mode.contains("-ti") || engine_mode == "ace-v13";
     let eme = engine_mode.contains("pmc");
-    AceParams {
+    TitaniumParams {
         time_ms: (movetime_ms as u64).max(1),
         max_depth: if max_depth > 0 { max_depth } else { 30 },
         full: false,
@@ -45,22 +50,26 @@ fn ace_params_from_mode(
     }
 }
 
-fn is_acev13_mode(engine_mode: &str) -> bool {
+fn is_titanium_v15_mode(engine_mode: &str) -> bool {
     engine_mode.starts_with("ace-v13") || engine_mode == "ace-v13"
 }
 
-fn build_acev13_search(g: AceGame, params: AceParams, engine_label: &str) -> AceSearch {
+fn build_titanium_search(
+    g: GameState,
+    params: TitaniumParams,
+    engine_label: &str,
+) -> TitaniumSearch {
     let mut search = match engine_label {
-        "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => *AceSearch::grafted(g, None),
-        "titanium-v15-frozen" => *AceSearch::grafted_frozen(g, None),
+        "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => *TitaniumSearch::grafted(g, None),
+        "titanium-v15-frozen" => *TitaniumSearch::grafted_frozen(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
-            *AceSearch::grafted_no_raceproof(g, None)
+            *TitaniumSearch::grafted_no_raceproof(g, None)
         }
-        "ace-v13-ti-pure" => *AceSearch::with_ti_movegen_pure(g),
-        _ if params.ti_movegen && params.cat => *AceSearch::with_ti_movegen_and_cat(g),
-        _ if params.ti_movegen => *AceSearch::with_ti_movegen(g),
-        _ if params.cat => *AceSearch::with_cat(g),
-        _ => *AceSearch::new(g),
+        "ace-v13-ti-pure" => *TitaniumSearch::with_ti_movegen_pure(g),
+        _ if params.ti_movegen && params.cat => *TitaniumSearch::with_ti_movegen_and_cat(g),
+        _ if params.ti_movegen => *TitaniumSearch::with_ti_movegen(g),
+        _ if params.cat => *TitaniumSearch::with_cat(g),
+        _ => *TitaniumSearch::new(g),
     };
     if params.eme {
         search.enable_eme();
@@ -68,9 +77,9 @@ fn build_acev13_search(g: AceGame, params: AceParams, engine_label: &str) -> Ace
     search
 }
 
-fn acev13_genmove_with_progress(
+fn titanium_genmove_with_progress(
     moves: &str,
-    params: AceParams,
+    params: TitaniumParams,
     engine_label: &str,
     on_progress: Option<js_sys::Function>,
 ) -> Option<(String, ThinkResult)> {
@@ -78,7 +87,7 @@ fn acev13_genmove_with_progress(
     if g.winner() >= 0 {
         return None;
     }
-    let mut search = build_acev13_search(g, params, engine_label);
+    let mut search = build_titanium_search(g, params, engine_label);
     search.set_wasm_progress(on_progress.clone());
     let stream = on_progress.is_some();
     let result = search.think(
@@ -88,7 +97,7 @@ fn acev13_genmove_with_progress(
         stream,
         engine_label,
     );
-    if result.mv == ACE_NO_MOVE {
+    if result.mv == TITANIUM_NO_MOVE {
         return None;
     }
     if result.mv == 0 && search.g.winner() >= 0 {
@@ -99,18 +108,18 @@ fn acev13_genmove_with_progress(
         let json = think_result_progress_json(engine_label, &result);
         let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&json));
     }
-    Some((ace_to_algebraic(result.mv), result))
+    Some((move_id_to_algebraic(result.mv), result))
 }
 
-fn replay_moves(moves: &str) -> Result<AceGame, JsError> {
-    let mut g = AceGame::new();
+fn replay_moves(moves: &str) -> Result<GameState, JsError> {
+    let mut g = GameState::new();
     for text in moves.split_whitespace().filter(|s| !s.is_empty()) {
         if g.winner() >= 0 {
             return Err(JsError::new(&format!(
                 "illegal replay past terminal: {text}"
             )));
         }
-        g.make_move(algebraic_to_ace(text));
+        g.make_move(algebraic_to_move_id(text));
     }
     Ok(g)
 }
@@ -141,9 +150,9 @@ impl WasmAceEngine {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
-        if is_acev13_mode(engine_mode) {
-            let params = acev13_params_from_mode(engine_mode, movetime_ms, max_depth);
-            return match acev13_genmove_with_progress(moves, params, engine_mode, on_progress) {
+        if is_titanium_v15_mode(engine_mode) {
+            let params = titanium_v15_params_from_mode(engine_mode, movetime_ms, max_depth);
+            return match titanium_genmove_with_progress(moves, params, engine_mode, on_progress) {
                 Some((alg, _)) => alg,
                 None => "(none)".to_string(),
             };
@@ -159,7 +168,7 @@ impl WasmAceEngine {
 /// Warm titanium-v15 session — TT / history persist between plies (GitHub Pages Titanium).
 #[wasm_bindgen]
 pub struct WasmEngine {
-    search: AceSearch,
+    search: TitaniumSearch,
     engine_label: String,
 }
 
@@ -168,14 +177,17 @@ impl WasmEngine {
     /// `frozen = true` → pinned pre-train NNUE (`titanium-v15-frozen`).
     #[wasm_bindgen(constructor)]
     pub fn new(frozen: bool) -> WasmEngine {
-        let g = AceGame::new();
+        let g = GameState::new();
         let (search, engine_label) = if frozen {
             (
-                *AceSearch::grafted_frozen(g, None),
+                *TitaniumSearch::grafted_frozen(g, None),
                 "titanium-v15-frozen".to_string(),
             )
         } else {
-            (*AceSearch::grafted(g, None), "titanium-v15".to_string())
+            (
+                *TitaniumSearch::grafted(g, None),
+                "titanium-v15".to_string(),
+            )
         };
         WasmEngine {
             search,
@@ -185,7 +197,7 @@ impl WasmEngine {
 
     /// Reset to startpos (clears TT/killers/history).
     pub fn reset(&mut self) {
-        self.search.set_position(AceGame::new());
+        self.search.set_position(GameState::new());
     }
 
     /// Set position from startpos via space-separated algebraic moves.
@@ -201,7 +213,7 @@ impl WasmEngine {
         if self.search.g.winner() >= 0 {
             return false;
         }
-        self.search.apply_move(algebraic_to_ace(mv));
+        self.search.apply_move(algebraic_to_move_id(mv));
         true
     }
 
@@ -227,10 +239,10 @@ impl WasmEngine {
             &self.engine_label,
         );
         self.search.set_wasm_progress(None);
-        if result.mv == ACE_NO_MOVE {
+        if result.mv == TITANIUM_NO_MOVE {
             "(none)".to_string()
         } else {
-            ace_to_algebraic(result.mv)
+            move_id_to_algebraic(result.mv)
         }
     }
 

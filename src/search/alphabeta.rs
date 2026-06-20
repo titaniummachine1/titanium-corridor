@@ -215,7 +215,7 @@ struct SearchState<'a> {
 }
 
 /// Endgame guaranteed-win/loss proof oracle (v13 `certify_win` via
-/// `acev13::cert_bridge`). Caches verdicts by (hash, side) and bounds total
+/// `titanium::cert_bridge`). Caches verdicts by (hash, side) and bounds total
 /// certify attempts per search so the cost stays negligible.
 struct EndgameCert {
     enabled: bool,
@@ -686,8 +686,8 @@ fn endgame_cert_floor(
     // when the paths overlap AND the lead is ≤1 tempo can a jump flip the result;
     // there (and only there) we pay for the exact retrograde oracle.
     if board.walls_remaining[0] == 0 && board.walls_remaining[1] == 0 {
-        use crate::acev13::cert_bridge::{hands_empty_race, RaceVerdict};
-        let mut g = crate::acev13::cert_bridge::ace_from_board(board);
+        use crate::titanium::cert_bridge::{hands_empty_race, RaceVerdict};
+        let mut g = crate::titanium::cert_bridge::titanium_game_from_board(board);
         match hands_empty_race(&g) {
             RaceVerdict::Win => {
                 CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -697,19 +697,17 @@ fn endgame_cert_floor(
                 CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(loss);
             }
-            RaceVerdict::NeedsProof => {
-                match crate::acev13::cert_bridge::race_minimax(&mut g) {
-                    crate::acev13::cert_bridge::RaceProof::Win => {
-                        CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Some(win);
-                    }
-                    crate::acev13::cert_bridge::RaceProof::Loss => {
-                        CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Some(loss);
-                    }
-                    crate::acev13::cert_bridge::RaceProof::Unknown => return None,
+            RaceVerdict::NeedsProof => match crate::titanium::cert_bridge::race_minimax(&mut g) {
+                crate::titanium::cert_bridge::RaceProof::Win => {
+                    CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(win);
                 }
-            }
+                crate::titanium::cert_bridge::RaceProof::Loss => {
+                    CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(loss);
+                }
+                crate::titanium::cert_bridge::RaceProof::Unknown => return None,
+            },
         }
     }
 
@@ -737,7 +735,7 @@ fn endgame_cert_floor(
             return None; // attempt budget spent; only cached verdicts remain free
         }
         state.cert.calls += 1;
-        let verdict = crate::acev13::cert_bridge::certify_board(board, state.cert.budget, 0, None);
+        let verdict = crate::titanium::cert_bridge::certify_board(board, state.cert.budget, 0, None);
         let code = match verdict {
             Some(Player::One) => 0u8,
             Some(Player::Two) => 1u8,
@@ -2083,8 +2081,8 @@ mod tests {
         board.hash = crate::core::zobrist::hash_board(&board);
 
         // Precondition: the oracle really calls this a loss for the side to move.
-        let mut oracle = crate::acev13::oracle::Oracle::default();
-        let g = crate::acev13::cert_bridge::ace_from_board(&board);
+        let mut oracle = crate::titanium::oracle::Oracle::default();
+        let g = crate::titanium::cert_bridge::titanium_game_from_board(&board);
         assert!(
             oracle.query(&g) < 0,
             "precondition: One should be losing this race, got {}",

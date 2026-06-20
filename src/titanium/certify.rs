@@ -14,7 +14,7 @@
 //! Rust port (mirroring the browser's `RP_CERT === null`) omitted it. This is
 //! the file that makes the v13 port faithful.
 
-use crate::acev13::game::{AceGame, BORDER, DELTA, DIRBIT};
+use crate::titanium::game::{GameState, BORDER, DELTA, DIRBIT};
 use crate::util::clock::Instant;
 
 /// Budget / deadline abort. Mirrors the JS `BUDGET_EX` throw: it unwinds
@@ -69,7 +69,7 @@ pub struct CertifyReport {
 
 /// Walls-only distance field from `src` (pawn-blind, like `compute_dist`).
 /// Matches the JS certify-local `bfsFromCell` (`out.fill(32000)`).
-fn bfs_from_cell(g: &AceGame, src: usize, out: &mut [i16; 81]) {
+fn bfs_from_cell(g: &GameState, src: usize, out: &mut [i16; 81]) {
     out.fill(32000);
     out[src] = 0;
     let mut queue = [0i16; 81];
@@ -109,8 +109,8 @@ fn race_winner_stm(turn: usize, d0: u8, d1: u8) -> usize {
 /// Exact no-wall race winner. This is the hard boundary between the expensive
 /// wall-campaign certifier and the already-solved pawn race: once both hands are
 /// empty, never recurse through certificate nodes.
-fn no_wall_race_winner(g: &mut AceGame) -> usize {
-    use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+fn no_wall_race_winner(g: &mut GameState) -> usize {
+    use crate::titanium::cert_bridge::hands_empty_race_stm_wins;
     let stm_wins = hands_empty_race_stm_wins(g).unwrap_or(false);
     if stm_wins {
         g.turn
@@ -138,7 +138,7 @@ fn cheb_near(cell_a: usize, cell_b: usize, rad: i32) -> bool {
 
 /// Wall-interdiction subgame solver for a single candidate side `s`.
 struct Solver<'a> {
-    g: &'a mut AceGame,
+    g: &'a mut GameState,
     s: usize,
     budget: u64,
     deadline: Option<Instant>,
@@ -386,7 +386,7 @@ struct Snapshot {
     blocked: [u8; 81],
 }
 
-fn snap(g: &AceGame) -> Snapshot {
+fn snap(g: &GameState) -> Snapshot {
     Snapshot {
         pawn: g.pawn,
         wl: g.wl,
@@ -402,7 +402,7 @@ fn snap(g: &AceGame) -> Snapshot {
     }
 }
 
-fn restore(g: &mut AceGame, s: &Snapshot) {
+fn restore(g: &mut GameState, s: &Snapshot) {
     g.pawn = s.pawn;
     g.wl = s.wl;
     g.turn = s.turn;
@@ -421,7 +421,7 @@ fn restore(g: &mut AceGame, s: &Snapshot) {
 /// Returns `proven: Some(side)` iff that side's win is certified under the
 /// 'all' (sound) mode. Tries the favored race winner first, then the other
 /// side, within the shared node budget. 1:1 with the JS `certify(game, opts)`.
-pub fn certify(game: &mut AceGame, opts: &CertifyOpts) -> CertifyReport {
+pub fn certify(game: &mut GameState, opts: &CertifyOpts) -> CertifyReport {
     let w = game.winner();
     if w >= 0 {
         return CertifyReport {
@@ -501,7 +501,7 @@ pub fn certify(game: &mut AceGame, opts: &CertifyOpts) -> CertifyReport {
 /// up front for free, then dist-race from the same stm" survives for S iff for
 /// EVERY placeable wall the race still adjudicates to S. Ported for parity with
 /// `certify_win.js`; not on the engine's hot path.
-pub fn upfront_one_wall_survives(game: &mut AceGame, s: usize) -> bool {
+pub fn upfront_one_wall_survives(game: &mut GameState, s: usize) -> bool {
     let mut d0 = [0u8; 81];
     let mut d1 = [0u8; 81];
     for wtype in 0..2usize {
@@ -533,8 +533,8 @@ pub fn upfront_one_wall_survives(game: &mut AceGame, s: usize) -> bool {
 mod tests {
     use super::*;
 
-    fn race_game(p0: usize, p1: usize, turn: usize) -> AceGame {
-        let mut g = AceGame::new();
+    fn race_game(p0: usize, p1: usize, turn: usize) -> GameState {
+        let mut g = GameState::new();
         g.pawn = [p0, p1];
         g.wl = [0, 0];
         g.turn = turn;
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn high_wall_positions_are_outside_certificate_scope() {
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let report = certify(
             &mut g,
             &CertifyOpts {

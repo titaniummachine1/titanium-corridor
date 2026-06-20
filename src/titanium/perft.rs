@@ -3,16 +3,16 @@
 use crate::util::clock::{Duration, Instant};
 use std::sync::mpsc;
 
-use crate::acev13::game::AceGame;
-use crate::acev13::search::board_move_to_ace;
 use crate::core::board::Board;
 use crate::core::board::Undo;
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::path::BfsScratch;
 use crate::search::runtime::Engine;
+use crate::titanium::game::GameState;
+use crate::titanium::search::board_move_to_move_id;
 use crate::util::perft::{perft_fast, PERFT3_STARTPOS, PERFT4_STARTPOS, PERFT4_TEST_TIMEOUT_SECS};
 
-pub const ACE_PERFT4_STARTPOS: u64 = PERFT4_STARTPOS;
+pub const TITANIUM_PERFT4_STARTPOS: u64 = PERFT4_STARTPOS;
 
 #[derive(Debug, Clone)]
 pub struct TimedPerftResult {
@@ -23,7 +23,7 @@ pub struct TimedPerftResult {
     pub label: &'static str,
 }
 
-impl AceGame {
+impl GameState {
     pub fn gen_legal_moves(&mut self, out: &mut [i16; 160]) -> usize {
         let mut n = self.gen_pawn_moves(out, 0);
         if self.wl[self.turn] > 0 {
@@ -42,7 +42,7 @@ impl AceGame {
     }
 }
 
-fn perft_ace_native(g: &mut AceGame, depth: u32) -> u64 {
+fn perft_ace_native(g: &mut GameState, depth: u32) -> u64 {
     if depth == 0 {
         return 1;
     }
@@ -59,7 +59,7 @@ fn perft_ace_native(g: &mut AceGame, depth: u32) -> u64 {
 
 #[allow(dead_code)]
 fn perft_ace_ti_gen(
-    g: &mut AceGame,
+    g: &mut GameState,
     depth: u32,
     board: &mut Board,
     bfs: &mut BfsScratch,
@@ -72,7 +72,7 @@ fn perft_ace_ti_gen(
     let n = generate_legal_moves_slice(board, &mut ti_buf, bfs);
     let mut nodes = 0u64;
     for i in 0..n {
-        let ace_m = board_move_to_ace(ti_buf[i]);
+        let ace_m = board_move_to_move_id(ti_buf[i]);
         let undo = board.make_move(ti_buf[i]);
         undo_stack.push(undo);
         g.make_move(ace_m);
@@ -125,15 +125,15 @@ where
     }
 }
 
-pub fn perft_ace_timed(depth: u32, timeout: Duration) -> TimedPerftResult {
+pub fn perft_titanium_native_timed(depth: u32, timeout: Duration) -> TimedPerftResult {
     run_timed("ace-v7-native", depth, timeout, move || {
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         perft_ace_native(&mut g, depth)
     })
 }
 
 /// Titanium movegen on the ACE ruleset — same nodes as `perft_fast` (verified at depth 3).
-pub fn perft_ace_ti_timed(depth: u32, timeout: Duration) -> TimedPerftResult {
+pub fn perft_titanium_ti_timed(depth: u32, timeout: Duration) -> TimedPerftResult {
     perft_titanium_timed_with_label("ace-ti-movegen", depth, timeout)
 }
 
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn perft3_native_matches_titanium_and_ti_bridge() {
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let native = perft_ace_native(&mut g, 3);
         let mut board = Board::new();
         let mut bfs = BfsScratch::new();
@@ -199,13 +199,13 @@ mod tests {
         assert_eq!(native, PERFT3_STARTPOS);
     }
 
-    /// Heavy (247M nodes): confirms acev13 make/unmake stays in lockstep with
+    /// Heavy (247M nodes): confirms Titanium make/unmake stays in lockstep with
     /// the independently-validated Titanium legal-move list to depth 4.
-    /// Run with `cargo test --release acev13 -- --ignored`.
+    /// Run with `cargo test --release titanium -- --ignored`.
     #[test]
     #[ignore]
     fn perft4_ti_bridge_matches_oracle() {
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let mut board = Board::new();
         let mut bfs = BfsScratch::new();
         let mut undo = Vec::new();

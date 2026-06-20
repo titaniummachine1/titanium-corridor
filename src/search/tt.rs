@@ -110,7 +110,7 @@ fn detect_cache_bytes() -> Option<(usize, usize, usize)> {
 /// Cache-tier index bits for ANY transposition table whose logical entry is
 /// `entry_bytes` wide. Returns `(l1_start, l2, l3)` index bits — the largest
 /// power-of-two entry count that fits each tier. Used by other TTs (e.g. the
-/// acev13 search TT, whose 7 parallel arrays total ~25 B/entry) to get the same
+/// Titanium search TT (formerly acev13 layout), whose 7 parallel arrays total ~25 B/entry) to get the same
 /// overflow-driven cache-tier growth as the perft TT. Falls back to 9/11/16 when
 /// CPUID cache detection is unavailable.
 pub fn cache_tier_bits(entry_bytes: usize) -> (usize, usize, usize) {

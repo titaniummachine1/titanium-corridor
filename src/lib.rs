@@ -12,7 +12,7 @@
 //! ```
 
 pub mod ace;
-pub mod acev13;
+pub mod titanium;
 pub mod cat;
 pub mod core;
 pub mod eval;
@@ -60,4 +60,14 @@ pub use util::perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_fast_mode,
     perft_fast_mode_ctx, perft_iterative, perft_naive, perft_no_tt_mode, perft_pawn_only_mode,
     PerftContext, PERFT3_STARTPOS, PERFT4_STARTPOS,
+};
+
+// Titanium v15 production API (formerly `acev13` module path).
+pub use titanium::fields_viz;
+pub use titanium::{
+    algebraic_to_move_id, board_move_to_move_id, decode_packed_state, move_id_to_algebraic,
+    move_id_to_board, pack_state, reduction_counterfactual_probe, reduction_shadow_probe,
+    run_titanium_session_stdio, titanium_game_from_packed, titanium_genmove, GameState,
+    TitaniumParams, TitaniumSearch, TITANIUM_NO_MOVE, FEATURE_SCHEMA, PACKED_STATE_LEN,
+    POSITION_SCHEMA_VERSION,
 };

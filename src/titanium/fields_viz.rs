@@ -2,11 +2,11 @@
 //!
 //! Run: `titanium fields [moves...]` or `python training/visualize_fields.py e2 e8 ...`
 
-use crate::acev13::dist::{
+use crate::titanium::dist::{
     fill_ace_dist_from_pawn, fill_ace_dist_to_goal, fill_choke_points, fill_contested,
     fill_corridor_delta, fill_path_crossing,
 };
-use crate::acev13::game::AceGame;
+use crate::titanium::game::GameState;
 use crate::util::grid::square_index;
 
 /// All per-cell geometry the HalfPW net consumes (ACE cell index, row 0 = top).
@@ -29,7 +29,7 @@ pub struct NnueFields {
     pub contested: [u8; 81],
 }
 
-pub fn compute_nnue_fields(g: &AceGame) -> NnueFields {
+pub fn compute_nnue_fields(g: &GameState) -> NnueFields {
     let mut goal_inv_p0 = [255u8; 81];
     let mut goal_inv_p1 = [255u8; 81];
     fill_ace_dist_to_goal(g, 0, &mut goal_inv_p0);
@@ -103,7 +103,7 @@ fn cell_char(v: u8, on_shortest: bool) -> char {
 }
 
 fn render_grid(
-    g: &AceGame,
+    g: &GameState,
     field: &[u8; 81],
     highlight_delta: Option<&[u8; 81]>,
     title: &str,
@@ -133,7 +133,7 @@ fn render_grid(
     out.push('\n');
 }
 
-fn render_choke_grid(g: &AceGame, field: &[u8; 81], title: &str, out: &mut String) {
+fn render_choke_grid(g: &GameState, field: &[u8; 81], title: &str, out: &mut String) {
     out.push_str(title);
     out.push('\n');
     for row in (0..9u8).rev() {
@@ -162,7 +162,7 @@ fn render_choke_grid(g: &AceGame, field: &[u8; 81], title: &str, out: &mut Strin
     out.push('\n');
 }
 
-fn render_cross_grid(g: &AceGame, field: &[u8; 81], title: &str, out: &mut String) {
+fn render_cross_grid(g: &GameState, field: &[u8; 81], title: &str, out: &mut String) {
     out.push_str(title);
     out.push('\n');
     for row in (0..9u8).rev() {
@@ -212,7 +212,7 @@ fn corridor_summary(delta: &[u8; 81], player: usize) -> String {
     )
 }
 
-pub fn render_fields_text(g: &AceGame, fields: &NnueFields) -> String {
+pub fn render_fields_text(g: &GameState, fields: &NnueFields) -> String {
     let mut out = String::new();
     out.push_str("Quoridor NNUE field planes (ACE coords, row 8 = bottom)\n");
     out.push_str("@ = P0 pawn  & = P1 pawn  · = unreachable  digits = distance\n");
@@ -305,7 +305,7 @@ pub fn render_fields_text(g: &AceGame, fields: &NnueFields) -> String {
 }
 
 /// Invariant checks — returns human-readable error strings (empty = OK).
-pub fn validate_fields(g: &AceGame, f: &NnueFields) -> Vec<String> {
+pub fn validate_fields(g: &GameState, f: &NnueFields) -> Vec<String> {
     let mut errs = Vec::new();
 
     if f.goal_inv_p0[g.pawn[0]] != f.d0_scalar {
@@ -398,19 +398,19 @@ pub fn validate_fields(g: &AceGame, f: &NnueFields) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acev13::algebraic_to_ace;
+    use crate::titanium::algebraic_to_move_id;
 
-    fn pos(moves: &[&str]) -> AceGame {
-        let mut g = AceGame::new();
+    fn pos(moves: &[&str]) -> GameState {
+        let mut g = GameState::new();
         for m in moves {
-            g.make_move(algebraic_to_ace(m));
+            g.make_move(algebraic_to_move_id(m));
         }
         g
     }
 
     #[test]
     fn startpos_fields_sane() {
-        let g = AceGame::new();
+        let g = GameState::new();
         let f = compute_nnue_fields(&g);
         assert_eq!(validate_fields(&g, &f), vec![] as Vec<String>);
         assert!(

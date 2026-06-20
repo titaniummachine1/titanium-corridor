@@ -11,7 +11,7 @@
 //! Successors come from the engine's own `gen_pawn_moves` on the CURRENT
 //! blocked[] board, so jump rules match the search exactly.
 
-use crate::acev13::game::AceGame;
+use crate::titanium::game::GameState;
 
 /// 81 × 81 × 2 (p0 cell, p1 cell, side to move).
 pub const RACE_STATES: usize = 13_122;
@@ -49,7 +49,7 @@ impl Default for RaceScratch {
 /// Solve the race for the game's current wall config into `tbl`.
 /// `gen_pawn_moves` reads only pawn/turn/blocked — pawns and turn are
 /// temporarily swept over all live states and restored afterwards.
-pub fn solve_race_config(g: &mut AceGame, s: &mut RaceScratch, tbl: &mut [i16]) {
+pub fn solve_race_config(g: &mut GameState, s: &mut RaceScratch, tbl: &mut [i16]) {
     debug_assert_eq!(tbl.len(), RACE_STATES);
     let (sp0, sp1, sturn) = (g.pawn[0], g.pawn[1], g.turn);
     tbl.fill(0);
@@ -163,7 +163,7 @@ mod tests {
     use super::*;
 
     fn solved_empty_board() -> Vec<i16> {
-        let mut g = AceGame::new();
+        let mut g = GameState::new();
         let mut s = RaceScratch::new();
         let mut tbl = vec![0i16; RACE_STATES];
         solve_race_config(&mut g, &mut s, &mut tbl);
@@ -175,16 +175,16 @@ mod tests {
     /// minimal fixpoint, so this validates soundness of every entry.
     #[test]
     fn race_table_is_bellman_consistent_on_sample_configs() {
-        use crate::acev13::algebraic_to_ace;
+        use crate::titanium::algebraic_to_move_id;
         let configs: [&[&str]; 3] = [
             &[],
             &["e2", "e8", "e3h", "e6h"],
             &["e2", "e8", "c3h", "f6v", "d7h", "b4v"],
         ];
         for moves in configs {
-            let mut g = AceGame::new();
+            let mut g = GameState::new();
             for m in moves {
-                g.make_move(algebraic_to_ace(m));
+                g.make_move(algebraic_to_move_id(m));
             }
             let mut s = RaceScratch::new();
             let mut tbl = vec![0i16; RACE_STATES];

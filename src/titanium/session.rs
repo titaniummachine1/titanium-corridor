@@ -1,7 +1,7 @@
 //! ACE v13 reference-engine session REPL (ace-v13-*, ace-v13-ti-pure, …).
 //!
 //! Wire protocol: `reset` / `position [MOVES]` / `makemove MOVE` /
-//! `go TIME_SEC` / `quit`.  Holds one warm `AceSearch` per process so the
+//! `go TIME_SEC` / `quit`.  Holds one warm `TitaniumSearch` per process so the
 //! TT, killers, history, and countermove tables persist between plies.
 //!
 //! `titanium-v15` uses this session (grafted build).  `session_v15` infinite
@@ -9,7 +9,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use super::{ace_to_algebraic, algebraic_to_ace, AceGame, AceSearch};
+use super::{move_id_to_algebraic, algebraic_to_move_id, GameState, TitaniumSearch};
 
 fn reply_ready(stdout: &mut io::Stdout) {
     let _ = writeln!(stdout, "ready");
@@ -21,17 +21,17 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
     let _ = stdout.flush();
 }
 
-fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
+fn build_search(engine_flag: &str, g: GameState) -> Box<TitaniumSearch> {
     // titanium-v15 = production grafted build. ace-v13-ti-pure = JS baseline yardstick.
     let mut search = match engine_flag {
-        "ace-v13-pure" => AceSearch::new(g),
-        "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
-        "titanium-v15-frozen" => AceSearch::grafted_frozen(g, None),
+        "ace-v13-pure" => TitaniumSearch::new(g),
+        "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
+        "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
-            AceSearch::grafted_no_raceproof(g, None)
+            TitaniumSearch::grafted_no_raceproof(g, None)
         }
-        "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => AceSearch::grafted(g, None),
-        _ => AceSearch::with_ti_movegen(g),
+        "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => TitaniumSearch::grafted(g, None),
+        _ => TitaniumSearch::with_ti_movegen(g),
     };
     if engine_flag.contains("pmc") {
         search.enable_eme();
@@ -39,20 +39,20 @@ fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
     search
 }
 
-fn replay(moves: &[String]) -> Result<AceGame, String> {
-    let mut g = AceGame::new();
+fn replay(moves: &[String]) -> Result<GameState, String> {
+    let mut g = GameState::new();
     for text in moves {
         if g.winner() >= 0 {
             return Err(format!("move {text} past terminal position"));
         }
-        g.make_move(algebraic_to_ace(text));
+        g.make_move(algebraic_to_move_id(text));
     }
     Ok(g)
 }
 
-/// Blocking REPL holding one warm `AceSearch` for the process lifetime.
-pub fn run_ace_session_stdio(engine_flag: &str) {
-    let mut search = build_search(engine_flag, AceGame::new());
+/// Blocking REPL holding one warm `TitaniumSearch` for the process lifetime.
+pub fn run_titanium_session_stdio(engine_flag: &str) {
+    let mut search = build_search(engine_flag, GameState::new());
     let mut applied: Vec<String> = Vec::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -72,7 +72,7 @@ pub fn run_ace_session_stdio(engine_flag: &str) {
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         match parts[0] {
             "reset" => {
-                search.set_position(AceGame::new());
+                search.set_position(GameState::new());
                 applied.clear();
                 reply_ready(&mut stdout);
             }
@@ -90,7 +90,7 @@ pub fn run_ace_session_stdio(engine_flag: &str) {
                             err = Some(format!("move {text} past terminal position"));
                             break;
                         }
-                        search.apply_move(algebraic_to_ace(text));
+                        search.apply_move(algebraic_to_move_id(text));
                     }
                     if let Some(msg) = err {
                         reply_error(&mut stdout, &msg);
@@ -119,7 +119,7 @@ pub fn run_ace_session_stdio(engine_flag: &str) {
                     reply_error(&mut stdout, "terminal position");
                     continue;
                 }
-                search.apply_move(algebraic_to_ace(mv));
+                search.apply_move(algebraic_to_move_id(mv));
                 applied.push((*mv).to_string());
                 reply_ready(&mut stdout);
             }
@@ -131,10 +131,10 @@ pub fn run_ace_session_stdio(engine_flag: &str) {
                 let time_sec: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4.0);
                 let time_ms = (time_sec * 1000.0).max(1.0) as u64;
                 let result = search.think(time_ms, 30, false, true, engine_flag);
-                if result.mv == super::ACE_NO_MOVE {
+                if result.mv == super::TITANIUM_NO_MOVE {
                     let _ = writeln!(stdout, "bestmove (none)");
                 } else {
-                    let _ = writeln!(stdout, "bestmove {}", ace_to_algebraic(result.mv));
+                    let _ = writeln!(stdout, "bestmove {}", move_id_to_algebraic(result.mv));
                 }
                 let _ = stdout.flush();
             }

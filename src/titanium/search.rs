@@ -19,20 +19,20 @@
 //!   build runs with `RP_CERT === null`, which this port mirrors (the
 //!   commitment gate keeps the wall when no certifier exists).
 
-use crate::acev13::ace_move_to_board;
-use crate::acev13::dist::{
+use crate::titanium::move_id_to_board;
+use crate::titanium::dist::{
     fill_ace_dist_from_pawn, fill_ace_dist_to_goal_with_masks, fill_choke_points, fill_contested,
     fill_corridor_delta, fill_distance_layers, fill_path_crossing, fill_sparse_route_masks,
     shortest_route_bits,
 };
 use crate::util::clock::{Duration, Instant};
 
-use crate::acev13::certify::{certify, CertifyOpts};
-use crate::acev13::game::{AceGame, ZOBRIST};
-use crate::acev13::packed_state::FEATURE_SCHEMA;
-use crate::acev13::net::{net, net_frozen, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
-use crate::acev13::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
-use crate::acev13::reduction_sidecar::ReductionSidecar;
+use crate::titanium::certify::{certify, CertifyOpts};
+use crate::titanium::game::{GameState, ZOBRIST};
+use crate::titanium::net::{net, net_frozen, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
+use crate::titanium::packed_state::FEATURE_SCHEMA;
+use crate::titanium::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
+use crate::titanium::reduction_sidecar::ReductionSidecar;
 use crate::cat::prune::{
     gap_play_zone_mask, get_shortest_path, wall_in_dead_zone, wall_should_search,
 };
@@ -99,10 +99,10 @@ pub struct TiBridge {
 }
 
 impl TiBridge {
-    fn from_game(g: &AceGame) -> Box<Self> {
+    fn from_game(g: &GameState) -> Box<Self> {
         let mut board = Board::new();
         for i in 0..g.hist_len {
-            let _ = board.make_move(ace_move_to_board(g.hist_m[i]));
+            let _ = board.make_move(move_id_to_board(g.hist_m[i]));
         }
         Box::new(Self {
             board,
@@ -114,7 +114,7 @@ impl TiBridge {
     }
 
     fn push(&mut self, m: i16) {
-        let undo = self.board.make_move(ace_move_to_board(m));
+        let undo = self.board.make_move(move_id_to_board(m));
         self.undo_stack.push(undo);
     }
 
@@ -135,14 +135,14 @@ impl TiBridge {
             Some(&mut self.wall_cache_stats),
         );
         for i in 0..n {
-            out[i] = board_move_to_ace(ti_buf[i]);
+            out[i] = board_move_to_move_id(ti_buf[i]);
         }
         n
     }
 }
 
 /// Titanium board move → ACE numeric encoding.
-pub fn board_move_to_ace(mv: BoardMove) -> i16 {
+pub fn board_move_to_move_id(mv: BoardMove) -> i16 {
     match mv {
         BoardMove::Pawn { row, col } => ((8 - row as i16) * 9 + col as i16) as i16,
         BoardMove::Wall {
@@ -338,8 +338,8 @@ fn emit_ace_progress(
 /// RaceProof race-table LRU slots (keyed by wall-config zobrist).
 const RC_SLOTS: usize = 64;
 
-pub struct AceSearch {
-    pub g: AceGame,
+pub struct TitaniumSearch {
+    pub g: GameState,
     tt_key_hi: Vec<u32>,
     tt_key_lo: Vec<u32>,
     tt_meta: Vec<i32>, // move | flag<<10 | depth<<12, 0 = empty
@@ -363,7 +363,7 @@ pub struct AceSearch {
     /// Overflow-driven cache-tier growth targets (Titanium strategy): start in L1,
     /// jump L1→L2→L3→d4(18)→d5(22) on overflow, then +1 per overflow past d5. Each
     /// jump lands on a calibrated size that won't immediately re-overflow. Inactive
-    /// unless [`enable_adaptive_tt`](AceSearch::enable_adaptive_tt) is called.
+    /// unless [`enable_adaptive_tt`](TitaniumSearch::enable_adaptive_tt) is called.
     tt_l2: usize,
     tt_l3: usize,
     tt_d4: usize,
@@ -508,8 +508,8 @@ pub struct AceSearch {
 const STREAM_EMIT_NODE_MASK: u64 = 65535;
 const STREAM_EMIT_MIN_INTERVAL_MS: u64 = 100;
 
-impl AceSearch {
-    pub fn new(g: AceGame) -> Box<Self> {
+impl TitaniumSearch {
+    pub fn new(g: GameState) -> Box<Self> {
         Box::new(Self {
             g,
             tt_key_hi: vec![0; TT_SIZE],
@@ -570,7 +570,7 @@ impl AceSearch {
             eme: false,
             nodes: 0,
             deadline: Instant::now(),
-            root_best: super::ACE_NO_MOVE,
+            root_best: super::TITANIUM_NO_MOVE,
             root_score: 0,
             use_partial_iter: true,
             pure_mode: false,
@@ -666,7 +666,7 @@ impl AceSearch {
     }
 
     /// Titanium movegen on a mirrored board — same legal set, much faster than `wall_legal`.
-    pub fn with_ti_movegen(g: AceGame) -> Box<Self> {
+    pub fn with_ti_movegen(g: GameState) -> Box<Self> {
         let mut search = Self::new(g);
         search.bridge = Some(TiBridge::from_game(&search.g));
         search.ti_movegen = true;
@@ -675,7 +675,7 @@ impl AceSearch {
 
     /// Pure JS-port baseline + O1 movegen only. Uses **frozen** v13 HalfPW weights
     /// (`net_weights_frozen.bin`) — never picks up live training/deploy updates.
-    pub fn with_ti_movegen_pure(g: AceGame) -> Box<Self> {
+    pub fn with_ti_movegen_pure(g: GameState) -> Box<Self> {
         let mut search = Self::new(g);
         search.net = net_frozen();
         search.bridge = Some(TiBridge::from_game(&search.g));
@@ -685,7 +685,7 @@ impl AceSearch {
     }
 
     /// CAT hybrid: walls at inner nodes must pass `wall_should_search`.
-    pub fn with_cat(g: AceGame) -> Box<Self> {
+    pub fn with_cat(g: GameState) -> Box<Self> {
         let mut search = Self::new(g);
         search.bridge = Some(TiBridge::from_game(&search.g));
         search.cat_walls = true;
@@ -693,7 +693,7 @@ impl AceSearch {
     }
 
     /// Fast Titanium movegen + CAT wall filter.
-    pub fn with_ti_movegen_and_cat(g: AceGame) -> Box<Self> {
+    pub fn with_ti_movegen_and_cat(g: GameState) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
         search.cat_walls = true;
         search
@@ -715,25 +715,25 @@ impl AceSearch {
     /// deltas are not individually trustworthy. These two extras are kept because
     /// they are *provably* non-harmful, not because a single match "won".
     /// `tt_bits = Some(n)` pins a fixed TT instead of the adaptive one.
-    pub fn grafted(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+    pub fn grafted(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         Self::grafted_with_weights(g, tt_bits, net())
     }
 
     /// Same as [`grafted`] but uses the frozen v13 HalfPW blob (training A/B control).
-    pub fn grafted_frozen(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+    pub fn grafted_frozen(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         Self::grafted_with_weights(g, tt_bits, net_frozen())
     }
 
     /// Production graft minus RaceProof/cert gates. Experimental only: useful for
     /// measuring whether search can replace the proof layer before removing it.
-    pub fn grafted_no_raceproof(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+    pub fn grafted_no_raceproof(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         let mut search = Self::grafted(g, tt_bits);
         search.race_proof = false;
         search
     }
 
     pub fn grafted_with_weights(
-        g: AceGame,
+        g: GameState,
         tt_bits: Option<usize>,
         weights: &'static Net,
     ) -> Box<Self> {
@@ -750,7 +750,7 @@ impl AceSearch {
 
     /// gen13 net search + O1 movegen + cheap hands-empty cert, but **no CAT**.
     /// Isolates the certificate contribution from CAT wall-pruning.
-    pub fn with_ti_movegen_cheap_cert(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+    pub fn with_ti_movegen_cheap_cert(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
         search.cheap_cert = true;
         if let Some(bits) = tt_bits {
@@ -761,7 +761,7 @@ impl AceSearch {
 
     /// gen13 net search + O1 movegen + adaptive cache-tier TT (no CAT, no cert).
     /// Isolates the TT-growth contribution.
-    pub fn with_ti_movegen_adaptive_tt(g: AceGame) -> Box<Self> {
+    pub fn with_ti_movegen_adaptive_tt(g: GameState) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
         search.enable_adaptive_tt();
         search
@@ -769,7 +769,7 @@ impl AceSearch {
 
     /// gen13 net search + O1 movegen + SOUND dead-zone wall prune (no CAT heat).
     /// Isolates the dead-zone pruner's contribution (NPS-only, can't cost Elo).
-    pub fn with_ti_movegen_deadzone(g: AceGame) -> Box<Self> {
+    pub fn with_ti_movegen_deadzone(g: GameState) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
         search.dead_zone_prune = true;
         search
@@ -886,7 +886,7 @@ impl AceSearch {
 
     /// Replace the position outright (undo, new game) without clearing the
     /// TT — entries are hash-keyed, stale ones simply never match.
-    pub fn set_position(&mut self, g: AceGame) {
+    pub fn set_position(&mut self, g: GameState) {
         self.g = g;
         self.position_changed();
     }
@@ -951,7 +951,7 @@ impl AceSearch {
         }
         let mut board = Board::new();
         for i in 0..self.g.hist_len {
-            let _ = board.make_move(ace_move_to_board(self.g.hist_m[i]));
+            let _ = board.make_move(move_id_to_board(self.g.hist_m[i]));
         }
         let mut scratch = BfsScratch::new();
         let mut cache = None;
@@ -1411,7 +1411,7 @@ impl AceSearch {
         // no walls the win-certificate reduces to the race outcome, so this returns
         // the same verdict as `certify` at a fraction of the node cost.
         if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
-            use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+            use crate::titanium::cert_bridge::hands_empty_race_stm_wins;
             if let Some(stm_wins) = hands_empty_race_stm_wins(&mut self.g) {
                 return if s == self.g.turn {
                     stm_wins
@@ -1577,7 +1577,7 @@ impl AceSearch {
                 // No walls left: Quoridor is a forced pawn race, never a draw.
                 // Most races are settled by tempo/path math; only close
                 // overlapping paths pay the tiny forward minimax proof.
-                use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+                use crate::titanium::cert_bridge::hands_empty_race_stm_wins;
                 if let Some(stm_wins) = hands_empty_race_stm_wins(&mut self.g) {
                     if stm_wins {
                         return RACE_MATE - d_me_i.max(1);
@@ -1878,7 +1878,7 @@ impl AceSearch {
                 let m = base + slot as i16;
                 let keep = m == tt_move
                     || wall_should_search(
-                        ace_move_to_board(m),
+                        move_id_to_board(m),
                         &cat,
                         reachable,
                         gap_zone,
@@ -1912,7 +1912,7 @@ impl AceSearch {
                     continue;
                 }
                 let m = base + slot as i16;
-                if wall_in_dead_zone(ace_move_to_board(m), reachable) {
+                if wall_in_dead_zone(move_id_to_board(m), reachable) {
                     continue;
                 }
                 out[n] = m;
@@ -2475,7 +2475,7 @@ impl AceSearch {
                 let my_v = if immediate_win {
                     1
                 } else {
-                    use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+                    use crate::titanium::cert_bridge::hands_empty_race_stm_wins;
                     let child_stm_wins = hands_empty_race_stm_wins(&mut self.g).unwrap_or(false);
                     let mut d_me = [255u8; 81];
                     let mut d_opp = [255u8; 81];
@@ -2638,7 +2638,7 @@ impl AceSearch {
         }
         self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
         self.nodes = 0;
-        self.root_best = super::ACE_NO_MOVE;
+        self.root_best = super::TITANIUM_NO_MOVE;
         self.root_score = 0;
         if !self.pure_mode && !self.is_pondering {
             // Advance TT generation: depth-preferred replacement will now protect entries
@@ -2670,14 +2670,14 @@ impl AceSearch {
         self.stream_depth_log.clear();
         self.stream_last_emit_nodes = 0;
         self.stream_last_emit_ms = 0;
-        self.stream_last_best = super::ACE_NO_MOVE;
+        self.stream_last_best = super::TITANIUM_NO_MOVE;
         // Re-sync the mirrored Titanium board from the authoritative ACE game.
         // Kills any drift left over from a previous search (e.g. an unbalanced
         // push/pop on time-abort) before it can poison this move's root list.
         if self.bridge.is_some() {
             self.bridge = Some(TiBridge::from_game(&self.g));
         }
-        let mut last_best: i16 = super::ACE_NO_MOVE;
+        let mut last_best: i16 = super::TITANIUM_NO_MOVE;
         let mut last_score = 0;
         let mut last_depth = 0;
         let mut stable = 0;
@@ -2768,7 +2768,7 @@ impl AceSearch {
                     }
                     let elapsed_ms = t0.elapsed().as_millis() as u64;
                     let pv = if last_best >= 0 {
-                        super::ace_to_algebraic(last_best)
+                        super::move_id_to_algebraic(last_best)
                     } else {
                         String::new()
                     };
@@ -2844,7 +2844,7 @@ impl AceSearch {
         {
             self.g.make_move(last_best);
             let rp_ok = if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
-                use crate::acev13::cert_bridge::hands_empty_race_stm_wins;
+                use crate::titanium::cert_bridge::hands_empty_race_stm_wins;
                 match hands_empty_race_stm_wins(&mut self.g) {
                     Some(opp_wins) => !opp_wins,
                     None => true, // unknown ⇒ do not demote without proof
@@ -2891,14 +2891,14 @@ impl AceSearch {
             if last_best >= 0 && nlegal > 0 {
                 eprintln!(
                     "info string ace root guard: searched best {} is illegal in true position — substituting",
-                    super::ace_to_algebraic(last_best)
+                    super::move_id_to_algebraic(last_best)
                 );
             }
             if nlegal > 0 {
                 self.order_moves(0, &mut legal[..nlegal], 0, 0);
                 last_best = legal[0];
             } else {
-                last_best = super::ACE_NO_MOVE;
+                last_best = super::TITANIUM_NO_MOVE;
             }
         }
 
