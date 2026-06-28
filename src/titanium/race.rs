@@ -432,7 +432,7 @@ pub enum RaceClass {
 /// the attractor iteration depth of the winning prover (an APPROXIMATE ply hint,
 /// never exact DTM; `u16::MAX` when unknown).
 pub struct RaceWinnerTable {
-    class: Box<[u8]>, // RACE_STATES; 0 = Unknown, 1 = ProvenP0, 2 = ProvenP1
+    class: Box<[u8]>,  // RACE_STATES; 0 = Unknown, 1 = ProvenP0, 2 = ProvenP1
     layer: Box<[u16]>, // RACE_STATES; approximate plies (attractor layer) or u16::MAX
 }
 
@@ -601,7 +601,12 @@ fn enumerate_attractor_graph<F: FnMut(u32, u32)>(
 /// into a flat edge list, then a counting-sort scatter into one contiguous CSR
 /// allocation, then backward-reachability propagation. (The two-pass variant —
 /// which regenerates transitions twice — was measured ~75% slower and dropped.)
-fn attractor_pass_csr(g_root: &GameState, own: &[[u8; 81]; 2], prover: usize, sc: &mut RaceCsrScratch) {
+fn attractor_pass_csr(
+    g_root: &GameState,
+    own: &[[u8; 81]; 2],
+    prover: usize,
+    sc: &mut RaceCsrScratch,
+) {
     let n = RACE_STATES;
     let RaceCsrScratch {
         incoming,
@@ -623,10 +628,20 @@ fn attractor_pass_csr(g_root: &GameState, own: &[[u8; 81]; 2], prover: usize, sc
     edges.clear();
 
     // Single transition pass: collect edges and per-child in-degree.
-    enumerate_attractor_graph(g_root, own, prover, win, layer, remaining, queue, true, |p, c| {
-        edges.push((p, c));
-        incoming[c as usize] += 1;
-    });
+    enumerate_attractor_graph(
+        g_root,
+        own,
+        prover,
+        win,
+        layer,
+        remaining,
+        queue,
+        true,
+        |p, c| {
+            edges.push((p, c));
+            incoming[c as usize] += 1;
+        },
+    );
 
     // Prefix sum → offsets; allocate the flat predecessor array once.
     offsets[0] = 0;
@@ -779,7 +794,6 @@ fn is_race_jump(src: usize, dst: usize) -> bool {
     let dcol = (sc as i32 - dc as i32).unsigned_abs();
     drow + dcol != 1
 }
-
 
 // ---------------------------------------------------------------------------
 // Service B — exact DTM (lazy successor-graph retrograde). Proven +k/-k-exact.
@@ -3488,10 +3502,7 @@ mod tests {
         }
 
         let result = if !wins.is_empty() {
-            let (mv, child) = wins
-                .into_iter()
-                .min_by_key(|(m, s)| (s.dtm, *m))
-                .unwrap();
+            let (mv, child) = wins.into_iter().min_by_key(|(m, s)| (s.dtm, *m)).unwrap();
             CertificateSolution {
                 winner: side as u8,
                 dtm: child.dtm + 1,
@@ -3531,8 +3542,8 @@ mod tests {
                 let mut ip = new_in_progress();
                 match solve_certificate(&g, ctx, &mut ip, 0, &mut Vec::new()) {
                     CertificateResult::Solved(_) => {}
-                    CertificateResult::DominanceCounterexample { .. } |
-                    CertificateResult::CycleDetected { .. } => break,
+                    CertificateResult::DominanceCounterexample { .. }
+                    | CertificateResult::CycleDetected { .. } => break,
                 }
             }
             let entry = ctx.memo[id].expect("certificate PV state missing from memo");
@@ -3633,7 +3644,12 @@ mod tests {
     /// Reconstruct legal[`index`] from base seed RAND_SEEDS[0] exactly as the
     /// corpus audit does, probe `(p0,p1,turn)`, and print/return the full Gate-2
     /// diagnostic for that state.
-    fn gate2_diag(index: usize, p0: usize, p1: usize, turn: usize) -> (i16, bool, bool, RaceVerdict, RaceClass) {
+    fn gate2_diag(
+        index: usize,
+        p0: usize,
+        p1: usize,
+        turn: usize,
+    ) -> (i16, bool, bool, RaceVerdict, RaceClass) {
         let seed = 0xACE5_2026u64;
         let mut rng = seed ^ (index as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
         let topo = loop {
@@ -3673,8 +3689,11 @@ mod tests {
 
         eprintln!("── Gate 2 diagnostic legal[{index}] ──────────────────────────");
         eprintln!("replay moves: {:?}", topo.moves);
-        eprintln!("state_id={} p0={p0} p1={p1} turn={turn} manhattan={}",
-                  state_id(p0, p1, turn), cell_manhattan(p0, p1));
+        eprintln!(
+            "state_id={} p0={p0} p1={p1} turn={turn} manhattan={}",
+            state_id(p0, p1, turn),
+            cell_manhattan(p0, p1)
+        );
         eprintln!("d0[p0]={} d1[p1]={}", d0[p0], d1[p1]);
         eprintln!("shortest set0 (p0): {cells0:?}");
         eprintln!("shortest set1 (p1): {cells1:?}");
@@ -3702,7 +3721,10 @@ mod tests {
             }
         };
 
-        for (label, g) in [("empty_board", GameState::new()), ("legal_20wall", topo.g.clone())] {
+        for (label, g) in [
+            ("empty_board", GameState::new()),
+            ("legal_20wall", topo.g.clone()),
+        ] {
             // Cold build (median of a few).
             let mut best = u128::MAX;
             let mut tbl_holder = None;
@@ -3742,9 +3764,20 @@ mod tests {
         let (oracle, overlap, contact_free, verdict, cls) = gate2_diag(92, 21, 20, 1);
         assert_eq!(oracle, 11, "oracle: stm (p1) wins in 11");
         assert!(!overlap, "vertex-only overlap reports separated (defect)");
-        assert_eq!(verdict, RaceVerdict::Loss, "pure-race verdict: stm loses (WRONG)");
-        assert_eq!(cls, RaceClass::ProvenP1, "winner table: P1 proven win (CORRECT)");
-        assert!(!contact_free, "contact-aware test catches the adjacency contact");
+        assert_eq!(
+            verdict,
+            RaceVerdict::Loss,
+            "pure-race verdict: stm loses (WRONG)"
+        );
+        assert_eq!(
+            cls,
+            RaceClass::ProvenP1,
+            "winner table: P1 proven win (CORRECT)"
+        );
+        assert!(
+            !contact_free,
+            "contact-aware test catches the adjacency contact"
+        );
     }
 
     /// Counterexample 2 — NON-ADJACENT pawns (manhattan 4). The corrected
@@ -3762,10 +3795,21 @@ mod tests {
     fn diag_gate2_nonadjacent_detour_counterexample() {
         let (oracle, _overlap, contact_free, verdict, cls) = gate2_diag(24, 23, 39, 0);
         assert_eq!(oracle, 15, "oracle: stm (p0) wins in 15");
-        assert!(contact_free, "contact-aware test still reports separated (insufficient)");
-        assert_eq!(verdict, RaceVerdict::Loss, "pure-race verdict: WRONG sign (would be a false bound)");
+        assert!(
+            contact_free,
+            "contact-aware test still reports separated (insufficient)"
+        );
+        assert_eq!(
+            verdict,
+            RaceVerdict::Loss,
+            "pure-race verdict: WRONG sign (would be a false bound)"
+        );
         // The winner table declines soundly (no false proof); production returns Unknown.
-        assert_eq!(cls, RaceClass::Unknown, "winner table soundly declines (no false proof)");
+        assert_eq!(
+            cls,
+            RaceClass::Unknown,
+            "winner table soundly declines (no false proof)"
+        );
     }
 
     /// Does the PRODUCTION winner table already encode "reaches goal FIRST"?
@@ -3789,13 +3833,25 @@ mod tests {
             wt.classify(id),
             oracle[id]
         );
-        assert_eq!(wt.classify(id), RaceClass::ProvenP1, "p1 jumps over p0 and wins first");
+        assert_eq!(
+            wt.classify(id),
+            RaceClass::ProvenP1,
+            "p1 jumps over p0 and wins first"
+        );
 
         // Mirror by vertical reflection (row r -> 8-r) and player swap:
         // (p0=37=r4c1, p1=28=r3c1, turn=1) -> (p0=46=r5c1, p1=37=r4c1, turn=0).
         let mid = state_id(46, 37, 0);
-        eprintln!("WT mirror 46/37/turn0: class={:?} oracle={}", wt.classify(mid), oracle[mid]);
-        assert_eq!(wt.classify(mid), RaceClass::ProvenP0, "mirror: p0 jumps over p1 and wins first");
+        eprintln!(
+            "WT mirror 46/37/turn0: class={:?} oracle={}",
+            wt.classify(mid),
+            oracle[mid]
+        );
+        assert_eq!(
+            wt.classify(mid),
+            RaceClass::ProvenP0,
+            "mirror: p0 jumps over p1 and wins first"
+        );
 
         // Full empty-board winner audit: production table vs exact oracle.
         let mut mism = 0u64;
@@ -3827,7 +3883,10 @@ mod tests {
             }
         }
         eprintln!("WT empty-board audit: live={live} winner_mismatches={mism}");
-        assert_eq!(mism, 0, "production winner table winner mismatch on empty board");
+        assert_eq!(
+            mism, 0,
+            "production winner table winner mismatch on empty board"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4088,8 +4147,14 @@ mod tests {
 
         // Corpus: empty board + 2 pinned + 8 named + 40 legal topologies.
         const ADV: [u64; 8] = [
-            0xC0111D_A001, 0x5E2A_A002, 0xC2055_A003, 0x51DE_A004,
-            0xBAC0_A005, 0x1EAA_A006, 0xAA0D_A007, 0x701E_A008,
+            0xC0111D_A001,
+            0x5E2A_A002,
+            0xC2055_A003,
+            0x51DE_A004,
+            0xBAC0_A005,
+            0x1EAA_A006,
+            0xAA0D_A007,
+            0x701E_A008,
         ];
         let legal_topo = |index: usize| -> GameState {
             let mut rng = 0xACE5_2026u64 ^ (index as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
@@ -4366,11 +4431,17 @@ mod tests {
         }
         let faster = t_c < t_full;
         eprintln!("VERDICT: K1 hybrid faster than FULL? {faster}  (filter+final vs full)");
-        eprintln!("VERDICT: K2 hybrid faster than FULL? {}  ", t_k2hyb < t_full);
+        eprintln!(
+            "VERDICT: K2 hybrid faster than FULL? {}  ",
+            t_k2hyb < t_full
+        );
         eprintln!("──────────────────────────────────────────────────────────────");
 
         // Hard invariants that MUST hold (independent of the experiment outcome):
-        assert_eq!(full_vs_oracle_mism, 0, "FULL table winner mismatch vs oracle");
+        assert_eq!(
+            full_vs_oracle_mism, 0,
+            "FULL table winner mismatch vs oracle"
+        );
         // (FULL == production table is asserted per-state in the loop.)
         // The hybrid equality (full_eq_b / full_eq_c) and timing are reported as
         // experiment outcomes, not gated — the optimization is accepted only if it
@@ -4535,8 +4606,14 @@ mod tests {
     #[test]
     fn csr_winner_table_oracle_parity() {
         const ADV: [u64; 8] = [
-            0xC0111D_A001, 0x5E2A_A002, 0xC2055_A003, 0x51DE_A004,
-            0xBAC0_A005, 0x1EAA_A006, 0xAA0D_A007, 0x701E_A008,
+            0xC0111D_A001,
+            0x5E2A_A002,
+            0xC2055_A003,
+            0x51DE_A004,
+            0xBAC0_A005,
+            0x1EAA_A006,
+            0xAA0D_A007,
+            0x701E_A008,
         ];
         let mut topos = vec![GameState::new(), csr_legal_topo(92), csr_legal_topo(24)];
         for s in ADV {
@@ -4575,7 +4652,10 @@ mod tests {
                 }
             }
         }
-        eprintln!("CSR winner-table oracle parity: topos={} winner_mismatches={mism}", topos.len());
+        eprintln!(
+            "CSR winner-table oracle parity: topos={} winner_mismatches={mism}",
+            topos.len()
+        );
         assert_eq!(mism, 0, "CSR winner table winner mismatch vs oracle");
     }
 
@@ -4593,10 +4673,13 @@ mod tests {
                 assert_eq!(s.dtm, 1, "should win in 1 ply");
                 assert!(s.best_move != NO_MOVE, "must have a move");
                 assert!(is_home(0, s.best_move as usize), "move must reach p0 goal");
-                eprintln!("immediate_goal: winner={} dtm={} mv={}", s.winner, s.dtm, s.best_move);
+                eprintln!(
+                    "immediate_goal: winner={} dtm={} mv={}",
+                    s.winner, s.dtm, s.best_move
+                );
             }
-            CertificateResult::DominanceCounterexample { state_id, .. } |
-            CertificateResult::CycleDetected { state_id } => {
+            CertificateResult::DominanceCounterexample { state_id, .. }
+            | CertificateResult::CycleDetected { state_id } => {
                 panic!("unexpected result at state {state_id}");
             }
         }
@@ -4623,11 +4706,26 @@ mod tests {
             CertificateResult::Solved(s) => {
                 let oracle_winner = if oracle > 0 { 0u8 } else { 1u8 };
                 assert_eq!(s.winner, oracle_winner, "winner mismatch head-on");
-                eprintln!("head_on cert: winner={} dtm={} mv={}", s.winner, s.dtm, s.best_move);
+                eprintln!(
+                    "head_on cert: winner={} dtm={} mv={}",
+                    s.winner, s.dtm, s.best_move
+                );
             }
-            CertificateResult::DominanceCounterexample { state_id, legal_moves, .. } => {
+            CertificateResult::DominanceCounterexample {
+                state_id,
+                legal_moves,
+                ..
+            } => {
                 for d in &legal_moves {
-                    eprintln!("  mv={} dst={} old_d={} new_d={} delta={} jump={}", d.move_id, d.destination, d.old_distance, d.new_distance, d.delta, d.is_jump);
+                    eprintln!(
+                        "  mv={} dst={} old_d={} new_d={} delta={} jump={}",
+                        d.move_id,
+                        d.destination,
+                        d.old_distance,
+                        d.new_distance,
+                        d.delta,
+                        d.is_jump
+                    );
                 }
                 panic!("counterexample at state {state_id}");
             }
@@ -4653,10 +4751,13 @@ mod tests {
                 assert_eq!(s.dtm, 1, "should win in 1 ply via jump");
                 assert!(s.best_move != NO_MOVE, "must have a move");
                 assert!(is_home(0, s.best_move as usize), "jump must reach row 0");
-                eprintln!("diagonal_jump: winner={} dtm={} mv={}", s.winner, s.dtm, s.best_move);
+                eprintln!(
+                    "diagonal_jump: winner={} dtm={} mv={}",
+                    s.winner, s.dtm, s.best_move
+                );
             }
-            CertificateResult::DominanceCounterexample { state_id, .. } |
-            CertificateResult::CycleDetected { state_id } => {
+            CertificateResult::DominanceCounterexample { state_id, .. }
+            | CertificateResult::CycleDetected { state_id } => {
                 panic!("unexpected result at state {state_id}");
             }
         }
@@ -4680,11 +4781,7 @@ mod tests {
 
         // Use non-terminal cases only.
         let _unused = cases; // shadow to avoid warning
-        let cases: &[(usize, usize, usize)] = &[
-            (13, 40, 0),
-            (40, 41, 0),
-            (76, 4, 0),
-        ];
+        let cases: &[(usize, usize, usize)] = &[(13, 40, 0), (40, 41, 0), (76, 4, 0)];
 
         for &(p0, p1, turn) in cases {
             let mut root = g.clone();
@@ -4697,10 +4794,16 @@ mod tests {
                 continue;
             }
 
-            let sol = match solve_certificate(&root, &mut ctx, &mut new_in_progress(), 0, &mut Vec::new()) {
+            let sol = match solve_certificate(
+                &root,
+                &mut ctx,
+                &mut new_in_progress(),
+                0,
+                &mut Vec::new(),
+            ) {
                 CertificateResult::Solved(s) => s,
-                CertificateResult::DominanceCounterexample { state_id, .. } |
-                CertificateResult::CycleDetected { state_id } => {
+                CertificateResult::DominanceCounterexample { state_id, .. }
+                | CertificateResult::CycleDetected { state_id } => {
                     panic!("unexpected result at state {state_id} for ({p0},{p1},{turn})");
                 }
             };
@@ -4708,7 +4811,9 @@ mod tests {
             let pv = reconstruct_certificate_pv(&root, &mut ctx);
             eprintln!(
                 "pv_consistency ({p0},{p1},{turn}): winner={} dtm={} pv_len={} pv={pv:?}",
-                sol.winner, sol.dtm, pv.len()
+                sol.winner,
+                sol.dtm,
+                pv.len()
             );
 
             assert_eq!(
@@ -4814,7 +4919,8 @@ mod tests {
                     g.pawn[1] = p1;
                     g.turn = turn;
 
-                    let cert_result = solve_certificate(&g, &mut ctx, &mut new_in_progress(), 0, &mut Vec::new());
+                    let cert_result =
+                        solve_certificate(&g, &mut ctx, &mut new_in_progress(), 0, &mut Vec::new());
 
                     let sol = match cert_result {
                         CertificateResult::Solved(s) => s,
@@ -4832,9 +4938,12 @@ mod tests {
                                     .map(|d| {
                                         format!(
                                             "mv={} dst={} old={} new={} delta={} jump={}",
-                                            d.move_id, d.destination,
-                                            d.old_distance, d.new_distance,
-                                            d.delta, d.is_jump
+                                            d.move_id,
+                                            d.destination,
+                                            d.old_distance,
+                                            d.new_distance,
+                                            d.delta,
+                                            d.is_jump
                                         )
                                     })
                                     .collect();
@@ -4859,7 +4968,11 @@ mod tests {
 
                     // Winner check.
                     // Oracle: +k = stm wins in k plies; -k = stm loses.
-                    let oracle_winner = if oracle > 0 { turn as u8 } else { (turn ^ 1) as u8 };
+                    let oracle_winner = if oracle > 0 {
+                        turn as u8
+                    } else {
+                        (turn ^ 1) as u8
+                    };
                     if sol.winner != oracle_winner {
                         winner_mismatches += 1;
                         if first_winner_fail.is_none() {
@@ -4943,7 +5056,10 @@ mod tests {
         eprintln!("oracle build time:      {oracle_ms} ms");
         eprintln!("cert cold solve time:   {cold_us} µs");
         eprintln!("cert warm lookup (ns):  {warm_ns}");
-        eprintln!("memo memory:            {} KB", RACE_STATES * std::mem::size_of::<Option<CertificateSolution>>() / 1024);
+        eprintln!(
+            "memo memory:            {} KB",
+            RACE_STATES * std::mem::size_of::<Option<CertificateSolution>>() / 1024
+        );
         eprintln!("──────────────────────────────────────────────────────────────");
         if let Some(ref msg) = first_winner_fail {
             eprintln!("first winner fail: {msg}");
@@ -4955,10 +5071,12 @@ mod tests {
         // Hard assertions.
         assert_eq!(
             counterexamples, 0,
-            "theorem counterexample: no retained delta>=1 move at {} state(s)", counterexamples
+            "theorem counterexample: no retained delta>=1 move at {} state(s)",
+            counterexamples
         );
         assert_eq!(
-            winner_mismatches, 0,
+            winner_mismatches,
+            0,
             "certificate winner mismatch at {} state(s); first: {}",
             winner_mismatches,
             first_winner_fail.as_deref().unwrap_or("none")
@@ -4999,7 +5117,11 @@ mod tests {
             let pv = reconstruct_certificate_pv(&root, &mut ctx);
             if pv.len() != sol.dtm as usize {
                 pv_failures += 1;
-                eprintln!("PV length {} != DTM {} at ({p0},{p1},{turn})", pv.len(), sol.dtm);
+                eprintln!(
+                    "PV length {} != DTM {} at ({p0},{p1},{turn})",
+                    pv.len(),
+                    sol.dtm
+                );
             }
             // Walk and verify legal.
             let mut walk = root.clone();
@@ -5008,7 +5130,10 @@ mod tests {
                 let nm = walk.gen_pawn_moves(&mut lb, 0);
                 if !lb[..nm].contains(&mv) {
                     pv_failures += 1;
-                    eprintln!("PV move {mv} illegal at ({},{},{})", walk.pawn[0], walk.pawn[1], walk.turn);
+                    eprintln!(
+                        "PV move {mv} illegal at ({},{},{})",
+                        walk.pawn[0], walk.pawn[1], walk.turn
+                    );
                 }
                 walk.make_move(mv);
             }
@@ -5050,7 +5175,9 @@ mod tests {
     /// Return repo root (parent of the engine crate directory).
     fn repo_root() -> Option<std::path::PathBuf> {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-        std::path::Path::new(&manifest).parent().map(|p| p.to_path_buf())
+        std::path::Path::new(&manifest)
+            .parent()
+            .map(|p| p.to_path_buf())
     }
 
     /// Load all games from all_games.db. Returns Vec of move sequences (move IDs).
@@ -5064,13 +5191,14 @@ mod tests {
                 return out;
             }
         };
-        let mut stmt = match conn.prepare("SELECT id, moves_bin FROM games WHERE moves_bin IS NOT NULL") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("prepare failed: {e}");
-                return out;
-            }
-        };
+        let mut stmt =
+            match conn.prepare("SELECT id, moves_bin FROM games WHERE moves_bin IS NOT NULL") {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("prepare failed: {e}");
+                    return out;
+                }
+            };
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
@@ -5115,10 +5243,8 @@ mod tests {
             let mut game_idx = 0usize;
             for line in BufReader::new(file).lines().flatten() {
                 if let Some(rest) = line.strip_prefix("GAME ") {
-                    let moves: Vec<i16> = rest
-                        .split_whitespace()
-                        .map(algebraic_to_move_id)
-                        .collect();
+                    let moves: Vec<i16> =
+                        rest.split_whitespace().map(algebraic_to_move_id).collect();
                     out.push((format!("{src_name}#game_{game_idx}"), moves));
                     game_idx += 1;
                 }
@@ -5207,12 +5333,13 @@ mod tests {
         let mut dist = vec![u16::MAX; RACE_STATES];
         let mut best_mv = vec![NO_MOVE; RACE_STATES];
 
-        let mut queue: std::collections::VecDeque<usize> =
-            std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
 
         for p0 in 0..81usize {
             for p1 in 0..81usize {
-                if p0 == p1 { continue; }
+                if p0 == p1 {
+                    continue;
+                }
                 for turn in 0..2usize {
                     let id = state_id(p0, p1, turn);
 
@@ -5227,7 +5354,9 @@ mod tests {
                     // Opponent already home → prover cannot win from here; no edges.
                     let opp = prover ^ 1;
                     let opp_home = is_home(opp, if opp == 0 { p0 } else { p1 });
-                    if opp_home { continue; }
+                    if opp_home {
+                        continue;
+                    }
 
                     let mut g = g_root.clone();
                     g.pawn[0] = p0;
@@ -5254,7 +5383,9 @@ mod tests {
                                 old_d as i16 - new_d as i16
                             };
                             let jump = is_jump_move(src, dst);
-                            if !(jump || delta >= 1) { continue; }
+                            if !(jump || delta >= 1) {
+                                continue;
+                            }
                         }
                         // AND node: take every legal move unrestricted.
                         let mut cg = g.clone();
@@ -5274,7 +5405,9 @@ mod tests {
             let cd = dist[c];
             let preds = predecessors[c].clone();
             for (p, mv) in preds {
-                if win[p] { continue; }
+                if win[p] {
+                    continue;
+                }
                 let p_turn = p % 2;
                 if p_turn == prover {
                     // OR node: one winning child suffices.
@@ -5284,7 +5417,9 @@ mod tests {
                     queue.push_back(p);
                 } else {
                     // AND node: confirm only when every child is a P-win.
-                    if remaining[p] > 0 { remaining[p] -= 1; }
+                    if remaining[p] > 0 {
+                        remaining[p] -= 1;
+                    }
                     if remaining[p] == 0 {
                         win[p] = true;
                         dist[p] = cd + 1; // last (max-dist) child ⟹ max resistance
@@ -5316,7 +5451,10 @@ mod tests {
             let both_home = is_home(0, p0c) && is_home(1, p1c);
             if a0.win[id] {
                 // Determinacy: a0 and a1 cannot both hold for a real state.
-                debug_assert!(both_home || !a1.win[id], "both provers force win at state {id}");
+                debug_assert!(
+                    both_home || !a1.win[id],
+                    "both provers force win at state {id}"
+                );
                 ctx.memo[id] = Some(CertificateSolution {
                     winner: 0,
                     dtm: a0.dist[id],
@@ -5335,8 +5473,8 @@ mod tests {
 
     #[test]
     fn certificate_poc_real_game_database() {
-        use std::time::Instant;
         use std::collections::HashMap;
+        use std::time::Instant;
 
         let root = match repo_root() {
             Some(r) => r,
@@ -5363,7 +5501,10 @@ mod tests {
             .chain(text_games.into_iter())
             .collect();
         eprintln!("Total games: {}", all_games.len());
-        assert!(!all_games.is_empty(), "No games loaded — check database paths");
+        assert!(
+            !all_games.is_empty(),
+            "No games loaded — check database paths"
+        );
 
         // ── 2. Replay all games, collect topologies ────────────────────────
         // Dedup key: (hw[0..64], vw[0..64]).
@@ -5393,12 +5534,9 @@ mod tests {
                     endgame_positions: Vec::new(),
                 });
                 if entry.sources.len() < 4 {
-                    entry.sources.push((
-                        source.clone(),
-                        game_idx,
-                        ply,
-                        moves[..ply].to_vec(),
-                    ));
+                    entry
+                        .sources
+                        .push((source.clone(), game_idx, ply, moves[..ply].to_vec()));
                 }
                 // Record the actual endgame position (may hit same topology many times).
                 let pos = (g.pawn[0], g.pawn[1], g.turn);
@@ -5473,14 +5611,22 @@ mod tests {
 
             for p0 in 9..81usize {
                 for p1 in 0..72usize {
-                    if p0 == p1 { continue; }
+                    if p0 == p1 {
+                        continue;
+                    }
                     for turn in 0..2usize {
                         let id = state_id(p0, p1, turn);
                         let oracle = oracle_tbl[id];
-                        if oracle == 0 { continue; }
+                        if oracle == 0 {
+                            continue;
+                        }
                         topo_live += 1;
 
-                        let oracle_winner = if oracle > 0 { turn as u8 } else { (turn ^ 1) as u8 };
+                        let oracle_winner = if oracle > 0 {
+                            turn as u8
+                        } else {
+                            (turn ^ 1) as u8
+                        };
 
                         // ── Production parity + production-vs-oracle audit ─────
                         let test_winner: Option<u8> = ctx.memo[id].map(|s| s.winner);
@@ -5514,7 +5660,11 @@ mod tests {
                             } else {
                                 g2d1[p1] <= g2d0[p0]
                             };
-                            let g2_winner = if stm_wins { turn as u8 } else { (turn ^ 1) as u8 };
+                            let g2_winner = if stm_wins {
+                                turn as u8
+                            } else {
+                                (turn ^ 1) as u8
+                            };
                             if g2_winner != oracle_winner {
                                 total_g2_violations += 1;
                                 if first_g2_violation.is_none() {
@@ -5522,7 +5672,9 @@ mod tests {
                                         "G2 VIOLATION topo={topo_idx} id={id} p0={p0} p1={p1} \
                                          turn={turn} d0={} d1={} g2_winner={g2_winner} \
                                          oracle={oracle} manhattan={}",
-                                        g2d0[p0], g2d1[p1], cell_manhattan(p0, p1)
+                                        g2d0[p0],
+                                        g2d1[p1],
+                                        cell_manhattan(p0, p1)
                                     ));
                                 }
                             }
@@ -5545,15 +5697,27 @@ mod tests {
                                 g.turn = turn;
                                 first_winner_fail = Some(build_failure_diag(
                                     &topo.sources.first().map(|s| s.0.as_str()).unwrap_or("?"),
-                                    topo_idx, &topo.hw, &topo.vw,
-                                    id, p0, p1, turn, &sol, oracle, &ctx, &oracle_tbl, &mut g,
+                                    topo_idx,
+                                    &topo.hw,
+                                    &topo.vw,
+                                    id,
+                                    p0,
+                                    p1,
+                                    turn,
+                                    &sol,
+                                    oracle,
+                                    &ctx,
+                                    &oracle_tbl,
+                                    &mut g,
                                 ));
                             }
                             continue;
                         }
 
                         let oracle_dtm = oracle.unsigned_abs() as u16;
-                        if sol.dtm != oracle_dtm { topo_dtm_m += 1; }
+                        if sol.dtm != oracle_dtm {
+                            topo_dtm_m += 1;
+                        }
 
                         if sol.best_move != NO_MOVE && sol.best_move >= 0 {
                             let dst = sol.best_move as usize;
@@ -5573,7 +5737,9 @@ mod tests {
                             } else {
                                 child_oracle > 0
                             };
-                            if !child_ok { topo_bellman += 1; }
+                            if !child_ok {
+                                topo_bellman += 1;
+                            }
                         }
                     }
                 }
@@ -5589,14 +5755,24 @@ mod tests {
             for &(p0, p1, turn) in &topo.endgame_positions {
                 let id = state_id(p0, p1, turn);
                 let oracle = oracle_tbl[id];
-                if oracle == 0 { continue; }
+                if oracle == 0 {
+                    continue;
+                }
                 endgame_tested += 1;
 
                 if let Some(sol) = ctx.memo[id] {
-                    let oracle_winner = if oracle > 0 { turn as u8 } else { (turn ^ 1) as u8 };
-                    if sol.winner != oracle_winner { endgame_winner_mismatches += 1; }
+                    let oracle_winner = if oracle > 0 {
+                        turn as u8
+                    } else {
+                        (turn ^ 1) as u8
+                    };
+                    if sol.winner != oracle_winner {
+                        endgame_winner_mismatches += 1;
+                    }
                     let oracle_dtm = oracle.unsigned_abs() as u16;
-                    if sol.dtm != oracle_dtm { endgame_dtm_mismatches += 1; }
+                    if sol.dtm != oracle_dtm {
+                        endgame_dtm_mismatches += 1;
+                    }
                 }
             }
 
@@ -5638,18 +5814,30 @@ mod tests {
             eprintln!("{msg}");
         }
 
-        assert_eq!(total_winner_mismatches, 0,
+        assert_eq!(
+            total_winner_mismatches,
+            0,
             "certificate winner mismatch on real-game topologies; first: {}",
-            first_winner_fail.as_deref().unwrap_or("none"));
-        assert_eq!(endgame_winner_mismatches, 0,
-            "certificate winner mismatch on recorded endgame positions");
-        assert_eq!(total_parity_mismatches, 0,
-            "production winner table disagrees with the proven test implementation");
-        assert_eq!(total_prod_winner_mismatches, 0,
-            "production winner table winner disagrees with the exact oracle");
-        assert_eq!(total_g2_violations, 0,
+            first_winner_fail.as_deref().unwrap_or("none")
+        );
+        assert_eq!(
+            endgame_winner_mismatches, 0,
+            "certificate winner mismatch on recorded endgame positions"
+        );
+        assert_eq!(
+            total_parity_mismatches, 0,
+            "production winner table disagrees with the proven test implementation"
+        );
+        assert_eq!(
+            total_prod_winner_mismatches, 0,
+            "production winner table winner disagrees with the exact oracle"
+        );
+        assert_eq!(
+            total_g2_violations,
+            0,
             "corrected contact-aware Gate 2 produced a wrong-sign verdict; first: {}",
-            first_g2_violation.as_deref().unwrap_or("none"));
+            first_g2_violation.as_deref().unwrap_or("none")
+        );
     }
 
     /// Count bits set in a [u8; 64] wall array.
@@ -5714,16 +5902,30 @@ mod tests {
             .map(|&mv| {
                 let dst = mv as usize;
                 let new_d = ctx.own_goal_dist[side][dst];
-                let delta = if new_d == u8::MAX { i16::MIN / 2 } else { old_d as i16 - new_d as i16 };
+                let delta = if new_d == u8::MAX {
+                    i16::MIN / 2
+                } else {
+                    old_d as i16 - new_d as i16
+                };
                 let jump = is_jump_move(g.pawn[side], dst);
-                let class = if jump { "B" } else if delta >= 1 { "A" } else { "C" };
+                let class = if jump {
+                    "B"
+                } else if delta >= 1 {
+                    "A"
+                } else {
+                    "C"
+                };
                 // Child oracle after this move (from child's STM perspective).
                 let child_id = if turn == 0 {
                     state_id(dst, p1, 1)
                 } else {
                     state_id(p0, dst, 0)
                 };
-                let child_oracle = if is_home(turn, dst) { 1i16 } else { oracle_tbl[child_id] };
+                let child_oracle = if is_home(turn, dst) {
+                    1i16
+                } else {
+                    oracle_tbl[child_id]
+                };
                 format!("mv={mv} dst={dst} delta={delta} class={class} child_oracle={child_oracle}")
             })
             .collect();
@@ -5732,9 +5934,15 @@ mod tests {
         for &mv in &buf[..nm] {
             let dst = mv as usize;
             let new_d = ctx.own_goal_dist[side][dst];
-            let delta = if new_d == u8::MAX { i16::MIN / 2 } else { old_d as i16 - new_d as i16 };
+            let delta = if new_d == u8::MAX {
+                i16::MIN / 2
+            } else {
+                old_d as i16 - new_d as i16
+            };
             let jump = is_jump_move(side, dst);
-            if !(jump || delta >= 1) { continue; }
+            if !(jump || delta >= 1) {
+                continue;
+            }
             // Build child state, show opponent's legal moves and oracle values.
             let mut child_g = g.clone();
             child_g.make_move(mv);
@@ -5755,11 +5963,23 @@ mod tests {
             }).collect();
             child_diags.push(format!(
                 "  after mv={mv}: opp_at={} opp_d={} opp_moves=[{}]",
-                opp_src, opp_old_d, opp_moves.join("; ")
+                opp_src,
+                opp_old_d,
+                opp_moves.join("; ")
             ));
         }
-        let hw_bits: Vec<usize> = hw.iter().enumerate().filter(|(_, &v)| v != 0).map(|(i, _)| i).collect();
-        let vw_bits: Vec<usize> = vw.iter().enumerate().filter(|(_, &v)| v != 0).map(|(i, _)| i).collect();
+        let hw_bits: Vec<usize> = hw
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0)
+            .map(|(i, _)| i)
+            .collect();
+        let vw_bits: Vec<usize> = vw
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0)
+            .map(|(i, _)| i)
+            .collect();
         format!(
             "WINNER FAIL source={source} topo={topo_idx} \
              hw_slots={hw_bits:?} vw_slots={vw_bits:?} \

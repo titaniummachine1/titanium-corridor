@@ -299,8 +299,8 @@ impl Oracle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::titanium::cert_bridge::titanium_game_from_board;
     use crate::core::board::{Board, Player};
+    use crate::titanium::cert_bridge::titanium_game_from_board;
 
     #[test]
     fn empty_board_table_is_self_consistent() {

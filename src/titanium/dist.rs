@@ -4,9 +4,9 @@
 //! — no Titanium `Board` rebuild and no row-flip remap. Each layer is one
 //! `expand_frontier` u128 step (same binary / bitboard flood family as CAT / movegen `pbff_*`).
 
-use crate::titanium::game::GameState;
 use crate::path::flood::expand_frontier;
 use crate::path::masks::DirMasks;
+use crate::titanium::game::GameState;
 use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, square_index, FLOOD_PLAYABLE};
 
 /// Corridor cells considered for choke detection (matches CAT bottleneck band).
@@ -23,6 +23,13 @@ fn ace_goal_row(player: usize) -> u8 {
 
 /// Scatter BFS layers from `seed` into `out` (255 = unreachable).
 fn flood_scatter(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
+    crate::bench_instr::record(
+        |b| &mut b.flood_scatter,
+        || flood_scatter_inner(seed, masks, out),
+    )
+}
+
+fn flood_scatter_inner(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
     out.fill(255);
     let mut reached = seed & FLOOD_PLAYABLE;
     let mut frontier = reached;
@@ -412,7 +419,10 @@ mod tests {
 
     #[test]
     fn shared_masks_match_independent_goal_floods() {
-        for g in [GameState::new(), pos(&["e2", "e8", "e3", "e7", "d3h", "f5v"])] {
+        for g in [
+            GameState::new(),
+            pos(&["e2", "e8", "e3", "e7", "d3h", "f5v"]),
+        ] {
             let masks = DirMasks::from_ace_game(&g);
             for player in [0usize, 1] {
                 let mut independent = [0u8; 81];

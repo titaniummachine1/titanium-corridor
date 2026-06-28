@@ -46,15 +46,15 @@ pub mod wall_ignore_corridor;
 
 pub use game::GameState;
 pub use packed_state::{
-    titanium_game_from_packed, decode_packed_state, pack_state, FEATURE_SCHEMA, PACKED_STATE_LEN,
+    decode_packed_state, pack_state, titanium_game_from_packed, FEATURE_SCHEMA, PACKED_STATE_LEN,
     POSITION_SCHEMA_VERSION,
 };
 pub use perft::{
-    default_timeout, oracle_nodes, perft_titanium_native_timed, perft_titanium_ti_timed,
-    perft_titanium_timed, perft_engine_timed, TimedPerftResult, TITANIUM_PERFT4_STARTPOS,
+    default_timeout, oracle_nodes, perft_engine_timed, perft_titanium_native_timed,
+    perft_titanium_ti_timed, perft_titanium_timed, TimedPerftResult, TITANIUM_PERFT4_STARTPOS,
 };
 pub use search::{
-    board_move_to_move_id, TitaniumSearch, ReductionProbeEvent, ReductionShadowStats, ThinkResult,
+    board_move_to_move_id, ReductionProbeEvent, ReductionShadowStats, ThinkResult, TitaniumSearch,
 };
 pub use session::run_titanium_session_stdio;
 pub use session_v15::run_v15_session_stdio;
@@ -122,6 +122,7 @@ pub fn move_id_to_algebraic(m: i16) -> String {
 pub struct TitaniumParams {
     pub time_ms: u64,
     pub max_depth: i32,
+    pub threads: usize,
     /// Disable the easy-move early stop (search the full time budget).
     pub full: bool,
     /// Hybrid: CAT-filter wall moves at inner nodes.
@@ -139,6 +140,7 @@ impl Default for TitaniumParams {
         Self {
             time_ms: 4000,
             max_depth: 30,
+            threads: 1,
             full: false,
             cat: false,
             ti_movegen: false,
@@ -163,6 +165,8 @@ pub fn titanium_genmove(
     }
     let mut search = match engine_label {
         "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => TitaniumSearch::grafted(g, None),
+        "titanium-v16" => TitaniumSearch::grafted_v16(g, None),
+        "titanium-v15-medium" => TitaniumSearch::grafted_medium(g, None),
         "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
             TitaniumSearch::grafted_no_raceproof(g, None)
@@ -176,6 +180,16 @@ pub fn titanium_genmove(
     if params.eme {
         search.enable_eme();
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    let result = search.think_with_threads(
+        params.time_ms,
+        params.max_depth,
+        params.full,
+        params.log,
+        engine_label,
+        params.threads,
+    );
+    #[cfg(target_arch = "wasm32")]
     let result = search.think(
         params.time_ms,
         params.max_depth,
@@ -284,6 +298,7 @@ mod tests {
         let params = TitaniumParams {
             time_ms: 500,
             max_depth: 4,
+            threads: 1,
             full: false,
             cat: false,
             ti_movegen: true,
@@ -419,7 +434,11 @@ mod tests {
             "titanium-neutral-sidecar-{}.bin",
             std::process::id()
         ));
-        std::fs::write(&path, crate::titanium::reduction_sidecar::neutral_test_blob()).unwrap();
+        std::fs::write(
+            &path,
+            crate::titanium::reduction_sidecar::neutral_test_blob(),
+        )
+        .unwrap();
         let (actual, stats) = reduction_shadow_probe(&moves, 4, &path).unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(

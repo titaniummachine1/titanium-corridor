@@ -126,7 +126,11 @@ impl CertScratch {
     }
 }
 
-fn classify_race_interaction(g: &GameState, _guarantee: &RunnerGuarantee, _loser: usize) -> RaceInteraction {
+fn classify_race_interaction(
+    g: &GameState,
+    _guarantee: &RunnerGuarantee,
+    _loser: usize,
+) -> RaceInteraction {
     let mut d0 = [0u8; 81];
     let mut d1 = [0u8; 81];
     g.compute_dist(0, &mut d0);
@@ -168,7 +172,12 @@ fn direct_wall_ignore_verdict(
     })
 }
 
-fn trace_rejection(reason: &str, g: &GameState, winner: Option<usize>, interaction: Option<RaceInteraction>) {
+fn trace_rejection(
+    reason: &str,
+    g: &GameState,
+    winner: Option<usize>,
+    interaction: Option<RaceInteraction>,
+) {
     if !wall_ignore_cert_trace_enabled() {
         return;
     }
@@ -178,7 +187,12 @@ fn trace_rejection(reason: &str, g: &GameState, winner: Option<usize>, interacti
     );
 }
 
-fn trace_verdict(g: &GameState, guarantee: &RunnerGuarantee, verdict: &WallIgnoreVerdict, interaction: RaceInteraction) {
+fn trace_verdict(
+    g: &GameState,
+    guarantee: &RunnerGuarantee,
+    verdict: &WallIgnoreVerdict,
+    interaction: RaceInteraction,
+) {
     if !wall_ignore_cert_trace_enabled() {
         return;
     }
@@ -210,7 +224,9 @@ pub fn try_wall_ignorance_loss_cert(
     }
 
     let t0 = std::time::Instant::now();
-    WALL_IGNORE_STATS.detector_calls.fetch_add(1, Ordering::Relaxed);
+    WALL_IGNORE_STATS
+        .detector_calls
+        .fetch_add(1, Ordering::Relaxed);
 
     for winner in [0usize, 1] {
         let Some(guarantee) = detect_zero_delay_corridor(g, winner, &mut scratch.corridor) else {
@@ -219,10 +235,9 @@ pub fn try_wall_ignorance_loss_cert(
         WALL_IGNORE_STATS
             .corridors_found
             .fetch_add(1, Ordering::Relaxed);
-        WALL_IGNORE_STATS.path_edge_checks.fetch_add(
-            guarantee.protected_edges.len() as u64,
-            Ordering::Relaxed,
-        );
+        WALL_IGNORE_STATS
+            .path_edge_checks
+            .fetch_add(guarantee.protected_edges.len() as u64, Ordering::Relaxed);
 
         let loser = 1 - winner;
         let interaction = classify_race_interaction(g, &guarantee, loser);
@@ -244,18 +259,16 @@ pub fn try_wall_ignorance_loss_cert(
             WALL_IGNORE_STATS
                 .certificates_emitted
                 .fetch_add(1, Ordering::Relaxed);
-            WALL_IGNORE_STATS.detector_nanos.fetch_add(
-                t0.elapsed().as_nanos() as u64,
-                Ordering::Relaxed,
-            );
+            WALL_IGNORE_STATS
+                .detector_nanos
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             return Some(v.clone());
         }
     }
 
-    WALL_IGNORE_STATS.detector_nanos.fetch_add(
-        t0.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
+    WALL_IGNORE_STATS
+        .detector_nanos
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     None
 }
 
@@ -284,8 +297,7 @@ pub fn cert_score_from_player(verdict: &WallIgnoreVerdict, player: Player) -> i3
 /// Compare with an existing winner-side certificate; debug builds assert agreement.
 pub fn assert_agrees_with_existing(existing_winner: Player, verdict: &WallIgnoreVerdict) {
     debug_assert_eq!(
-        existing_winner as usize,
-        verdict.winner,
+        existing_winner as usize, verdict.winner,
         "wall-ignore cert disagrees with existing certificate"
     );
 }
@@ -323,7 +335,8 @@ mod tests {
         for wl1 in [0, 1, 3, 7, 10] {
             let mut g = corridor_game(5, wl1);
             let mut scratch = CertScratch::new();
-            let v = try_wall_ignorance_loss_cert(&mut g, &mut scratch, true).expect("cert wl1={wl1}");
+            let v =
+                try_wall_ignorance_loss_cert(&mut g, &mut scratch, true).expect("cert wl1={wl1}");
             assert_eq!(v.winner, 0);
             assert!(v.winner_terminal_ply < v.loser_terminal_ply);
         }
@@ -334,7 +347,8 @@ mod tests {
         for wl0 in [0, 1, 5, 10] {
             let mut g = corridor_game(wl0, 10);
             let mut scratch = CertScratch::new();
-            let v = try_wall_ignorance_loss_cert(&mut g, &mut scratch, true).expect("cert wl0={wl0}");
+            let v =
+                try_wall_ignorance_loss_cert(&mut g, &mut scratch, true).expect("cert wl0={wl0}");
             assert_eq!(v.winner, 0);
         }
     }
@@ -362,9 +376,7 @@ mod tests {
         // White far, black close — no forced white win.
         let mut g = game_with_pawns(8 * 9 + 4, 2 * 9 + 4, 0, (10, 10));
         let mut scratch = CertScratch::new();
-        assert!(
-            try_wall_ignorance_loss_cert(&mut g, &mut scratch, true).is_none()
-        );
+        assert!(try_wall_ignorance_loss_cert(&mut g, &mut scratch, true).is_none());
     }
 
     #[test]
@@ -389,9 +401,7 @@ mod tests {
     fn shared_path_no_raw_distance_certificate() {
         let g = game_with_pawns(6 * 9 + 4, 5 * 9 + 4, 0, (0, 0));
         let mut scratch = CertScratch::new();
-        assert!(
-            try_wall_ignorance_loss_cert(&mut g.clone(), &mut scratch, true).is_none()
-        );
+        assert!(try_wall_ignorance_loss_cert(&mut g.clone(), &mut scratch, true).is_none());
     }
 
     #[test]

@@ -146,7 +146,10 @@ impl GameState {
 
     #[inline(always)]
     pub fn can_step(&self, cell: usize, dir: usize) -> bool {
-        ((self.blocked[cell] | BORDER[cell]) & DIRBIT[dir]) == 0
+        crate::bench_instr::count(
+            |b| &mut b.can_step,
+            || ((self.blocked[cell] | BORDER[cell]) & DIRBIT[dir]) == 0,
+        )
     }
 
     pub fn winner(&self) -> i32 {

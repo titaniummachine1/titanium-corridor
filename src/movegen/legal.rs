@@ -285,6 +285,19 @@ pub fn geometric_wall_len_cached(
     role: GeometricWallCacheRole,
     stats: Option<&mut GeometricWallCacheStats>,
 ) -> usize {
+    crate::bench_instr::record(
+        |b| &mut b.wall_legality,
+        || geometric_wall_len_cached_inner(cache, board, scratch, role, stats),
+    )
+}
+
+fn geometric_wall_len_cached_inner(
+    cache: &mut Option<GeometricWallCache>,
+    board: &mut Board,
+    scratch: &mut BfsScratch,
+    role: GeometricWallCacheRole,
+    stats: Option<&mut GeometricWallCacheStats>,
+) -> usize {
     let key = GeometricWallKey::from_board(board);
     if cache.as_ref().is_some_and(|c| c.key == key) {
         if let Some(s) = stats {
@@ -313,10 +326,7 @@ pub fn geometric_wall_len_cached(
 }
 
 #[inline]
-fn copy_geometric_walls_cached(
-    cache: &GeometricWallCache,
-    out: &mut [Move],
-) -> usize {
+fn copy_geometric_walls_cached(cache: &GeometricWallCache, out: &mut [Move]) -> usize {
     debug_assert!(out.len() >= cache.len);
     out[..cache.len].copy_from_slice(&cache.moves[..cache.len]);
     cache.len
@@ -381,6 +391,20 @@ fn generate_wall_moves_slice(
 
 /// L1∧L2 candidates — phase A emits isolated walls; phase B runs L3 flood.
 fn collect_wall_orientation(
+    board: &Board,
+    candidates: u64,
+    needs_flood: u64,
+    orientation: WallOrientation,
+    out: &mut [Move],
+    ctx: &mut Option<WallTrialCtx>,
+) -> usize {
+    crate::bench_instr::record(
+        |b| &mut b.collect_wall_orientation,
+        || collect_wall_orientation_inner(board, candidates, needs_flood, orientation, out, ctx),
+    )
+}
+
+fn collect_wall_orientation_inner(
     board: &Board,
     candidates: u64,
     needs_flood: u64,

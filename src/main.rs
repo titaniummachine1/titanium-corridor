@@ -78,7 +78,9 @@ fn main() {
         "session" => match ace_engine_flag(&args) {
             // v15 uses the standard warm session (go TIME_SEC). session_v15 infinite
             // search is kept in-tree but disabled — it regressed vs ti-pure baseline.
-            Some(flag) if uses_titanium_module(flag) => titanium::run_titanium_session_stdio(flag),
+            Some(flag) if uses_titanium_module(flag) => {
+                titanium::run_titanium_session_stdio(flag, parse_threads_arg(&args))
+            }
             Some(flag) => titanium::ace::run_ace_session_stdio(flag),
             None => run_session_stdio(),
         },
@@ -565,9 +567,7 @@ fn run_eval(args: &[String]) {
 
 /// ASCII grids for NNUE distance / corridor fields — eyeball training geometry.
 fn run_fields(args: &[String]) {
-    use titanium::fields_viz::{
-        compute_nnue_fields, render_fields_text, validate_fields,
-    };
+    use titanium::fields_viz::{compute_nnue_fields, render_fields_text, validate_fields};
     use titanium::{algebraic_to_move_id, GameState};
     let check = args.iter().any(|a| a == "--check");
     let mut g = GameState::new();
@@ -1417,7 +1417,7 @@ impl Seat {
                     _ => {
                         // Plain ace-v13 — but still honor --tt-bits so a pure TT-size
                         // experiment (ace-v13 @ N bits vs ace-v13 default) is possible.
-                        let mut s = TitaniumSearch::with_ti_movegen(g);
+                        let mut s = TitaniumSearch::with_ti_movegen_frozen(g);
                         if let Some(bits) = tt_bits {
                             s.resize_tt(bits);
                         }
@@ -1556,11 +1556,38 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             | "ace-v13-pure" | "ace-v13-grafted" | "ace-v13-grafted-no-raceproof"
             | "ace-v13-ti-pure"
             // Titanium production engines (use titanium search core)
-            | "titanium-v14" | "titanium-v15" | "titanium-v15-frozen"
+            | "titanium-v14" | "titanium-v15" | "titanium-v15-medium" | "titanium-v15-frozen"
+            | "titanium-v16"
             | "titanium-v15-no-raceproof" => Some(w[1].as_str()),
             _ => None,
         }
     })
+}
+
+fn parse_threads_arg(args: &[String]) -> usize {
+    let mut threads = 1usize;
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--threads" {
+            let Some(raw) = args.get(i + 1) else {
+                eprintln!("error --threads requires a value");
+                std::process::exit(2);
+            };
+            match raw.parse::<usize>() {
+                Ok(0) | Err(_) => {
+                    eprintln!("error --threads must be a positive integer");
+                    std::process::exit(2);
+                }
+                Ok(v) => {
+                    threads = v.min(16);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    threads
 }
 
 fn ace_engine_mode(flag: &str) -> &'static str {
@@ -1581,6 +1608,8 @@ fn uses_titanium_module(flag: &str) -> bool {
     flag.starts_with("ace-v13")
         || flag == "titanium-v14"
         || flag == "titanium-v15"
+        || flag == "titanium-v16"
+        || flag == "titanium-v15-medium"
         || flag == "titanium-v15-frozen"
         || flag == "titanium-v15-no-raceproof"
 }
@@ -1620,6 +1649,7 @@ fn run_genmove_ace(args: &[String]) {
     let eme0 = label.contains("pmc");
     let mut time_ms = 4000u64;
     let mut max_depth = 30i32;
+    let mut threads = 1usize;
     let mut full = false;
     let mut log = false;
     let mut eme = eme0;
@@ -1639,6 +1669,22 @@ fn run_genmove_ace(args: &[String]) {
                 i += 2;
                 continue;
             }
+        } else if arg == "--threads" {
+            if let Some(raw) = args.get(i + 1) {
+                match raw.parse::<usize>() {
+                    Ok(0) | Err(_) => {
+                        eprintln!("error --threads must be a positive integer");
+                        std::process::exit(2);
+                    }
+                    Ok(v) => {
+                        threads = v.min(16);
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            eprintln!("error --threads requires a value");
+            std::process::exit(2);
         } else if arg == "--full" {
             full = true;
             i += 1;
@@ -1722,33 +1768,65 @@ fn run_genmove_ace(args: &[String]) {
             eme,
             time_ms,
             max_depth,
+            threads,
             full,
             log,
             ..Default::default()
         };
         match titanium::titanium_genmove(&moves, params, label) {
             Some((algebraic, info)) => {
-                if !log {
-                    let mut depth_json = String::new();
-                    for (j, e) in info.depth_log.iter().enumerate() {
-                        if j > 0 {
-                            depth_json.push(',');
-                        }
-                        let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
-                        let score_text = score_text(e.score);
-                        depth_json.push_str(&format!(
-                            "{{\"depth\":{},\"score\":{},\"scoreText\":\"{}\",\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
-                            e.depth, e.score, score_text, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
-                        ));
+                let mut depth_json = String::new();
+                for (j, e) in info.depth_log.iter().enumerate() {
+                    if j > 0 {
+                        depth_json.push(',');
                     }
-                    let root_score_text = score_text(info.score);
-                    eprintln!(
-                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
-                        label, label, info.depth, info.nodes, info.score,
-                        root_score_text,
-                        info.white_dist, info.black_dist, info.ms, depth_json
-                    );
+                    let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
+                    let score_text = score_text(e.score);
+                    depth_json.push_str(&format!(
+                        "{{\"depth\":{},\"score\":{},\"scoreText\":\"{}\",\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+                        e.depth, e.score, score_text, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
+                    ));
                 }
+                let helper_nodes = info
+                    .helper_nodes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let helper_depths = info
+                    .helper_completed_depths
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let root_widths = info
+                    .root_widths
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{{\"workerId\":{},\"percent\":{},\"allowed\":{},\"rootMoves\":{}}}",
+                            p.worker_id,
+                            p.root_width_percent,
+                            p.allowed_root_moves(),
+                            p.root_move_count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let root_score_text = score_text(info.score);
+                eprintln!(
+                    "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}],\"rootWidths\":[{}],\"depthLog\":[{}]}}",
+                    label, label, info.depth, info.nodes, info.score,
+                    root_score_text,
+                    info.white_dist, info.black_dist, info.ms,
+                    info.main_thread_nodes,
+                    helper_nodes,
+                    info.total_nodes,
+                    info.main_completed_depth,
+                    helper_depths,
+                    root_widths,
+                    depth_json
+                );
                 println!("bestmove {}", algebraic);
             }
             None => println!("bestmove (none)"),

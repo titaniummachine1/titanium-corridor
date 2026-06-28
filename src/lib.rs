@@ -12,7 +12,7 @@
 //! ```
 
 pub mod ace;
-pub mod titanium;
+pub mod bench_instr;
 pub mod cat;
 pub mod core;
 pub mod eval;
@@ -21,6 +21,7 @@ pub mod opening;
 pub mod oracle;
 pub mod path;
 pub mod search;
+pub mod titanium;
 pub mod util;
 
 #[cfg(feature = "wasm")]
@@ -64,11 +65,11 @@ pub use util::perft::{
 
 // Titanium v15 production API (formerly `acev13` module path).
 pub use titanium::fields_viz;
+#[cfg(not(target_arch = "wasm32"))]
+pub use titanium::reduction_shadow_probe;
 pub use titanium::{
     algebraic_to_move_id, board_move_to_move_id, decode_packed_state, move_id_to_algebraic,
     move_id_to_board, pack_state, reduction_counterfactual_probe, run_titanium_session_stdio,
     titanium_game_from_packed, titanium_genmove, GameState, TitaniumParams, TitaniumSearch,
-    TITANIUM_NO_MOVE, FEATURE_SCHEMA, PACKED_STATE_LEN, POSITION_SCHEMA_VERSION,
+    FEATURE_SCHEMA, PACKED_STATE_LEN, POSITION_SCHEMA_VERSION, TITANIUM_NO_MOVE,
 };
-#[cfg(not(target_arch = "wasm32"))]
-pub use titanium::reduction_shadow_probe;

@@ -7,8 +7,7 @@ mod extended {
     use crate::titanium::cert_bridge::titanium_game_from_board;
     use crate::titanium::game::GameState;
     use crate::titanium::wall_ignore_cert::{
-        try_wall_ignorance_loss_cert, try_wall_ignore_cert_board, CertScratch,
-        WALL_IGNORE_STATS,
+        try_wall_ignorance_loss_cert, try_wall_ignore_cert_board, CertScratch, WALL_IGNORE_STATS,
     };
     use crate::titanium::wall_ignore_corridor::{
         build_column_four_corridor_fixture, detect_zero_delay_corridor, shortest_distance,
@@ -112,7 +111,8 @@ mod extended {
     fn adversarial_loser_wall_monotonicity() {
         let g = corridor_game(10, 10, 0);
         let mut scratch = CertScratch::new();
-        let verdict = try_wall_ignorance_loss_cert(&mut g.clone(), &mut scratch, true).expect("cert");
+        let verdict =
+            try_wall_ignorance_loss_cert(&mut g.clone(), &mut scratch, true).expect("cert");
         let orig_l_ply = verdict.loser_terminal_ply;
 
         let mut pos = g.clone();
@@ -320,6 +320,9 @@ mod extended {
         assert!(stats.certificates_emitted >= 990);
         let avg_ns = stats.detector_nanos / stats.detector_calls.max(1);
         eprintln!("avg detector time: {avg_ns} ns");
-        assert!(avg_ns < 5_000_000, "detector should stay under 5ms per call");
+        assert!(
+            avg_ns < 5_000_000,
+            "detector should stay under 5ms per call"
+        );
     }
 }

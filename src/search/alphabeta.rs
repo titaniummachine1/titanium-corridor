@@ -718,8 +718,7 @@ fn endgame_cert_floor(
         {
             CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some(crate::titanium::wall_ignore_cert::cert_score_from_player(
-                &verdict,
-                stm,
+                &verdict, stm,
             ));
         }
     }

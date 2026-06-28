@@ -5,16 +5,17 @@
 //! Two embedded blobs:
 //!   `net_weights.bin`        — v15 live (micro-train + deploy updates this)
 //!   `net_weights_frozen.bin` — pinned v13 baseline (ti-pure anchor + v15-frozen)
+//!   `net_weights_medium.bin` — browser Medium tier, also used by native proxy
 //!
 //! Blob layout (little-endian f64):
-//!   Wskip[18] B1[32] W2[32] W1C[36864] PO[2592] PX[2592]
+//!   Wskip[20] B1[32] W2[32] W1C[36864] PO[2592] PX[2592]
 //!   goal_inv_p0, goal_inv_p1, pawn_fwd_p0, pawn_fwd_p1,
 //!   corridor_delta_p0, corridor_delta_p1, path_cross_p0, path_cross_p1,
 //!   choke_p0, choke_p1, contested  (each 81×32 except contested is shared)
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 pub const NET_H: usize = 32;
-pub const WSKIP_LEN: usize = 18;
+pub const WSKIP_LEN: usize = 20;
 const W1C_LEN: usize = 9 * 128 * NET_H;
 const PO_LEN: usize = 81 * NET_H;
 const PX_LEN: usize = 81 * NET_H;
@@ -24,6 +25,7 @@ pub const NET_WEIGHT_F64S: usize =
     WSKIP_LEN + NET_H + NET_H + W1C_LEN + PO_LEN + PX_LEN + FIELD_PLANE_LEN * FIELD_PLANE_SETS;
 static NET_BYTES: &[u8] = include_bytes!("net_weights.bin");
 static NET_FROZEN_BYTES: &[u8] = include_bytes!("net_weights_frozen.bin");
+static NET_MEDIUM_BYTES: &[u8] = include_bytes!("net_weights_medium.bin");
 pub struct Net {
     pub ws: [f64; WSKIP_LEN],
     pub b1: [f64; NET_H],
@@ -109,6 +111,33 @@ pub fn net_frozen() -> &'static Net {
 
 pub fn live_weights_sha256() -> [u8; 32] {
     Sha256::digest(NET_BYTES).into()
+}
+
+pub fn frozen_weights_sha256() -> [u8; 32] {
+    Sha256::digest(NET_FROZEN_BYTES).into()
+}
+
+pub const NET_WEIGHT_BYTE_LEN: usize = NET_WEIGHT_F64S * 8;
+
+static NET_MEDIUM: OnceLock<Net> = OnceLock::new();
+
+/// Runtime medium-tier weights (fetched by the browser worker).
+pub fn install_medium_weights(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() != NET_WEIGHT_BYTE_LEN {
+        return Err("medium weights size mismatch");
+    }
+    let net = load_net_from_bytes(bytes);
+    NET_MEDIUM
+        .set(net)
+        .map_err(|_| "medium weights already installed")
+}
+
+pub fn net_medium() -> Option<&'static Net> {
+    if let Some(net) = NET_MEDIUM.get() {
+        return Some(net);
+    }
+    static NET_BUILTIN_MEDIUM: OnceLock<Net> = OnceLock::new();
+    Some(NET_BUILTIN_MEDIUM.get_or_init(|| load_net_from_bytes(NET_MEDIUM_BYTES)))
 }
 // ── Symmetry tables (match the JS NET_MIRC / NET_MIRS / NET_BKT loops) ────────
 const fn build_mirc() -> [usize; 81] {

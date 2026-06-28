@@ -15,6 +15,9 @@ use crate::util::grid::{has_wall, is_goal, square_index, unpack_square, wall_tou
 pub const TEMPO_PENALTY: i32 = -10;
 const WALL_CROSS_GAP_CM: i32 = 40;
 const WALL_CROSS_BLOCK_CM: i32 = 35;
+const WALL_LOCAL_DENIAL_SLOTS: usize = 6;
+const WALL_DENIAL_BOOST_NUM: i32 = 3;
+const WALL_DENIAL_BOOST_DEN: i32 = 2;
 
 pub fn wall_blocks_path_step(mv: Move, sq1: u8, sq2: u8) -> bool {
     let Move::Wall {
@@ -282,6 +285,113 @@ fn wall_shape_local_heat(
         .max()
         .unwrap_or(0);
     edge.max(touch)
+}
+
+pub fn wall_slot_index(mv: Move) -> Option<usize> {
+    match mv {
+        Move::Wall {
+            row,
+            col,
+            orientation,
+        } if row < 8 && col < 8 => {
+            let base = match orientation {
+                WallOrientation::Horizontal => 0,
+                WallOrientation::Vertical => 64,
+            };
+            Some(base + row as usize * 8 + col as usize)
+        }
+        _ => None,
+    }
+}
+
+fn push_wall_slot(
+    row: i16,
+    col: i16,
+    orientation: WallOrientation,
+    out: &mut [usize; WALL_LOCAL_DENIAL_SLOTS],
+    n: &mut usize,
+) {
+    if !(0..=7).contains(&row) || !(0..=7).contains(&col) {
+        return;
+    }
+    let mv = Move::Wall {
+        row: row as u8,
+        col: col as u8,
+        orientation,
+    };
+    let Some(idx) = wall_slot_index(mv) else {
+        return;
+    };
+    if out[..*n].contains(&idx) {
+        return;
+    }
+    out[*n] = idx;
+    *n += 1;
+}
+
+/// Wall slots made physically illegal by placing `mv`: same/cross slot plus
+/// adjacent same-orientation slots. This is intentionally local and does not
+/// recurse into child move generation.
+pub fn locally_invalidated_wall_slots(
+    mv: Move,
+    out: &mut [usize; WALL_LOCAL_DENIAL_SLOTS],
+) -> usize {
+    let Move::Wall {
+        row,
+        col,
+        orientation,
+    } = mv
+    else {
+        return 0;
+    };
+    let mut n = 0usize;
+    let row = row as i16;
+    let col = col as i16;
+    let other = match orientation {
+        WallOrientation::Horizontal => WallOrientation::Vertical,
+        WallOrientation::Vertical => WallOrientation::Horizontal,
+    };
+    push_wall_slot(row, col, orientation, out, &mut n);
+    push_wall_slot(row, col, other, out, &mut n);
+    match orientation {
+        WallOrientation::Horizontal => {
+            push_wall_slot(row, col - 1, orientation, out, &mut n);
+            push_wall_slot(row, col + 1, orientation, out, &mut n);
+        }
+        WallOrientation::Vertical => {
+            push_wall_slot(row - 1, col, orientation, out, &mut n);
+            push_wall_slot(row + 1, col, orientation, out, &mut n);
+        }
+    }
+    n
+}
+
+pub fn legal_neighbor_denial_heat(
+    mv: Move,
+    candidates: &[Move],
+    direct_heats: &[i32],
+    n: usize,
+) -> i32 {
+    let Some(self_slot) = wall_slot_index(mv) else {
+        return 0;
+    };
+    let mut local = [usize::MAX; WALL_LOCAL_DENIAL_SLOTS];
+    let local_n = locally_invalidated_wall_slots(mv, &mut local);
+    let mut best = 0i32;
+    for i in 0..n.min(candidates.len()).min(direct_heats.len()) {
+        let Some(slot) = wall_slot_index(candidates[i]) else {
+            continue;
+        };
+        if slot == self_slot || !local[..local_n].contains(&slot) {
+            continue;
+        }
+        let heat = direct_heats[i].max(0);
+        if heat >= i32::from(CAT_HOT_CM) {
+            let boosted = heat.saturating_mul(WALL_DENIAL_BOOST_NUM) / WALL_DENIAL_BOOST_DEN;
+            best = best.max(boosted);
+        }
+    }
+    best
 }
 
 pub fn wall_shape_attention_bonus(board: &Board, mv: Move, cat: &CorridorAttention) -> i32 {
@@ -643,9 +753,22 @@ pub fn cat_heat_refs(
 #[inline]
 pub fn cat_heat_ref_max(mv: Move, refs: CatHeatRefs) -> u16 {
     match mv {
-        Move::Wall { .. } => refs.walls.max(refs.all),
+        Move::Wall { .. } => refs.walls,
         Move::Pawn { .. } => refs.all,
     }
+}
+
+pub fn cat_heat_refs_from_scores(buf: &[Move], n: usize, cat_heats: &[i32]) -> CatHeatRefs {
+    let mut refs = CatHeatRefs::default();
+    for i in 0..n.min(buf.len()).min(cat_heats.len()) {
+        let cm = cat_heats[i].max(0) as u16;
+        refs.all = refs.all.max(cm);
+        match buf[i] {
+            Move::Wall { .. } => refs.walls = refs.walls.max(cm),
+            Move::Pawn { .. } => refs.pawns = refs.pawns.max(cm),
+        }
+    }
+    refs
 }
 
 /// Target child plies from CAT heat — cold fringe caps at 1–2, hotspots keep full depth.
@@ -674,6 +797,65 @@ pub fn cat_heat_child_depth(
         used = used.min((child_depth_full / 3).max(2));
     }
     used.min(child_depth_full)
+}
+
+/// Default CAT attention ceiling for Titanium v16 LMR (override via `TITANIUM_CAT_LMR_CEILING`).
+pub const CAT_V16_LMR_CEILING_DEFAULT: u16 = 800;
+pub const CAT_V16_LMR_CEILINGS: [u16; 3] = [500, 800, 1000];
+/// Fringe cutoff: moves below this fraction of the effective position maximum search at child depth 1.
+pub const CAT_V16_FRINGE_PCT_DEFAULT: u16 = 5;
+pub const CAT_V16_FRINGE_PCT_STEP_PER_WORKER: u16 = 10;
+pub const CAT_V16_FRINGE_PCT_MAX: u16 = 70;
+
+#[inline]
+pub fn cat_v16_lmr_fringe_pct_for_worker(worker_id: usize) -> u16 {
+    if worker_id == 0 {
+        CAT_V16_FRINGE_PCT_DEFAULT
+    } else {
+        (worker_id as u16)
+            .saturating_mul(CAT_V16_FRINGE_PCT_STEP_PER_WORKER)
+            .min(CAT_V16_FRINGE_PCT_MAX)
+    }
+}
+
+/// Parse v16 LMR ceiling from env (`500`, `800`, or `1000`); defaults to [`CAT_V16_LMR_CEILING_DEFAULT`].
+pub fn cat_v16_lmr_ceiling_from_env() -> u16 {
+    std::env::var("TITANIUM_CAT_LMR_CEILING")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|v| CAT_V16_LMR_CEILINGS.contains(v))
+        .unwrap_or(CAT_V16_LMR_CEILING_DEFAULT)
+}
+
+/// Titanium v16 late-move reduction from CAT heat.
+///
+/// Normalizes against the hottest same-kind move in the position, capped by the
+/// selected upper bound (`ceiling` in 500/800/1000 cm). Moves at or colder than
+/// `fringe_pct` of that effective maximum search at child depth 1; warmer moves
+/// keep a proportional fraction of the remaining depth.
+pub fn cat_v16_lmr_reduction_plies(
+    mv: Move,
+    cat_cm: i32,
+    refs: CatHeatRefs,
+    ceiling: u16,
+    fringe_pct: u16,
+    child_depth_full: u32,
+) -> u32 {
+    if child_depth_full <= 1 {
+        return 0;
+    }
+    let cat_ref = cat_heat_ref_max(mv, refs).min(ceiling);
+    if cat_ref == 0 {
+        return child_depth_full.saturating_sub(1);
+    }
+    let fringe_pct = fringe_pct.min(100);
+    let threshold = (u32::from(cat_ref) * u32::from(fringe_pct)).div_ceil(100) as i32;
+    if cat_cm <= threshold {
+        return child_depth_full.saturating_sub(1);
+    }
+    let reduction =
+        cat_heat_depth_reduction(cat_cm, cat_ref, threshold.max(0) as u16, child_depth_full);
+    reduction.min(child_depth_full.saturating_sub(2))
 }
 
 /// CAT-shaped LMR plies from heat fraction — scales child depth like the heatmap (245 ≫ 98).
@@ -743,8 +925,92 @@ fn cat_score_for_move(mv: Move, cat: &CorridorAttention) -> i32 {
 }
 
 /// Combined corridor heat for LMR / futility (higher = more likely to matter).
+/// Peak CAT heat (cm) over legal pawn moves for each player — NNUE `cat_best_p0/p1`.
+pub fn best_pawn_cat_heats(
+    board: &Board,
+    cat: &CorridorAttention,
+    bfs: &mut BfsScratch,
+) -> (u16, u16) {
+    let mut best = [0i32; 2];
+    for (pi, player) in [Player::One, Player::Two].into_iter().enumerate() {
+        let mut b = board.clone();
+        b.side_to_move = player;
+        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let n = generate_legal_moves_slice(&mut b, &mut buf, bfs);
+        for mv in &buf[..n] {
+            if matches!(mv, Move::Pawn { .. }) {
+                best[pi] = best[pi].max(move_corridor_attention(&b, *mv, cat));
+            }
+        }
+    }
+    (
+        best[0].clamp(0, u16::MAX as i32) as u16,
+        best[1].clamp(0, u16::MAX as i32) as u16,
+    )
+}
+
 pub fn move_corridor_attention(board: &Board, mv: Move, cat: &CorridorAttention) -> i32 {
     cat_score_for_move(mv, cat) + wall_shape_attention_bonus(board, mv, cat)
+}
+
+pub fn wall_path_impact_attention(
+    board: &mut Board,
+    mv: Move,
+    white_dist: u8,
+    black_dist: u8,
+    bfs: &mut BfsScratch,
+) -> i32 {
+    let Move::Wall { .. } = mv else {
+        return 0;
+    };
+    let undo = board.make_move(mv);
+    let white_after = bfs
+        .shortest_distance(board, Player::One)
+        .unwrap_or(DIST_PENALTY);
+    let black_after = bfs
+        .shortest_distance(board, Player::Two)
+        .unwrap_or(DIST_PENALTY);
+    board.unmake_move(undo);
+
+    let white_gain = u32::from(white_after.saturating_sub(white_dist));
+    let black_gain = u32::from(black_after.saturating_sub(black_dist));
+    let total = white_gain + black_gain;
+    if total == 0 {
+        return 0;
+    }
+    let strongest = white_gain.max(black_gain);
+    let affected_paths = u32::from(white_gain > 0) + u32::from(black_gain > 0);
+    let shared_bonus = if affected_paths > 1 { 40 } else { 0 };
+    (total * 120 + strongest * 50 + shared_bonus).min(i32::MAX as u32) as i32
+}
+
+pub fn move_corridor_attention_with_path(
+    board: &mut Board,
+    mv: Move,
+    cat: &CorridorAttention,
+    white_dist: u8,
+    black_dist: u8,
+    bfs: &mut BfsScratch,
+) -> i32 {
+    move_corridor_attention(board, mv, cat).max(wall_path_impact_attention(
+        board, mv, white_dist, black_dist, bfs,
+    ))
+}
+
+pub fn move_corridor_attention_with_denial(
+    board: &Board,
+    mv: Move,
+    cat: &CorridorAttention,
+    candidates: &[Move],
+    direct_heats: &[i32],
+    n: usize,
+) -> i32 {
+    let direct = move_corridor_attention(board, mv, cat);
+    if matches!(mv, Move::Wall { .. }) {
+        direct.max(legal_neighbor_denial_heat(mv, candidates, direct_heats, n))
+    } else {
+        direct
+    }
 }
 
 /// Stockfish-style extras layered on top of tactical ordering.
@@ -1013,6 +1279,72 @@ mod tests {
         let boost100 = cat_corridor_order_boost(100, max, cold);
         let boost200 = cat_corridor_order_boost(200, max, cold);
         assert!(boost200 > boost100 * 5);
+    }
+
+    #[test]
+    fn cat_v16_fringe_caps_child_depth_at_one() {
+        let refs = CatHeatRefs {
+            all: 900,
+            walls: 900,
+            pawns: 400,
+        };
+        let cold_wall = Move::Wall {
+            row: 0,
+            col: 0,
+            orientation: crate::core::board::WallOrientation::Horizontal,
+        };
+        let red = cat_v16_lmr_reduction_plies(cold_wall, 80, refs, 800, 10, 9);
+        assert_eq!(red, 8, "80cm <= 10% of 800cm ceiling → depth-1 child");
+        let warm = cat_v16_lmr_reduction_plies(cold_wall, 500, refs, 800, 10, 9);
+        assert!(warm < 8, "warm corridor should keep more than 1 ply");
+    }
+
+    #[test]
+    fn cat_v16_worker_fringe_schedule_caps_at_seventy_percent() {
+        let schedule: Vec<u16> = (0..10).map(cat_v16_lmr_fringe_pct_for_worker).collect();
+        assert_eq!(schedule, vec![5, 10, 20, 30, 40, 50, 60, 70, 70, 70]);
+    }
+
+    #[test]
+    fn cat_v16_helper_fringe_is_more_aggressive_than_main() {
+        let refs = CatHeatRefs {
+            all: 800,
+            walls: 800,
+            pawns: 400,
+        };
+        let wall = Move::Wall {
+            row: 0,
+            col: 0,
+            orientation: crate::core::board::WallOrientation::Horizontal,
+        };
+        let main_red = cat_v16_lmr_reduction_plies(wall, 200, refs, 800, 5, 9);
+        let helper_red = cat_v16_lmr_reduction_plies(wall, 200, refs, 800, 30, 9);
+        assert!(main_red < 8, "200cm is warm at the main 5% threshold");
+        assert_eq!(
+            helper_red, 8,
+            "200cm is fringe for a helper using a 30% threshold"
+        );
+    }
+
+    #[test]
+    fn cat_v16_uses_wall_position_max_not_pawn_heat() {
+        let refs = CatHeatRefs {
+            all: 900,
+            walls: 120,
+            pawns: 900,
+        };
+        let wall = Move::Wall {
+            row: 0,
+            col: 0,
+            orientation: crate::core::board::WallOrientation::Horizontal,
+        };
+        let warm_wall = cat_v16_lmr_reduction_plies(wall, 80, refs, 800, 10, 7);
+        assert!(
+            warm_wall < 6,
+            "80cm is warm against 120cm wall max, even if pawn heat is 900cm"
+        );
+        let cold_wall = cat_v16_lmr_reduction_plies(wall, 12, refs, 800, 10, 7);
+        assert_eq!(cold_wall, 6, "at 10% of wall max searches child depth 1");
     }
 
     #[test]

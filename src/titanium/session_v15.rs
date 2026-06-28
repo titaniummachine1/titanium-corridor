@@ -25,7 +25,9 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use super::{move_id_to_algebraic, algebraic_to_move_id, GameState, TitaniumSearch, TITANIUM_NO_MOVE};
+use super::{
+    algebraic_to_move_id, move_id_to_algebraic, GameState, TitaniumSearch, TITANIUM_NO_MOVE,
+};
 
 // ── Inter-thread messages ─────────────────────────────────────────────────────
 
@@ -60,6 +62,7 @@ fn build_search(engine_flag: &str, g: GameState) -> Box<TitaniumSearch> {
         "ace-v13-pure" => TitaniumSearch::new(g),
         "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
         "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
+        "titanium-v16" => TitaniumSearch::grafted_v16(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
             TitaniumSearch::grafted_no_raceproof(g, None)
         }

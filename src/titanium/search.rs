@@ -28,7 +28,9 @@ use crate::titanium::move_id_to_board;
 use crate::util::clock::{Duration, Instant};
 
 use crate::cat::prune::{
-    gap_play_zone_mask, get_shortest_path, wall_in_dead_zone, wall_should_search,
+    cat_heat_refs_from_scores, cat_v16_lmr_fringe_pct_for_worker, cat_v16_lmr_reduction_plies,
+    gap_play_zone_mask, get_shortest_path, move_corridor_attention_with_denial,
+    move_corridor_attention_with_path, wall_in_dead_zone, wall_should_search, CatHeatRefs,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
@@ -48,6 +50,11 @@ use crate::titanium::race::{
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
 use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, FLOOD_PLAYABLE};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc, RwLock,
+};
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
@@ -87,20 +94,254 @@ fn ace_graduated_eme_extension(move_index: usize, depth: i32) -> i32 {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lazy_smp_tests {
+    use super::*;
+
+    fn fresh() -> Box<TitaniumSearch> {
+        TitaniumSearch::grafted(GameState::new(), Some(18))
+    }
+
+    #[test]
+    fn root_width_calculation_uses_ceiling_and_min_one() {
+        let cases = [
+            (30, 100, 30),
+            (30, 80, 24),
+            (30, 60, 18),
+            (30, 40, 12),
+            (30, 20, 6),
+            (1, 20, 1),
+            (2, 20, 1),
+            (3, 20, 1),
+            (4, 20, 1),
+            (5, 20, 1),
+            (6, 20, 2),
+            (0, 100, 0),
+        ];
+        for (root_count, percent, expected) in cases {
+            assert_eq!(lazy_smp_allowed_root_moves(root_count, percent), expected);
+        }
+    }
+
+    #[test]
+    fn root_filtering_limits_each_worker_to_its_width() {
+        let mut search = fresh();
+        let result = search.think_with_threads(1_000, 1, true, false, "titanium-v15", 5);
+        assert_eq!(result.root_widths.len(), 5);
+        for plan in &result.root_widths {
+            let visits = &result.root_visits[plan.worker_id];
+            let allowed = plan.allowed_root_moves();
+            assert!(
+                visits.iter().all(|&idx| idx < plan.root_move_count),
+                "worker {} visited outside root list of {}: {:?}",
+                plan.worker_id,
+                plan.root_move_count,
+                visits
+            );
+            let unique = visits
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            assert!(unique.len() <= allowed);
+            if plan.worker_id == 0 {
+                assert_eq!(allowed, plan.root_move_count);
+            }
+        }
+    }
+
+    #[test]
+    fn helper_root_profiles_are_diversified() {
+        let root_moves = (0..20).collect::<Vec<i16>>();
+        let (main_moves, main_idx) =
+            TitaniumSearch::lazy_smp_profile_root_moves(&root_moves, 0, 20);
+        let (helper_moves, helper_idx) =
+            TitaniumSearch::lazy_smp_profile_root_moves(&root_moves, 1, 12);
+        assert_eq!(main_moves, root_moves);
+        assert_eq!(main_idx, (0..20).collect::<Vec<_>>());
+        assert_eq!(helper_moves.len(), 12);
+        assert_eq!(helper_idx.len(), 12);
+        assert_ne!(helper_idx, (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cat_v16_worker_profiles_raise_fringe_threshold() {
+        let mut search = *TitaniumSearch::grafted_v16(GameState::new(), Some(18));
+        search.set_cat_lmr_worker_profile(0);
+        assert_eq!(search.cat_lmr_fringe_pct, 5);
+        search.set_cat_lmr_worker_profile(1);
+        assert_eq!(search.cat_lmr_fringe_pct, 10);
+        search.set_cat_lmr_worker_profile(2);
+        assert_eq!(search.cat_lmr_fringe_pct, 20);
+        search.set_cat_lmr_worker_profile(4);
+        assert_eq!(search.cat_lmr_fringe_pct, 40);
+        search.set_cat_lmr_worker_profile(8);
+        assert_eq!(search.cat_lmr_fringe_pct, 70);
+    }
+
+    #[test]
+    fn shared_tt_allocation_and_probe_are_shared() {
+        let mut search = fresh();
+        search.resize_tt(18);
+        let shared = Arc::new(SharedTitaniumTt::from_search(&search));
+        let runtime = Arc::new(LazySmpRuntime::new(
+            Instant::now() + Duration::from_millis(100),
+        ));
+        let root_moves = Arc::new(vec![0i16]);
+        let root_visit_map = Arc::new(vec![0usize]);
+        let mut worker = search.fork_lazy_worker(&GameState::new());
+        search.install_lazy_smp_context(
+            0,
+            shared.clone(),
+            runtime.clone(),
+            root_moves.clone(),
+            root_visit_map.clone(),
+            1,
+        );
+        worker.install_lazy_smp_context(1, shared.clone(), runtime, root_moves, root_visit_map, 1);
+        assert!(Arc::ptr_eq(
+            search.shared_tt.as_ref().expect("main shared TT"),
+            worker.shared_tt.as_ref().expect("helper shared TT")
+        ));
+
+        shared.store(
+            123,
+            456,
+            7,
+            false,
+            SharedTtEntry {
+                key_hi: 456,
+                key_lo: 123,
+                meta: 42 | (0 << 10) | (5 << 12),
+                score: 99,
+                rep: 0,
+                anc_lo: 0,
+                anc_hi: 0,
+                entry_gen: 7,
+            },
+        );
+        let entry = shared.probe(123, 456).expect("stored helper entry");
+        assert_eq!(entry.score, 99);
+        assert_eq!(entry.meta >> 12, 5);
+    }
+
+    #[test]
+    fn shared_stop_flag_is_observed() {
+        let mut search = fresh();
+        let runtime = Arc::new(LazySmpRuntime::new(Instant::now() + Duration::from_secs(1)));
+        runtime.stop.store(true, Ordering::Relaxed);
+        search.lazy_runtime = Some(runtime);
+        assert!(search.check_time().is_err());
+    }
+
+    #[test]
+    fn helper_depth_does_not_replace_main_authority() {
+        let mut search = fresh();
+        let result = search.think_with_threads(1_000, 2, true, false, "titanium-v15", 4);
+        assert_eq!(result.depth, result.main_completed_depth);
+        assert_eq!(
+            result.main_thread_nodes + result.helper_nodes.iter().sum::<u64>(),
+            result.total_nodes
+        );
+        assert_eq!(result.nodes, result.total_nodes);
+    }
+
+    #[test]
+    fn helper_partial_is_used_only_when_main_has_no_completed_move() {
+        fn result(mv: i16, depth: i32, nodes: u64) -> ThinkResult {
+            ThinkResult {
+                mv,
+                score: depth * 10,
+                depth,
+                nodes,
+                main_thread_nodes: 0,
+                helper_nodes: Vec::new(),
+                total_nodes: 0,
+                main_completed_depth: 0,
+                helper_completed_depths: Vec::new(),
+                root_widths: Vec::new(),
+                root_visits: Vec::new(),
+                ms: 0,
+                white_dist: 0,
+                black_dist: 0,
+                depth_log: Vec::new(),
+                stop_reason: "test",
+            }
+        }
+
+        let legal_roots = [11, 22, 33];
+        let helpers = vec![
+            (1, result(99, 8, 99), Vec::new()),
+            (2, result(22, 3, 300), Vec::new()),
+            (3, result(33, 4, 200), Vec::new()),
+        ];
+        let main_ready = result(11, 1, 10);
+        assert!(
+            TitaniumSearch::lazy_smp_helper_partial(&main_ready, &helpers, &legal_roots).is_none()
+        );
+
+        let main_empty = result(crate::titanium::TITANIUM_NO_MOVE, 0, 0);
+        let adopted = TitaniumSearch::lazy_smp_helper_partial(&main_empty, &helpers, &legal_roots)
+            .expect("legal helper result");
+        assert_eq!(adopted.mv, 33);
+        assert_eq!(adopted.depth, 4);
+    }
+
+    #[test]
+    fn one_thread_matches_existing_search_at_fixed_depth() {
+        let mut old = fresh();
+        let mut new = fresh();
+        let a = old.think(10_000, 2, true, false, "titanium-v15");
+        let b = new.think_with_threads(10_000, 2, true, false, "titanium-v15", 1);
+        assert_eq!(a.mv, b.mv);
+        assert_eq!(a.score, b.score);
+        assert_eq!(a.depth, b.depth);
+        assert_eq!(a.nodes, b.nodes);
+        assert_eq!(a.depth_log.len(), b.depth_log.len());
+    }
+
+    #[test]
+    fn race_stress_no_illegal_moves_or_hangs() {
+        for _ in 0..8 {
+            let mut search = fresh();
+            let result = search.think_with_threads(250, 3, true, false, "titanium-v15", 4);
+            let mut legal = [0i16; 160];
+            let n = search.gen_moves(0, 1, result.mv, &mut legal);
+            assert!(n > 0);
+            assert!(legal[..n].contains(&result.mv));
+        }
+    }
+}
+
 /// Count moves in `walls` that cross `route` (a flood u128 bitset, bit = flood_bit_sq(sq)).
 /// A wall crosses a route when both cells across one of its blocked edges are on the route.
 fn wall_crossing_count(walls: &[BoardMove], route: u128) -> u32 {
+    crate::bench_instr::record(
+        |b| &mut b.wall_crossing_count,
+        || wall_crossing_count_inner(walls, route),
+    )
+}
+
+fn wall_crossing_count_inner(walls: &[BoardMove], route: u128) -> u32 {
     let mut n = 0u32;
     for mv in walls {
-        let BoardMove::Wall { row, col, orientation } = *mv else { continue };
+        let BoardMove::Wall {
+            row,
+            col,
+            orientation,
+        } = *mv
+        else {
+            continue;
+        };
         let r = row as usize;
         let c = col as usize;
         let bit = |r: usize, c: usize| (route & flood_bit_sq((r * 9 + c) as u8)) != 0;
         let crosses = match orientation {
-            WallOrientation::Horizontal =>
-                (bit(r, c) && bit(r + 1, c)) || (bit(r, c + 1) && bit(r + 1, c + 1)),
-            WallOrientation::Vertical =>
-                (bit(r, c) && bit(r, c + 1)) || (bit(r + 1, c) && bit(r + 1, c + 1)),
+            WallOrientation::Horizontal => {
+                (bit(r, c) && bit(r + 1, c)) || (bit(r, c + 1) && bit(r + 1, c + 1))
+            }
+            WallOrientation::Vertical => {
+                (bit(r, c) && bit(r, c + 1)) || (bit(r + 1, c) && bit(r + 1, c + 1))
+            }
         };
         if crosses {
             n += 1;
@@ -113,15 +354,24 @@ fn wall_crossing_count(walls: &[BoardMove], route: u128) -> u32 {
 fn wall_crossing_count_arr(walls: &[BoardMove], route: &[u8; 81]) -> u32 {
     let mut n = 0u32;
     for mv in walls {
-        let BoardMove::Wall { row, col, orientation } = *mv else { continue };
+        let BoardMove::Wall {
+            row,
+            col,
+            orientation,
+        } = *mv
+        else {
+            continue;
+        };
         let r = row as usize;
         let c = col as usize;
         let cell = |r: usize, c: usize| route[r * 9 + c] != 0;
         let crosses = match orientation {
-            WallOrientation::Horizontal =>
-                (cell(r, c) && cell(r + 1, c)) || (cell(r, c + 1) && cell(r + 1, c + 1)),
-            WallOrientation::Vertical =>
-                (cell(r, c) && cell(r, c + 1)) || (cell(r + 1, c) && cell(r + 1, c + 1)),
+            WallOrientation::Horizontal => {
+                (cell(r, c) && cell(r + 1, c)) || (cell(r, c + 1) && cell(r + 1, c + 1))
+            }
+            WallOrientation::Vertical => {
+                (cell(r, c) && cell(r, c + 1)) || (cell(r + 1, c) && cell(r + 1, c + 1))
+            }
         };
         if crosses {
             n += 1;
@@ -133,6 +383,128 @@ fn wall_crossing_count_arr(walls: &[BoardMove], route: &[u8; 81]) -> u32 {
 const TT_BITS: usize = 20;
 const TT_SIZE: usize = 1 << TT_BITS;
 const TT_MASK: u32 = (TT_SIZE - 1) as u32;
+
+const LAZY_SMP_WIDTHS: [usize; 5] = [100, 80, 60, 40, 20];
+
+#[cfg(not(target_arch = "wasm32"))]
+pub const LAZY_SMP_MAX_THREADS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerPlan {
+    pub worker_id: usize,
+    pub root_move_count: usize,
+    pub root_width_percent: usize,
+}
+
+impl WorkerPlan {
+    pub fn allowed_root_moves(&self) -> usize {
+        lazy_smp_allowed_root_moves(self.root_move_count, self.root_width_percent)
+    }
+}
+
+pub fn lazy_smp_allowed_root_moves(root_move_count: usize, root_width_percent: usize) -> usize {
+    if root_move_count == 0 {
+        return 0;
+    }
+    let allowed = root_move_count
+        .saturating_mul(root_width_percent)
+        .saturating_add(99)
+        / 100;
+    allowed.max(1).min(root_move_count)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, Default)]
+struct SharedTtEntry {
+    key_hi: u32,
+    key_lo: u32,
+    meta: i32,
+    score: i32,
+    rep: u8,
+    anc_lo: u32,
+    anc_hi: u32,
+    entry_gen: u8,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SharedTitaniumTt {
+    slots: Vec<RwLock<SharedTtEntry>>,
+    mask: u32,
+    bits: usize,
+    filled: AtomicUsize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SharedTitaniumTt {
+    fn from_search(search: &TitaniumSearch) -> Self {
+        let slots = (0..search.tt_meta.len())
+            .map(|i| {
+                RwLock::new(SharedTtEntry {
+                    key_hi: search.tt_key_hi[i],
+                    key_lo: search.tt_key_lo[i],
+                    meta: search.tt_meta[i],
+                    score: search.tt_score[i],
+                    rep: search.tt_rep[i],
+                    anc_lo: search.tt_anc_lo[i],
+                    anc_hi: search.tt_anc_hi[i],
+                    entry_gen: search.tt_entry_gen[i],
+                })
+            })
+            .collect();
+        Self {
+            slots,
+            mask: search.tt_mask,
+            bits: search.tt_bits,
+            filled: AtomicUsize::new(search.tt_filled),
+        }
+    }
+
+    fn probe(&self, hash_lo: u32, hash_hi: u32) -> Option<SharedTtEntry> {
+        let idx = (hash_lo & self.mask) as usize;
+        let entry = *self.slots[idx]
+            .read()
+            .expect("shared TT read lock poisoned");
+        if entry.meta != 0 && entry.key_hi == hash_hi && entry.key_lo == hash_lo {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    fn store(&self, hash_lo: u32, hash_hi: u32, tt_gen: u8, pure_mode: bool, entry: SharedTtEntry) {
+        let idx = (hash_lo & self.mask) as usize;
+        let mut slot = self.slots[idx]
+            .write()
+            .expect("shared TT write lock poisoned");
+        let was_empty = slot.meta == 0;
+        let stale_gen = !pure_mode && !was_empty && slot.entry_gen != tt_gen;
+        let deeper = !was_empty && !stale_gen && (entry.meta >> 12) >= (slot.meta >> 12);
+        if was_empty || stale_gen || deeper {
+            *slot = entry;
+            if was_empty {
+                self.filled.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LazySmpRuntime {
+    stop: AtomicBool,
+    global_nodes: AtomicU64,
+    deadline: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LazySmpRuntime {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            global_nodes: AtomicU64::new(0),
+            deadline,
+        }
+    }
+}
 
 /// Time-abort marker — propagates like the JS `throw "time"`.
 pub struct TimeUp;
@@ -217,15 +589,24 @@ pub struct AceDepthLogEntry {
     pub pv: String,
 }
 
+#[derive(Clone)]
 pub struct ThinkResult {
     pub mv: i16,
     pub score: i32,
     pub depth: i32,
     pub nodes: u64,
+    pub main_thread_nodes: u64,
+    pub helper_nodes: Vec<u64>,
+    pub total_nodes: u64,
+    pub main_completed_depth: i32,
+    pub helper_completed_depths: Vec<i32>,
+    pub root_widths: Vec<WorkerPlan>,
+    pub root_visits: Vec<Vec<usize>>,
     pub ms: u64,
     pub white_dist: u8,
     pub black_dist: u8,
     pub depth_log: Vec<AceDepthLogEntry>,
+    pub stop_reason: &'static str,
 }
 
 /// One complete late-move pipeline observation. These records are emitted only
@@ -458,6 +839,10 @@ pub struct TitaniumSearch {
     ti_movegen: bool,
     /// CAT-filter walls at inner nodes (requires `bridge`).
     cat_walls: bool,
+    /// Titanium v16: CAT-scaled LMR with ceiling normalization (500/800/1000 cm).
+    cat_lmr_v16: bool,
+    cat_lmr_ceiling: u16,
+    cat_lmr_fringe_pct: u16,
     /// SOUND dead-zone wall prune at inner nodes (requires `bridge`): drop only
     /// walls in an unreachable void / sealed interior — provably irrelevant (they
     /// change no path and only burn inventory, never the best move). NPS-only;
@@ -548,6 +933,22 @@ pub struct TitaniumSearch {
     stream_last_emit_nodes: u64,
     stream_last_emit_ms: u64,
     stream_last_best: i16,
+    #[cfg(not(target_arch = "wasm32"))]
+    shared_tt: Option<Arc<SharedTitaniumTt>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_runtime: Option<Arc<LazySmpRuntime>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_root_moves: Option<Arc<Vec<i16>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_root_visit_map: Option<Arc<Vec<usize>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_root_allowed: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_worker_id: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_skip_setup: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy_root_visits: Vec<usize>,
     /// GitHub Pages: live `info json` payloads forwarded to the browser worker.
     #[cfg(feature = "wasm")]
     wasm_progress: Option<js_sys::Function>,
@@ -614,6 +1015,9 @@ impl TitaniumSearch {
             bridge: None,
             ti_movegen: false,
             cat_walls: false,
+            cat_lmr_v16: false,
+            cat_lmr_ceiling: crate::cat::CAT_V16_LMR_CEILING_DEFAULT,
+            cat_lmr_fringe_pct: crate::cat::CAT_V16_FRINGE_PCT_DEFAULT,
             dead_zone_prune: false,
             cheap_cert: false,
             cert_eval_leaves_only: false,
@@ -672,6 +1076,22 @@ impl TitaniumSearch {
             stream_last_emit_nodes: 0,
             stream_last_emit_ms: 0,
             stream_last_best: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            shared_tt: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_runtime: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_root_moves: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_root_visit_map: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_root_allowed: usize::MAX,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_worker_id: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_skip_setup: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy_root_visits: Vec::new(),
             #[cfg(feature = "wasm")]
             wasm_progress: None,
         })
@@ -724,13 +1144,18 @@ impl TitaniumSearch {
         search
     }
 
+    /// ACE v13 reference tier with Titanium movegen acceleration, pinned to the
+    /// frozen HalfPW blob used by the JS reference instead of live training weights.
+    pub fn with_ti_movegen_frozen(g: GameState) -> Box<Self> {
+        let mut search = Self::with_ti_movegen(g);
+        search.net = net_frozen();
+        search
+    }
+
     /// Pure JS-port baseline + O1 movegen only. Uses **frozen** v13 HalfPW weights
     /// (`net_weights_frozen.bin`) — never picks up live training/deploy updates.
     pub fn with_ti_movegen_pure(g: GameState) -> Box<Self> {
-        let mut search = Self::new(g);
-        search.net = net_frozen();
-        search.bridge = Some(TiBridge::from_game(&search.g));
-        search.ti_movegen = true;
+        let mut search = Self::with_ti_movegen_frozen(g);
         search.pure_mode = true;
         search
     }
@@ -770,9 +1195,16 @@ impl TitaniumSearch {
         Self::grafted_with_weights(g, tt_bits, net())
     }
 
-    /// Same as [`grafted`] but uses the frozen v13 HalfPW blob (training A/B control).
+    /// Same as [`grafted_frozen`] but uses the frozen v13 HalfPW blob (training A/B control).
     pub fn grafted_frozen(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         Self::grafted_with_weights(g, tt_bits, net_frozen())
+    }
+
+    /// Medium tier — runtime-installed weights (`net_weights_medium.bin`).
+    pub fn grafted_medium(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
+        let weights = crate::titanium::net::net_medium()
+            .expect("medium NNUE weights not installed — fetch net_weights_medium.bin first");
+        Self::grafted_with_weights(g, tt_bits, weights)
     }
 
     /// Production graft minus RaceProof/cert gates. Experimental only: useful for
@@ -803,6 +1235,35 @@ impl TitaniumSearch {
             Some(bits) => search.resize_tt(bits),
             None => search.enable_adaptive_tt(),
         }
+        search
+    }
+
+    /// **Titanium v16** — v15 graft + CAT-scaled late-move reductions.
+    ///
+    /// Main-thread cold walls (at or below 5% of the attention ceiling, default 800 cm)
+    /// are searched at child depth 1; helper workers use 10%, 20%, 30%... capped
+    /// at 70%. Corridor-hot walls keep proportional depth. Same NNUE weights as
+    /// v15 live (`net_weights.bin`) until a dedicated v16 blob ships.
+    pub fn grafted_v16(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let ceiling = crate::cat::cat_v16_lmr_ceiling_from_env();
+        #[cfg(target_arch = "wasm32")]
+        let ceiling = crate::cat::CAT_V16_LMR_CEILING_DEFAULT;
+        Self::grafted_v16_with_ceiling(g, tt_bits, ceiling)
+    }
+
+    pub fn grafted_v16_with_ceiling(
+        g: GameState,
+        tt_bits: Option<usize>,
+        ceiling: u16,
+    ) -> Box<Self> {
+        let mut search = Self::grafted(g, tt_bits);
+        search.cat_lmr_v16 = true;
+        search.cat_lmr_ceiling = if crate::cat::CAT_V16_LMR_CEILINGS.contains(&ceiling) {
+            ceiling
+        } else {
+            crate::cat::CAT_V16_LMR_CEILING_DEFAULT
+        };
         search
     }
 
@@ -995,6 +1456,165 @@ impl TitaniumSearch {
         self.is_pondering = on;
     }
 
+    pub fn set_cat_lmr_fringe_pct(&mut self, pct: u16) {
+        self.cat_lmr_fringe_pct = pct.min(crate::cat::CAT_V16_FRINGE_PCT_MAX);
+    }
+
+    pub fn set_cat_lmr_worker_profile(&mut self, worker_id: usize) {
+        self.set_cat_lmr_fringe_pct(cat_v16_lmr_fringe_pct_for_worker(worker_id));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lazy_smp_width_percent(worker_id: usize) -> usize {
+        LAZY_SMP_WIDTHS
+            .get(worker_id)
+            .copied()
+            .unwrap_or(*LAZY_SMP_WIDTHS.last().expect("width schedule is non-empty"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_think_start_state(&mut self) {
+        if !self.pure_mode && !self.is_pondering {
+            self.tt_gen = self.tt_gen.wrapping_add(1);
+            for h in self.history_tbl.iter_mut() {
+                *h >>= 1;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ordered_root_moves_snapshot(&mut self, depth: i32) -> Vec<i16> {
+        self.refresh_dist(0);
+        if self.bridge.is_some() {
+            self.bridge = Some(TiBridge::from_game(&self.g));
+        }
+        let mut moves = [0i16; 160];
+        let root_entry = self
+            .shared_tt
+            .as_ref()
+            .and_then(|tt| tt.probe(self.g.hash_lo, self.g.hash_hi));
+        let tt_move = root_entry
+            .map(|entry| (entry.meta & 1023) as i16)
+            .unwrap_or_else(|| {
+                let idx = (self.g.hash_lo & self.tt_mask) as usize;
+                let meta = self.tt_meta[idx];
+                if meta != 0
+                    && self.tt_key_hi[idx] == self.g.hash_hi
+                    && self.tt_key_lo[idx] == self.g.hash_lo
+                {
+                    (meta & 1023) as i16
+                } else {
+                    0
+                }
+            });
+        let n = self.gen_moves(0, depth.max(1), tt_move, &mut moves);
+        self.order_moves(0, &mut moves[..n], tt_move, 0);
+        moves[..n].to_vec()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn gcd_usize(mut a: usize, mut b: usize) -> usize {
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        a
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lazy_smp_profile_root_moves(
+        root_moves: &[i16],
+        worker_id: usize,
+        allowed: usize,
+    ) -> (Vec<i16>, Vec<usize>) {
+        let len = root_moves.len();
+        let allowed = allowed.min(len);
+        if allowed == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        if worker_id == 0 || len <= 1 {
+            return (
+                root_moves[..allowed].to_vec(),
+                (0..allowed).collect::<Vec<_>>(),
+            );
+        }
+
+        let mut stride = worker_id.saturating_mul(2).saturating_add(1).max(3);
+        while Self::gcd_usize(stride, len) != 1 {
+            stride = stride.saturating_add(2);
+        }
+        let offset = worker_id.saturating_mul(37) % len;
+        let mut seen = vec![false; len];
+        let mut profiled = Vec::with_capacity(allowed);
+        let mut original_indices = Vec::with_capacity(allowed);
+        let mut cursor = offset;
+        while profiled.len() < allowed {
+            if !seen[cursor] {
+                seen[cursor] = true;
+                profiled.push(root_moves[cursor]);
+                original_indices.push(cursor);
+            }
+            cursor = (cursor + stride) % len;
+        }
+        (profiled, original_indices)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fork_lazy_worker(&self, root: &GameState) -> Box<Self> {
+        let mut worker = Self::new(root.clone());
+        worker.history_tbl = self.history_tbl;
+        worker.cm = self.cm;
+        worker.killers = self.killers;
+        worker.net = self.net;
+        worker.ti_movegen = self.ti_movegen;
+        worker.cat_walls = self.cat_walls;
+        worker.cat_lmr_v16 = self.cat_lmr_v16;
+        worker.cat_lmr_ceiling = self.cat_lmr_ceiling;
+        worker.cat_lmr_fringe_pct = self.cat_lmr_fringe_pct;
+        worker.dead_zone_prune = self.dead_zone_prune;
+        worker.cheap_cert = self.cheap_cert;
+        worker.cert_eval_leaves_only = self.cert_eval_leaves_only;
+        worker.wall_ignore_cert_override = self.wall_ignore_cert_override;
+        worker.eme = self.eme;
+        worker.use_partial_iter = self.use_partial_iter;
+        worker.pure_mode = self.pure_mode;
+        worker.race_proof = self.race_proof;
+        worker.tt_gen = self.tt_gen;
+        worker.tt_mask = self.tt_mask;
+        worker.tt_bits = self.tt_bits;
+        worker.tt_adaptive = false;
+        if self.bridge.is_some() {
+            worker.bridge = Some(TiBridge::from_game(root));
+        }
+        worker
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn install_lazy_smp_context(
+        &mut self,
+        worker_id: usize,
+        shared_tt: Arc<SharedTitaniumTt>,
+        runtime: Arc<LazySmpRuntime>,
+        root_moves: Arc<Vec<i16>>,
+        root_visit_map: Arc<Vec<usize>>,
+        allowed: usize,
+    ) {
+        self.shared_tt = Some(shared_tt.clone());
+        self.tt_mask = shared_tt.mask;
+        self.tt_bits = shared_tt.bits;
+        self.tt_adaptive = false;
+        self.lazy_runtime = Some(runtime.clone());
+        self.deadline = runtime.deadline;
+        self.lazy_root_moves = Some(root_moves);
+        self.lazy_root_visit_map = Some(root_visit_map);
+        self.lazy_root_allowed = allowed;
+        self.lazy_worker_id = worker_id;
+        self.set_cat_lmr_worker_profile(worker_id);
+        self.lazy_skip_setup = true;
+        self.lazy_root_visits.clear();
+    }
+
     /// Path-valid wall slot count for `ws[14]` (geometric; ignores wall budget / side).
     /// Path-valid = tentative placement keeps both players connected to goal (`pbff_wall_legal`).
     pub fn geometric_legal_wall_count(&mut self) -> u32 {
@@ -1097,6 +1717,11 @@ impl TitaniumSearch {
         let mut flank1 = [0u8; 81];
         fill_sparse_route_masks(&self.g, self.g.pawn[0], &d0f, &mut route0, &mut flank0);
         fill_sparse_route_masks(&self.g, self.g.pawn[1], &d1f, &mut route1, &mut flank1);
+        let (cat_best_p0, cat_best_p1) = {
+            let mut bridge = TiBridge::from_game(&self.g);
+            let cat = bridge.bfs.build_corridor_attention(&bridge.board);
+            crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs)
+        };
         let legal_walls = self.geometric_legal_wall_count();
         let (cross_p0, cross_p1) = self.legal_path_crossing_counts_arr(&route0, &route1);
         let width_me = self.d0[self.dist0_idx]
@@ -1110,6 +1735,7 @@ impl TitaniumSearch {
         format!(
             "{{\"turn\":{},\"pawn0\":{},\"pawn1\":{},\"wl0\":{},\"wl1\":{},\
              \"d0\":{},\"d1\":{},\"legal_wall_count\":{},\"legal_path_cross_p0\":{},\"legal_path_cross_p1\":{},\
+             \"cat_best_p0\":{},\"cat_best_p1\":{},\
              \"corridor_width0\":{},\"corridor_width1\":{},\
              \"goal_inv_p0_field\":[{}],\"goal_inv_p1_field\":[{}],\
              \"pawn_fwd_p0_field\":[{}],\"pawn_fwd_p1_field\":[{}],\
@@ -1134,6 +1760,8 @@ impl TitaniumSearch {
             legal_walls,
             cross_p0,
             cross_p1,
+            cat_best_p0,
+            cat_best_p1,
             width_me,
             width_opp,
             field(&d0f),
@@ -1227,8 +1855,18 @@ impl TitaniumSearch {
 
     #[inline(always)]
     fn check_time(&mut self) -> Result<(), TimeUp> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(runtime) = self.lazy_runtime.as_ref() {
+            if runtime.stop.load(Ordering::Relaxed) {
+                return Err(TimeUp);
+            }
+        }
         if (self.nodes & 1023) == 0 {
             if Instant::now() > self.deadline {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(runtime) = self.lazy_runtime.as_ref() {
+                    runtime.stop.store(true, Ordering::Relaxed);
+                }
                 self.emit_stream_progress(true);
                 return Err(TimeUp);
             }
@@ -1252,6 +1890,13 @@ impl TitaniumSearch {
 
     /// Returns (score, route0_bits, route1_bits) so callers can reuse the route bitsets.
     fn route_feature_score(&self, nw: &Net) -> (f64, u128, u128) {
+        crate::bench_instr::record(
+            |b| &mut b.eval_route_features,
+            || self.route_feature_score_inner(nw),
+        )
+    }
+
+    fn route_feature_score_inner(&self, nw: &Net) -> (f64, u128, u128) {
         if !nw.route_active {
             return (0.0, 0, 0);
         }
@@ -1300,6 +1945,13 @@ impl TitaniumSearch {
 
     /// Count legal walls from cache that cross the given route u128 bitset (flood-indexed).
     fn legal_path_crossing_counts_bits(&mut self, route0: u128, route1: u128) -> (u32, u32) {
+        crate::bench_instr::record(
+            |b| &mut b.eval_legal_wall_count,
+            || self.legal_path_crossing_counts_bits_inner(route0, route1),
+        )
+    }
+
+    fn legal_path_crossing_counts_bits_inner(&mut self, route0: u128, route1: u128) -> (u32, u32) {
         if let Some(bridge) = self.bridge.as_mut() {
             let _ = geometric_wall_len_cached(
                 &mut bridge.geometric_walls,
@@ -1321,18 +1973,28 @@ impl TitaniumSearch {
         let mut scratch = BfsScratch::new();
         let mut cache_opt: Option<GeometricWallCache> = None;
         geometric_wall_len_cached(
-            &mut cache_opt, &mut board, &mut scratch, GeometricWallCacheRole::Eval, None,
+            &mut cache_opt,
+            &mut board,
+            &mut scratch,
+            GeometricWallCacheRole::Eval,
+            None,
         );
         if let Some(ref cache) = cache_opt {
-            (wall_crossing_count(cache.wall_slice(), route0),
-             wall_crossing_count(cache.wall_slice(), route1))
+            (
+                wall_crossing_count(cache.wall_slice(), route0),
+                wall_crossing_count(cache.wall_slice(), route1),
+            )
         } else {
             (0, 0)
         }
     }
 
     /// Count legal walls crossing each player's path (for eval JSON). Uses [u8;81] route arrays.
-    fn legal_path_crossing_counts_arr(&mut self, route0: &[u8; 81], route1: &[u8; 81]) -> (u32, u32) {
+    fn legal_path_crossing_counts_arr(
+        &mut self,
+        route0: &[u8; 81],
+        route1: &[u8; 81],
+    ) -> (u32, u32) {
         if let Some(bridge) = self.bridge.as_mut() {
             let _ = geometric_wall_len_cached(
                 &mut bridge.geometric_walls,
@@ -1354,17 +2016,27 @@ impl TitaniumSearch {
         let mut scratch = BfsScratch::new();
         let mut cache_opt: Option<GeometricWallCache> = None;
         geometric_wall_len_cached(
-            &mut cache_opt, &mut board, &mut scratch, GeometricWallCacheRole::Eval, None,
+            &mut cache_opt,
+            &mut board,
+            &mut scratch,
+            GeometricWallCacheRole::Eval,
+            None,
         );
         if let Some(ref cache) = cache_opt {
-            (wall_crossing_count_arr(cache.wall_slice(), route0),
-             wall_crossing_count_arr(cache.wall_slice(), route1))
+            (
+                wall_crossing_count_arr(cache.wall_slice(), route0),
+                wall_crossing_count_arr(cache.wall_slice(), route1),
+            )
         } else {
             (0, 0)
         }
     }
 
     fn refresh_dist(&mut self, ply: usize) {
+        crate::bench_instr::record(|b| &mut b.refresh_dist, || self.refresh_dist_inner(ply))
+    }
+
+    fn refresh_dist_inner(&mut self, ply: usize) {
         let stamp = self.g.wall_stamp;
         if self.cached_stamp == stamp {
             return; // refs already valid for these walls
@@ -1424,12 +2096,17 @@ impl TitaniumSearch {
         self.dist0_idx = ply; // own arrays: ancestors stay intact
         self.dist1_idx = ply;
         let masks = DirMasks::from_ace_game(&self.g);
-        fill_ace_dist_to_goal_with_masks(0, masks, &mut self.d0[ply]);
-        fill_ace_dist_to_goal_with_masks(1, masks, &mut self.d1[ply]);
-        if self.net.route_active {
-            fill_distance_layers(&self.d0[ply], &mut self.d0_layers[ply]);
-            fill_distance_layers(&self.d1[ply], &mut self.d1_layers[ply]);
-        }
+        crate::bench_instr::record(
+            |b| &mut b.shortest_path,
+            || {
+                fill_ace_dist_to_goal_with_masks(0, masks, &mut self.d0[ply]);
+                fill_ace_dist_to_goal_with_masks(1, masks, &mut self.d1[ply]);
+                if self.net.route_active {
+                    fill_distance_layers(&self.d0[ply], &mut self.d0_layers[ply]);
+                    fill_distance_layers(&self.d1[ply], &mut self.d1_layers[ply]);
+                }
+            },
+        );
         self.cached_stamp = stamp;
     }
 
@@ -1685,6 +2362,7 @@ impl TitaniumSearch {
 
     /// Static/quiescence eval. `depth <= 0` = leaf (cert oracle eligible when gated).
     fn evaluate(&mut self, depth: i32) -> i32 {
+        let _eval_timer = crate::bench_instr::OpTimer::start(|b| &mut b.evaluate);
         let me = self.g.turn;
         let opp = 1 - me;
         let d_me_u = if me == 0 {
@@ -1714,10 +2392,13 @@ impl TitaniumSearch {
                 if self.race_scratch.is_none() {
                     self.race_scratch = Some(Box::new(RaceScratch::new()));
                 }
-                let bound = {
-                    let scratch = self.race_scratch.as_mut().expect("race scratch");
-                    race_outcome(&mut self.g, scratch)
-                };
+                let bound = crate::bench_instr::record(
+                    |b| &mut b.eval_race_bound,
+                    || {
+                        let scratch = self.race_scratch.as_mut().expect("race scratch");
+                        race_outcome(&mut self.g, scratch)
+                    },
+                );
                 match bound {
                     // Proven win: graded by own distance (faster = higher). The
                     // GUARANTEE is the bound; the magnitude is an ordering hint.
@@ -1760,36 +2441,41 @@ impl TitaniumSearch {
         let nw = self.net;
         let ws = &nw.ws;
 
-        let pd = d_opp - d_me;
-        let wd = w_me - w_opp;
-        let mut out = ws[0]
-            + ws[1] * pd
-            + ws[2] * wd
-            + ws[3] * d_me
-            + ws[4] * d_opp
-            + ws[9] * pd * (w_me + w_opp) / 20.0
-            + ws[10] * wd * (d_me + d_opp) / 16.0;
+        let mut out = crate::bench_instr::record(
+            |b| &mut b.eval_misc_scalar,
+            || {
+                let pd = d_opp - d_me;
+                let wd = w_me - w_opp;
+                let mut out = ws[0]
+                    + ws[1] * pd
+                    + ws[2] * wd
+                    + ws[3] * d_me
+                    + ws[4] * d_opp
+                    + ws[9] * pd * (w_me + w_opp) / 20.0
+                    + ws[10] * wd * (d_me + d_opp) / 16.0;
+                if w_opp_i == 0 {
+                    out += ws[6];
+                    if d_me <= d_opp {
+                        out += ws[5];
+                    }
+                } else if w_me_i == 0 {
+                    out += ws[8];
+                    if d_opp <= d_me - 1.0 {
+                        out += ws[7];
+                    }
+                }
+                if d_opp <= 4.0 {
+                    out += ws[11] * if w_me < 3.0 { w_me } else { 3.0 };
+                }
+                if d_me <= 4.0 {
+                    out += ws[12] * if w_opp < 3.0 { w_opp } else { 3.0 };
+                }
+                out += ws[13] * pd * w_opp / 10.0;
+                out
+            },
+        );
         let (route_score, route0_bits, route1_bits) = self.route_feature_score(nw);
         out += route_score;
-        if w_opp_i == 0 {
-            out += ws[6];
-            if d_me <= d_opp {
-                out += ws[5];
-            }
-        } else if w_me_i == 0 {
-            out += ws[8];
-            if d_opp <= d_me - 1.0 {
-                out += ws[7];
-            }
-        }
-        if d_opp <= 4.0 {
-            out += ws[11] * if w_me < 3.0 { w_me } else { 3.0 };
-        }
-        if d_me <= 4.0 {
-            out += ws[12] * if w_opp < 3.0 { w_opp } else { 3.0 };
-        }
-        // ws[13]: fragile-lead (tempo × opp walls — a lead is fragile when opp can spend walls)
-        out += ws[13] * pd * w_opp / 10.0;
         // ws[14]: unrealized wall action capacity (path-valid slots / 128). NOT corridor width.
         let legal_wall_norm = self.geometric_legal_wall_count() as f64 / 128.0;
         // ws[15]: opponent corridor width on their goal field (matches halfpw.py).
@@ -1811,68 +2497,89 @@ impl TitaniumSearch {
         } else {
             (route1_bits, route0_bits)
         };
-        let (cross_me, cross_opp) = self.legal_path_crossing_counts_bits(route_me_bits, route_opp_bits);
+        let (cross_me, cross_opp) = crate::bench_instr::record(
+            |b| &mut b.eval_wall_cross,
+            || self.legal_path_crossing_counts_bits(route_me_bits, route_opp_bits),
+        );
         out += ws[16] * cross_me as f64 / 128.0 + ws[17] * cross_opp as f64 / 128.0;
+        {
+            let mut bridge = TiBridge::from_game(&self.g);
+            let cat = bridge.bfs.build_corridor_attention(&bridge.board);
+            let (cat_p0, cat_p1) =
+                crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs);
+            let (cat_me, cat_opp) = if me == 0 {
+                (cat_p0, cat_p1)
+            } else {
+                (cat_p1, cat_p0)
+            };
+            out += ws[18] * f64::from(cat_me) / 256.0 + ws[19] * f64::from(cat_opp) / 256.0;
+        }
 
         let b0 = NET_BKT[self.g.pawn[0]] as i32;
         let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
+        let _nnue_prep = crate::bench_instr::OpTimer::start(|b| &mut b.eval_nnue_prep);
         if b0 != self.np_b0 || b1 != self.np_b1v {
-            // bucket cross: rebuild BOTH perspectives (ACE v10 audit blocker 5:
-            // rebuilding only the crossed side dropped pending wall diffs for
-            // the other accumulator)
-            self.np_acc0.fill(0.0);
-            self.np_acc1.fill(0.0);
-            for s in 0..64 {
-                if self.g.hw[s] != 0 {
-                    let o = (b0 as usize * 128 + s) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += nw.w1c[o + j];
+            crate::bench_instr::record(
+                |b| &mut b.nnue_full_refresh,
+                || {
+                    self.np_acc0.fill(0.0);
+                    self.np_acc1.fill(0.0);
+                    for s in 0..64 {
+                        if self.g.hw[s] != 0 {
+                            let o = (b0 as usize * 128 + s) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += nw.w1c[o + j];
+                            }
+                            let o = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc1[j] += nw.w1c[o + j];
+                            }
+                        }
+                        if self.g.vw[s] != 0 {
+                            let o = (b0 as usize * 128 + 64 + s) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += nw.w1c[o + j];
+                            }
+                            let o = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc1[j] += nw.w1c[o + j];
+                            }
+                        }
+                        self.np_hw[s] = self.g.hw[s];
+                        self.np_vw[s] = self.g.vw[s];
                     }
-                    let o = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc1[j] += nw.w1c[o + j];
-                    }
-                }
-                if self.g.vw[s] != 0 {
-                    let o = (b0 as usize * 128 + 64 + s) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += nw.w1c[o + j];
-                    }
-                    let o = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc1[j] += nw.w1c[o + j];
-                    }
-                }
-                self.np_hw[s] = self.g.hw[s];
-                self.np_vw[s] = self.g.vw[s];
-            }
-            self.np_b0 = b0;
-            self.np_b1v = b1;
+                    self.np_b0 = b0;
+                    self.np_b1v = b1;
+                },
+            );
         } else {
-            // NO stamp gate (ACE v10 audit blocker 4: wall_stamp is a count,
-            // aliases across sibling wall configs): always diff the wall snapshot
-            for s in 0..64 {
-                if self.g.hw[s] != self.np_hw[s] {
-                    let sg = if self.g.hw[s] != 0 { 1.0 } else { -1.0 };
-                    let o0 = (b0 as usize * 128 + s) * NET_H;
-                    let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += sg * nw.w1c[o0 + j];
-                        self.np_acc1[j] += sg * nw.w1c[o1 + j];
+            crate::bench_instr::record(
+                |b| &mut b.nnue_incr_update,
+                || {
+                    for s in 0..64 {
+                        if self.g.hw[s] != self.np_hw[s] {
+                            let sg = if self.g.hw[s] != 0 { 1.0 } else { -1.0 };
+                            let o0 = (b0 as usize * 128 + s) * NET_H;
+                            let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += sg * nw.w1c[o0 + j];
+                                self.np_acc1[j] += sg * nw.w1c[o1 + j];
+                            }
+                            self.np_hw[s] = self.g.hw[s];
+                        }
+                        if self.g.vw[s] != self.np_vw[s] {
+                            let sg = if self.g.vw[s] != 0 { 1.0 } else { -1.0 };
+                            let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
+                            let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += sg * nw.w1c[o0 + j];
+                                self.np_acc1[j] += sg * nw.w1c[o1 + j];
+                            }
+                            self.np_vw[s] = self.g.vw[s];
+                        }
                     }
-                    self.np_hw[s] = self.g.hw[s];
-                }
-                if self.g.vw[s] != self.np_vw[s] {
-                    let sg = if self.g.vw[s] != 0 { 1.0 } else { -1.0 };
-                    let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
-                    let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += sg * nw.w1c[o0 + j];
-                        self.np_acc1[j] += sg * nw.w1c[o1 + j];
-                    }
-                    self.np_vw[s] = self.g.vw[s];
-                }
-            }
+                },
+            );
         }
 
         let mut hid = [0.0f64; NET_H];
@@ -1901,10 +2608,15 @@ impl TitaniumSearch {
                 hid[j] += nw.px[o1 + j];
             }
         }
-        for j in 0..NET_H {
-            let a2 = hid[j].clamp(0.0, 1.0);
-            out += nw.w2[j] * a2 * 200.0;
-        }
+        crate::bench_instr::record(
+            |b| &mut b.eval_nnue_infer,
+            || {
+                for j in 0..NET_H {
+                    let a2 = hid[j].clamp(0.0, 1.0);
+                    out += nw.w2[j] * a2 * 200.0;
+                }
+            },
+        );
         // Integer centipawns (JS `out | 0` / halfpw `int(out)`).
         let mut ret = out as i32;
         // pathfix/RaceProof(c): certified-win floor (sound; lazy; memoized;
@@ -2025,6 +2737,19 @@ impl TitaniumSearch {
     }
 
     fn gen_moves(&mut self, ply: usize, depth: i32, tt_move: i16, out: &mut [i16; 160]) -> usize {
+        crate::bench_instr::record(
+            |b| &mut b.gen_moves,
+            || self.gen_moves_inner(ply, depth, tt_move, out),
+        )
+    }
+
+    fn gen_moves_inner(
+        &mut self,
+        ply: usize,
+        depth: i32,
+        tt_move: i16,
+        out: &mut [i16; 160],
+    ) -> usize {
         let check_legal = ply == 0;
         // MoveGen+ : Titanium legal movegen at EVERY node (perft-parity search).
         // Fully legal walls — no lazy seal checks needed downstream, and inner
@@ -2095,6 +2820,8 @@ impl TitaniumSearch {
         } else {
             self.d0[self.dist0_idx][self.g.pawn[0]]
         };
+        let white_dist = if me == 0 { our_dist } else { opp_dist };
+        let black_dist = if me == 0 { opp_dist } else { our_dist };
         let opp_player = if me == 0 { Player::Two } else { Player::One };
 
         let bridge = self.bridge.as_mut().expect("cat bridge");
@@ -2108,6 +2835,9 @@ impl TitaniumSearch {
             get_shortest_path(&bridge.board, opp_player, &mut bridge.bfs, &mut opp_path);
         let reachable = bridge.bfs.both_reachable_mask(&bridge.board);
         let gap_zone = gap_play_zone_mask(reachable);
+        let mut wall_candidates = [BoardMove::Pawn { row: 0, col: 0 }; 128];
+        let mut wall_direct_heats = [0i32; 128];
+        let mut wall_candidate_n = 0usize;
 
         for slot in 0..64 {
             for (wall_type, base) in [(0usize, 100i16), (1usize, 200i16)] {
@@ -2115,23 +2845,62 @@ impl TitaniumSearch {
                     continue;
                 }
                 let m = base + slot as i16;
-                let keep = m == tt_move
-                    || wall_should_search(
-                        move_id_to_board(m),
-                        &cat,
-                        reachable,
-                        gap_zone,
-                        &mut bridge.board,
-                        our_dist,
-                        opp_dist,
-                        &opp_path,
-                        opp_path_len,
-                        &mut bridge.bfs,
-                    );
-                if keep {
-                    out[n] = m;
-                    n += 1;
+                let mv = move_id_to_board(m);
+                wall_candidates[wall_candidate_n] = mv;
+                wall_direct_heats[wall_candidate_n] = move_corridor_attention_with_path(
+                    &mut bridge.board,
+                    mv,
+                    &cat,
+                    white_dist,
+                    black_dist,
+                    &mut bridge.bfs,
+                );
+                wall_candidate_n += 1;
+            }
+        }
+
+        for i in 0..wall_candidate_n {
+            let mv = wall_candidates[i];
+            let m = match mv {
+                BoardMove::Wall {
+                    row,
+                    col,
+                    orientation,
+                } => {
+                    let slot = i16::from(row) * 8 + i16::from(col);
+                    match orientation {
+                        WallOrientation::Horizontal => 100 + slot,
+                        WallOrientation::Vertical => 200 + slot,
+                    }
                 }
+                BoardMove::Pawn { .. } => continue,
+            };
+            let boosted_heat = move_corridor_attention_with_denial(
+                &bridge.board,
+                mv,
+                &cat,
+                &wall_candidates[..wall_candidate_n],
+                &wall_direct_heats[..wall_candidate_n],
+                wall_candidate_n,
+            );
+            let denied_hot_neighbor = boosted_heat > wall_direct_heats[i];
+            let keep = m == tt_move
+                || denied_hot_neighbor
+                || wall_should_search(
+                    mv,
+                    &cat,
+                    reachable,
+                    gap_zone,
+                    &mut bridge.board,
+                    our_dist,
+                    opp_dist,
+                    &opp_path,
+                    opp_path_len,
+                    &mut bridge.bfs,
+                );
+            if keep {
+                out[n] = m;
+                n += 1;
             }
         }
         n
@@ -2234,6 +3003,10 @@ impl TitaniumSearch {
         prev_move: i16,
     ) -> Result<i32, TimeUp> {
         self.nodes += 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(runtime) = self.lazy_runtime.as_ref() {
+            runtime.global_nodes.fetch_add(1, Ordering::Relaxed);
+        }
         self.check_time()?;
         self.sub_min[ply] = MAX_PLY as i32;
         let prev = 1 - self.g.turn;
@@ -2288,15 +3061,36 @@ impl TitaniumSearch {
         // TT probe (typed, always-replace)
         let idx = (self.g.hash_lo & self.tt_mask) as usize;
         let mut tt_move: i16 = 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        let shared_entry = self
+            .shared_tt
+            .as_ref()
+            .and_then(|tt| tt.probe(self.g.hash_lo, self.g.hash_hi));
+        #[cfg(not(target_arch = "wasm32"))]
+        let meta = shared_entry.map_or(self.tt_meta[idx], |entry| entry.meta);
+        #[cfg(target_arch = "wasm32")]
         let meta = self.tt_meta[idx];
-        if meta != 0
-            && self.tt_key_hi[idx] == self.g.hash_hi
-            && self.tt_key_lo[idx] == self.g.hash_lo
-        {
+        crate::bench_instr::bump(|b| &mut b.tt_probe);
+        if meta != 0 && {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                shared_entry.is_some()
+                    || (self.tt_key_hi[idx] == self.g.hash_hi
+                        && self.tt_key_lo[idx] == self.g.hash_lo)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.tt_key_hi[idx] == self.g.hash_hi && self.tt_key_lo[idx] == self.g.hash_lo
+            }
+        } {
+            crate::bench_instr::bump(|b| &mut b.tt_hit);
             tt_move = (meta & 1023) as i16;
             let tdepth = meta >> 12;
             let tflag = (meta >> 10) & 3;
             if tdepth >= depth && ply > 0 {
+                #[cfg(not(target_arch = "wasm32"))]
+                let mut es = shared_entry.map_or(self.tt_score[idx], |entry| entry.score);
+                #[cfg(target_arch = "wasm32")]
                 let mut es = self.tt_score[idx]; // mate scores stored node-relative
                 if es > MATE - 2 * MAX_PLY as i32 {
                     es -= ply as i32;
@@ -2304,7 +3098,12 @@ impl TitaniumSearch {
                     es += ply as i32;
                 }
                 if (tflag == 0) || (tflag == 1 && es >= beta) || (tflag == 2 && es <= alpha) {
-                    if self.tt_rep[idx] == 0 {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let tt_rep = shared_entry.map_or(self.tt_rep[idx], |entry| entry.rep);
+                    #[cfg(target_arch = "wasm32")]
+                    let tt_rep = self.tt_rep[idx];
+                    if tt_rep == 0 {
+                        crate::bench_instr::bump(|b| &mut b.tt_cutoff);
                         return Ok(es);
                     }
                     // tainted-zero entry: PLAIN ZeroFence ships with the anchor
@@ -2361,7 +3160,7 @@ impl TitaniumSearch {
         }
 
         let mut moves = [0i16; 160];
-        let n = self.gen_moves(ply, depth, tt_move, &mut moves);
+        let mut n = self.gen_moves(ply, depth, tt_move, &mut moves);
         if n == 0 {
             return Ok(self.evaluate(depth));
         }
@@ -2371,6 +3170,59 @@ impl TitaniumSearch {
             0
         };
         self.order_moves(ply, &mut moves[..n], tt_move, cm_move);
+        #[cfg(not(target_arch = "wasm32"))]
+        if ply == 0 {
+            if let Some(root_moves) = self.lazy_root_moves.as_ref() {
+                let allowed = self
+                    .lazy_root_allowed
+                    .min(root_moves.len())
+                    .min(moves.len());
+                for (dst, src) in moves.iter_mut().zip(root_moves.iter()).take(allowed) {
+                    *dst = *src;
+                }
+                n = allowed;
+            }
+        }
+
+        let mut cat_heats = [0i32; 160];
+        let mut cat_refs = CatHeatRefs::default();
+        let cat_lmr_active = self.cat_lmr_v16 && depth >= 2 && n > 0;
+        if cat_lmr_active {
+            if let Some(bridge) = self.bridge.as_mut() {
+                let cat = bridge.bfs.build_corridor_attention(&bridge.board);
+                let white_dist = bridge
+                    .bfs
+                    .shortest_distance(&bridge.board, Player::One)
+                    .unwrap_or(crate::cat::DIST_PENALTY);
+                let black_dist = bridge
+                    .bfs
+                    .shortest_distance(&bridge.board, Player::Two)
+                    .unwrap_or(crate::cat::DIST_PENALTY);
+                let mut buf = [BoardMove::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+                for i in 0..n {
+                    buf[i] = move_id_to_board(moves[i]);
+                    cat_heats[i] = move_corridor_attention_with_path(
+                        &mut bridge.board,
+                        buf[i],
+                        &cat,
+                        white_dist,
+                        black_dist,
+                        &mut bridge.bfs,
+                    );
+                }
+                for i in 0..n {
+                    cat_heats[i] = move_corridor_attention_with_denial(
+                        &bridge.board,
+                        buf[i],
+                        &cat,
+                        &buf[..n],
+                        &cat_heats[..n],
+                        n,
+                    );
+                }
+                cat_refs = cat_heat_refs_from_scores(&buf[..n], n, &cat_heats[..n]);
+            }
+        }
 
         let mut best = i32::MIN; // JS -Infinity
         let mut best_move: i16 = 0;
@@ -2407,15 +3259,29 @@ impl TitaniumSearch {
                     }
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            if ply == 0 {
+                let original_idx = self
+                    .lazy_root_visit_map
+                    .as_ref()
+                    .and_then(|map| map.get(i).copied())
+                    .unwrap_or(i);
+                self.lazy_root_visits.push(original_idx);
+            }
             let probe_parent_hash = if self.reduction_probe_enabled {
                 Some((self.g.hash_lo, self.g.hash_hi))
             } else {
                 None
             };
-            self.g.make_move(m);
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.push(m);
-            }
+            crate::bench_instr::record(
+                |b| &mut b.make_move,
+                || {
+                    self.g.make_move(m);
+                    if let Some(bridge) = self.bridge.as_mut() {
+                        bridge.push(m);
+                    }
+                },
+            );
             let new_depth = depth - 1;
             let result = if self.eme
                 && i > 0
@@ -2433,8 +3299,22 @@ impl TitaniumSearch {
                 && m >= 100
                 && m != tt_move
             {
-                // graduated LMR
-                let red = ace_graduated_lmr_reduction(i, depth);
+                // graduated LMR — v16 stacks CAT-scaled depth on top of ACE baseline
+                let ace_red = ace_graduated_lmr_reduction(i, depth);
+                let red = if cat_lmr_active {
+                    let mv = move_id_to_board(m);
+                    let cat_red = cat_v16_lmr_reduction_plies(
+                        mv,
+                        cat_heats[i],
+                        cat_refs,
+                        self.cat_lmr_ceiling,
+                        self.cat_lmr_fringe_pct,
+                        new_depth as u32,
+                    ) as i32;
+                    ace_red.max(cat_red)
+                } else {
+                    ace_red
+                };
                 if self.reduction_sidecar.is_some() {
                     let started = Instant::now();
                     let hidden = self.current_hidden_features();
@@ -2537,13 +3417,7 @@ impl TitaniumSearch {
                 self.ab(new_depth, -beta, -alpha, ply + 1, true, m)
                     .map(|s| -s)
             };
-            self.g.unmake_move();
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.pop();
-            }
-            self.dist0_idx = nd0;
-            self.dist1_idx = nd1;
-            self.cached_stamp = nst;
+            self.unwind_move(nd0, nd1, nst);
             if self.sub_min[ply + 1] < self.sub_min[ply] {
                 self.sub_min[ply] = self.sub_min[ply + 1];
                 self.sub_anc_lo[ply] = self.sub_anc_lo[ply + 1];
@@ -2640,28 +3514,78 @@ impl TitaniumSearch {
         // Depth-preferred replacement (gen-aware when pure_mode=false).
         // Recompute idx: a child may have grown the TT (adaptive path) after our probe.
         let idx = (self.g.hash_lo & self.tt_mask) as usize;
-        let was_empty = self.tt_meta[idx] == 0;
-        let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
-        let deeper = !was_empty && !stale_gen && depth >= (self.tt_meta[idx] >> 12);
-        if was_empty || stale_gen || deeper {
-            self.tt_key_hi[idx] = self.g.hash_hi;
-            self.tt_key_lo[idx] = self.g.hash_lo;
-            self.tt_meta[idx] = best_move as i32 | (sf << 10) | (depth << 12);
-            self.tt_score[idx] = ts;
-            self.tt_rep[idx] = rb;
-            self.tt_entry_gen[idx] = self.tt_gen;
-            if rb != 0 {
-                self.tt_anc_lo[idx] = self.sub_anc_lo[ply];
-                self.tt_anc_hi[idx] = self.sub_anc_hi[ply];
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(shared) = self.shared_tt.as_ref() {
+            crate::bench_instr::bump(|b| &mut b.tt_store);
+            shared.store(
+                self.g.hash_lo,
+                self.g.hash_hi,
+                self.tt_gen,
+                self.pure_mode,
+                SharedTtEntry {
+                    key_hi: self.g.hash_hi,
+                    key_lo: self.g.hash_lo,
+                    meta: best_move as i32 | (sf << 10) | (depth << 12),
+                    score: ts,
+                    rep: rb,
+                    anc_lo: if rb != 0 { self.sub_anc_lo[ply] } else { 0 },
+                    anc_hi: if rb != 0 { self.sub_anc_hi[ply] } else { 0 },
+                    entry_gen: self.tt_gen,
+                },
+            );
+        } else {
+            let was_empty = self.tt_meta[idx] == 0;
+            let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
+            let deeper = !was_empty && !stale_gen && depth >= (self.tt_meta[idx] >> 12);
+            if was_empty || stale_gen || deeper {
+                crate::bench_instr::bump(|b| &mut b.tt_store);
+                self.tt_key_hi[idx] = self.g.hash_hi;
+                self.tt_key_lo[idx] = self.g.hash_lo;
+                self.tt_meta[idx] = best_move as i32 | (sf << 10) | (depth << 12);
+                self.tt_score[idx] = ts;
+                self.tt_rep[idx] = rb;
+                self.tt_entry_gen[idx] = self.tt_gen;
+                if rb != 0 {
+                    self.tt_anc_lo[idx] = self.sub_anc_lo[ply];
+                    self.tt_anc_hi[idx] = self.sub_anc_hi[ply];
+                }
+                // Overflow-driven cache-tier growth (idx is dead after this — safe to grow).
+                if was_empty {
+                    self.tt_filled += 1;
+                    if self.tt_adaptive
+                        && self.tt_bits < self.tt_max
+                        && self.tt_filled.saturating_mul(2) >= (1usize << self.tt_bits)
+                    {
+                        self.tt_grow();
+                    }
+                }
             }
-            // Overflow-driven cache-tier growth (idx is dead after this — safe to grow).
-            if was_empty {
-                self.tt_filled += 1;
-                if self.tt_adaptive
-                    && self.tt_bits < self.tt_max
-                    && self.tt_filled.saturating_mul(2) >= (1usize << self.tt_bits)
-                {
-                    self.tt_grow();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let was_empty = self.tt_meta[idx] == 0;
+            let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
+            let deeper = !was_empty && !stale_gen && depth >= (self.tt_meta[idx] >> 12);
+            if was_empty || stale_gen || deeper {
+                crate::bench_instr::bump(|b| &mut b.tt_store);
+                self.tt_key_hi[idx] = self.g.hash_hi;
+                self.tt_key_lo[idx] = self.g.hash_lo;
+                self.tt_meta[idx] = best_move as i32 | (sf << 10) | (depth << 12);
+                self.tt_score[idx] = ts;
+                self.tt_rep[idx] = rb;
+                self.tt_entry_gen[idx] = self.tt_gen;
+                if rb != 0 {
+                    self.tt_anc_lo[idx] = self.sub_anc_lo[ply];
+                    self.tt_anc_hi[idx] = self.sub_anc_hi[ply];
+                }
+                if was_empty {
+                    self.tt_filled += 1;
+                    if self.tt_adaptive
+                        && self.tt_bits < self.tt_max
+                        && self.tt_filled.saturating_mul(2) >= (1usize << self.tt_bits)
+                    {
+                        self.tt_grow();
+                    }
                 }
             }
         }
@@ -2670,10 +3594,15 @@ impl TitaniumSearch {
 
     /// Restore after a time abort mid-move (JS `finally` semantics).
     fn unwind_move(&mut self, nd0: usize, nd1: usize, nst: i32) {
-        self.g.unmake_move();
-        if let Some(bridge) = self.bridge.as_mut() {
-            bridge.pop();
-        }
+        crate::bench_instr::record(
+            |b| &mut b.unmake_move,
+            || {
+                self.g.unmake_move();
+                if let Some(bridge) = self.bridge.as_mut() {
+                    bridge.pop();
+                }
+            },
+        );
         self.dist0_idx = nd0;
         self.dist1_idx = nd1;
         self.cached_stamp = nst;
@@ -2691,6 +3620,7 @@ impl TitaniumSearch {
         log: bool,
         engine_label: &str,
     ) -> ThinkResult {
+        let mut stop_reason: &'static str = "unknown";
         if self.cheap_cert
             && !self.race_proof
             && self.g.wl[0] == 0
@@ -2771,10 +3701,18 @@ impl TitaniumSearch {
                     score,
                     depth: 99,
                     nodes: nm as u64,
+                    main_thread_nodes: nm as u64,
+                    helper_nodes: Vec::new(),
+                    total_nodes: nm as u64,
+                    main_completed_depth: 99,
+                    helper_completed_depths: Vec::new(),
+                    root_widths: Vec::new(),
+                    root_visits: Vec::new(),
                     ms: rt0.elapsed().as_millis() as u64,
                     white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
                     black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
                     depth_log: Vec::new(),
+                    stop_reason: "cheap_cert_root_race",
                 };
             }
         }
@@ -2804,15 +3742,215 @@ impl TitaniumSearch {
                         },
                         depth: 99,
                         nodes: nm as u64,
+                        main_thread_nodes: nm as u64,
+                        helper_nodes: Vec::new(),
+                        total_nodes: nm as u64,
+                        main_completed_depth: 99,
+                        helper_completed_depths: Vec::new(),
+                        root_widths: Vec::new(),
+                        root_visits: Vec::new(),
                         ms: rt0.elapsed().as_millis() as u64,
                         white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
                         black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
                         depth_log: Vec::new(),
+                        stop_reason: "race_proof_root_table",
                     };
                 }
             }
         }
-        self.think_search(time_ms, max_depth, full, log, engine_label)
+        self.think_search(
+            time_ms,
+            max_depth,
+            full,
+            log,
+            engine_label,
+            &mut stop_reason,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn think_with_threads(
+        &mut self,
+        time_ms: u64,
+        max_depth: i32,
+        full: bool,
+        log: bool,
+        engine_label: &str,
+        threads: usize,
+    ) -> ThinkResult {
+        if threads <= 1 {
+            self.shared_tt = None;
+            self.lazy_runtime = None;
+            self.lazy_root_moves = None;
+            self.lazy_root_visit_map = None;
+            return self.think(time_ms, max_depth, full, log, engine_label);
+        }
+        let threads = threads.min(LAZY_SMP_MAX_THREADS);
+        self.think_lazy_smp(time_ms, max_depth, full, log, engine_label, threads)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lazy_smp_helper_partial<'a>(
+        main_result: &ThinkResult,
+        helper_results: &'a [(usize, ThinkResult, Vec<usize>)],
+        root_moves_raw: &[i16],
+    ) -> Option<&'a ThinkResult> {
+        if main_result.depth > 0 && main_result.mv != super::TITANIUM_NO_MOVE {
+            return None;
+        }
+        helper_results
+            .iter()
+            .map(|(_, result, _)| result)
+            .filter(|result| {
+                result.depth > 0
+                    && result.mv != super::TITANIUM_NO_MOVE
+                    && root_moves_raw.contains(&result.mv)
+            })
+            .max_by_key(|result| (result.depth, result.nodes))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn think_lazy_smp(
+        &mut self,
+        time_ms: u64,
+        max_depth: i32,
+        full: bool,
+        log: bool,
+        engine_label: &str,
+        threads: usize,
+    ) -> ThinkResult {
+        if self.g.winner() >= 0 {
+            return self.think(time_ms, max_depth, full, log, engine_label);
+        }
+
+        // Parallel search uses a fixed shared allocation. Live adaptive growth is
+        // intentionally disabled because resizing a TT while other workers probe
+        // it would invalidate the shared slots.
+        if self.shared_tt.is_none() && self.tt_bits < TT_BITS {
+            self.resize_tt(TT_BITS);
+        }
+        self.tt_adaptive = false;
+        self.apply_think_start_state();
+
+        let depth_limit = if max_depth > 0 { max_depth } else { 30 };
+        let root_moves_raw = self.ordered_root_moves_snapshot(depth_limit);
+        if root_moves_raw.is_empty() {
+            return self.think(time_ms, max_depth, full, log, engine_label);
+        }
+        let root_position = self.g.clone();
+        let shared_tt = self
+            .shared_tt
+            .clone()
+            .unwrap_or_else(|| Arc::new(SharedTitaniumTt::from_search(self)));
+        let deadline = Instant::now() + Duration::from_millis(time_ms.max(1));
+        let runtime = Arc::new(LazySmpRuntime::new(deadline));
+        let plans: Vec<WorkerPlan> = (0..threads)
+            .map(|worker_id| WorkerPlan {
+                worker_id,
+                root_move_count: root_moves_raw.len(),
+                root_width_percent: Self::lazy_smp_width_percent(worker_id),
+            })
+            .collect();
+
+        let mut helper_results: Vec<(usize, ThinkResult, Vec<usize>)> = Vec::new();
+        let main_allowed = plans[0].allowed_root_moves();
+        let (main_root_moves, main_visit_map) =
+            Self::lazy_smp_profile_root_moves(&root_moves_raw, 0, main_allowed);
+        self.install_lazy_smp_context(
+            0,
+            shared_tt.clone(),
+            runtime.clone(),
+            Arc::new(main_root_moves),
+            Arc::new(main_visit_map),
+            main_allowed,
+        );
+
+        let helper_workers: Vec<(WorkerPlan, Box<TitaniumSearch>)> = plans
+            .iter()
+            .copied()
+            .skip(1)
+            .map(|plan| {
+                let mut worker = self.fork_lazy_worker(&root_position);
+                let allowed = plan.allowed_root_moves();
+                let (profiled_root_moves, visit_map) =
+                    Self::lazy_smp_profile_root_moves(&root_moves_raw, plan.worker_id, allowed);
+                worker.install_lazy_smp_context(
+                    plan.worker_id,
+                    shared_tt.clone(),
+                    runtime.clone(),
+                    Arc::new(profiled_root_moves),
+                    Arc::new(visit_map),
+                    allowed,
+                );
+                (plan, worker)
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads.saturating_sub(1));
+            for (plan, mut worker) in helper_workers {
+                handles.push(scope.spawn(move || {
+                    let mut stop_reason = "unknown";
+                    let result = worker.think_search(
+                        time_ms,
+                        max_depth,
+                        full,
+                        false,
+                        engine_label,
+                        &mut stop_reason,
+                    );
+                    (plan.worker_id, result, worker.lazy_root_visits)
+                }));
+            }
+
+            let mut stop_reason = "unknown";
+            let mut main_result = self.think_search(
+                time_ms,
+                max_depth,
+                full,
+                log,
+                engine_label,
+                &mut stop_reason,
+            );
+            runtime.stop.store(true, Ordering::Relaxed);
+
+            for handle in handles {
+                if let Ok(result) = handle.join() {
+                    helper_results.push(result);
+                }
+            }
+            helper_results.sort_by_key(|(worker_id, _, _)| *worker_id);
+
+            let main_completed_depth = main_result.depth;
+            let main_nodes = main_result.nodes;
+            if let Some(helper) =
+                Self::lazy_smp_helper_partial(&main_result, &helper_results, &root_moves_raw)
+            {
+                main_result.mv = helper.mv;
+                main_result.score = helper.score;
+                main_result.depth = helper.depth;
+                main_result.ms = main_result.ms.max(helper.ms);
+                main_result.white_dist = helper.white_dist;
+                main_result.black_dist = helper.black_dist;
+                main_result.depth_log = helper.depth_log.clone();
+                main_result.stop_reason = "lazy_smp_helper_partial";
+            }
+
+            let helper_nodes: Vec<u64> = helper_results.iter().map(|(_, r, _)| r.nodes).collect();
+            let helper_depths: Vec<i32> = helper_results.iter().map(|(_, r, _)| r.depth).collect();
+            let mut root_visits = vec![self.lazy_root_visits.clone()];
+            root_visits.extend(helper_results.iter().map(|(_, _, visits)| visits.clone()));
+            let total_nodes = main_nodes + helper_nodes.iter().copied().sum::<u64>();
+            main_result.main_thread_nodes = main_nodes;
+            main_result.helper_nodes = helper_nodes;
+            main_result.total_nodes = total_nodes;
+            main_result.nodes = total_nodes;
+            main_result.main_completed_depth = main_completed_depth;
+            main_result.helper_completed_depths = helper_depths;
+            main_result.root_widths = plans;
+            main_result.root_visits = root_visits;
+            main_result
+        })
     }
 
     /// Iterative deepening within `time_ms`. `full` disables the easy-move stop.
@@ -2823,8 +3961,10 @@ impl TitaniumSearch {
         full: bool,
         log: bool,
         engine_label: &str,
+        stop_reason: &mut &'static str,
     ) -> ThinkResult {
         let t0 = Instant::now();
+        crate::bench_instr::begin_search();
         // pathfix/RaceProof(b): reserve the commitment gate's worst-case cost
         // out of the search deadline when the gate can fire — it runs after
         // the search loop and its raceTbl(force=true) call ignores deadline.
@@ -2837,23 +3977,39 @@ impl TitaniumSearch {
                 .max((time_ms as f64 * 0.15) as u64)
                 .min(cap);
         }
-        self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(runtime) = self.lazy_runtime.as_ref() {
+            self.deadline = runtime.deadline;
+        } else {
+            self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
+        }
         self.nodes = 0;
         self.root_best = super::TITANIUM_NO_MOVE;
         self.root_score = 0;
-        if !self.pure_mode && !self.is_pondering {
-            // Advance TT generation: depth-preferred replacement will now protect entries
-            // from this search over shallower rewrites, while stale (prior-gen) entries
-            // are always evictable regardless of their depth.
-            // Skipped during pondering: all ponder chunks share one generation so the
-            // opponent's ponder time builds real depth rather than aging itself out.
-            self.tt_gen = self.tt_gen.wrapping_add(1);
-            // Decay history table before each search: halve all values so stale tactical
-            // patterns from several moves ago don't dominate current move ordering.
-            // Skipped during pondering: history accumulates across all ponder chunks and
-            // is decayed exactly once when the real think() call begins.
-            for h in self.history_tbl.iter_mut() {
-                *h >>= 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        let skip_setup = self.lazy_skip_setup;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.lazy_skip_setup = false;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let skip_setup = false;
+        if !skip_setup {
+            // Advance TT generation and decay history once at think start.
+            // Lazy SMP does this before forking workers so every worker stores
+            // into the same generation and starts from the same ordered root.
+            #[cfg(not(target_arch = "wasm32"))]
+            self.apply_think_start_state();
+            #[cfg(target_arch = "wasm32")]
+            if !self.pure_mode && !self.is_pondering {
+                self.tt_gen = self.tt_gen.wrapping_add(1);
+                for h in self.history_tbl.iter_mut() {
+                    *h >>= 1;
+                }
             }
         }
         // RaceProof per-think solve budgets + caps
@@ -2896,16 +4052,39 @@ impl TitaniumSearch {
         // Disabled in pure_mode (faithful JS baseline).
         let start_depth = if !self.pure_mode {
             let ridx = (self.g.hash_lo & self.tt_mask) as usize;
+            #[cfg(not(target_arch = "wasm32"))]
+            let root_entry = self
+                .shared_tt
+                .as_ref()
+                .and_then(|tt| tt.probe(self.g.hash_lo, self.g.hash_hi));
+            #[cfg(not(target_arch = "wasm32"))]
+            let rmeta = root_entry.map_or(self.tt_meta[ridx], |entry| entry.meta);
+            #[cfg(target_arch = "wasm32")]
             let rmeta = self.tt_meta[ridx];
-            if rmeta != 0
-                && self.tt_key_hi[ridx] == self.g.hash_hi
-                && self.tt_key_lo[ridx] == self.g.hash_lo
-            {
+            if rmeta != 0 && {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    root_entry.is_some()
+                        || (self.tt_key_hi[ridx] == self.g.hash_hi
+                            && self.tt_key_lo[ridx] == self.g.hash_lo)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.tt_key_hi[ridx] == self.g.hash_hi && self.tt_key_lo[ridx] == self.g.hash_lo
+                }
+            } {
                 let tt_depth = rmeta >> 12;
                 let tt_flag = (rmeta >> 10) & 3;
                 if tt_depth >= 4 && tt_flag == 0 {
                     // Exact score: safe to use as aspiration seed and skip iterations.
-                    last_score = self.tt_score[ridx]; // seed aspiration; ply=0 so no mate-adj
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        last_score = root_entry.map_or(self.tt_score[ridx], |entry| entry.score);
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        last_score = self.tt_score[ridx];
+                    }
                     (tt_depth - 2).max(1)
                 } else {
                     1
@@ -2919,9 +4098,11 @@ impl TitaniumSearch {
 
         for d in start_depth..=max_depth {
             if d > 1 && Self::ace_over_time_budget(t0, time_ms, last_score) {
+                *stop_reason = "ace_over_time_budget_before_depth";
                 break;
             }
             if Instant::now() >= self.deadline {
+                *stop_reason = "deadline_before_depth";
                 break;
             }
             // RaceProof: in-tree solves only when cheap to amortize
@@ -2986,6 +4167,7 @@ impl TitaniumSearch {
                         self.emit_stream_progress(true);
                     }
                     if sc > MATE - 200 || sc < -(MATE - 200) {
+                        *stop_reason = "forced_mate_or_loss";
                         break; // forced result
                     }
                     // v8 easy-move stop (acev8_engine.js)
@@ -2995,6 +4177,7 @@ impl TitaniumSearch {
                         && last_score > -120
                         && t0.elapsed().as_millis() as u64 > time_ms * 3 / 10
                     {
+                        *stop_reason = "easy_move_stable";
                         break;
                     }
                 }
@@ -3016,12 +4199,17 @@ impl TitaniumSearch {
                             last_pawn_score = self.root_pawn_score;
                         }
                     }
+                    *stop_reason = "time_up";
                     break; // state already restored by unwinding unmakes
                 }
             }
             if Self::ace_over_time_budget(t0, time_ms, last_score) {
+                *stop_reason = "ace_over_time_budget_after_depth";
                 break;
             }
+        }
+        if *stop_reason == "unknown" {
+            *stop_reason = "max_depth_completed";
         }
 
         // ---------- pathfix/RaceProof(b): last-wall commitment gate (DEMOTE, never forbid) ----------
@@ -3126,15 +4314,26 @@ impl TitaniumSearch {
             }
         }
 
+        crate::bench_instr::set_stop_reason(stop_reason);
+        crate::bench_instr::end_search(self.nodes);
+
         ThinkResult {
             mv: last_best,
             score: last_score,
             depth: last_depth,
             nodes: self.nodes,
+            main_thread_nodes: self.nodes,
+            helper_nodes: Vec::new(),
+            total_nodes: self.nodes,
+            main_completed_depth: last_depth,
+            helper_completed_depths: Vec::new(),
+            root_widths: Vec::new(),
+            root_visits: Vec::new(),
             ms,
             white_dist,
             black_dist,
             depth_log,
+            stop_reason: *stop_reason,
         }
     }
 }

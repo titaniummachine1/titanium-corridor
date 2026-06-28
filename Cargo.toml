@@ -9,6 +9,14 @@ license = "GPL-3.0-or-later"
 lto = "fat"
 codegen-units = 1
 
+# Release optimizations + full debuginfo for samply / cargo-flamegraph (symbolicated stacks).
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
+lto = "fat"
+codegen-units = 1
+
 [lib]
 name = "titanium"
 path = "src/lib.rs"
@@ -23,8 +31,15 @@ required-features = ["parallel"]
 name = "movegen-o1-gen"
 path = "src/bin/movegen_o1_gen.rs"
 
+[[bin]]
+name = "search_bench"
+path = "src/bin/search_bench.rs"
+required-features = ["parallel"]
+
 [features]
 default = ["parallel"]
+# Per-op call counts and phase timers for search_bench (compiled out when disabled).
+bench-instrument = []
 # Multi-threaded perft / Lazy SMP (rayon). Disable for wasm.
 parallel = ["dep:rayon"]
 # Bake the precomputed pawn O1 tables (~1.85MB) into the binary instead of

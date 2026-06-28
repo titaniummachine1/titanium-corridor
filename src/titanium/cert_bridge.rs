@@ -14,9 +14,9 @@
 //!   player index   identical (One→0, Two→1)
 //!   turn hash term present iff side-to-move == 1 (ACE base hash is turn-0)
 
+use crate::core::board::{Board, Player};
 use crate::titanium::certify::{certify, CertifyOpts};
 use crate::titanium::game::{GameState, BORDER, DELTA, DIRBIT, ZOBRIST};
-use crate::core::board::{Board, Player};
 use crate::util::clock::{Duration, Instant};
 
 /// Titanium pawn `(row, col)` → ACE cell index (0..80).
@@ -129,7 +129,8 @@ pub fn certify_board(
             None
         };
     }
-    if let Some(verdict) = crate::titanium::wall_ignore_cert::try_wall_ignore_cert_board(board, false)
+    if let Some(verdict) =
+        crate::titanium::wall_ignore_cert::try_wall_ignore_cert_board(board, false)
     {
         let winner = player_from_ace(verdict.winner);
         return if side.is_none_or(|s| s == winner) {
@@ -565,8 +566,8 @@ mod tests {
         // GameState for ARBITRARY reachable positions, not just one line — a wrong
         // blocked[]/pawn/turn would feed the oracle/certificate a wrong board and
         // make it "prove" a win that isn't real. Fuzz many random legal games.
-        use crate::titanium::algebraic_to_move_id;
         use crate::movegen::generate_legal_moves;
+        use crate::titanium::algebraic_to_move_id;
         use crate::util::perft::format_move;
 
         let mut seed = 0x1234_5678_9abc_def0u64;

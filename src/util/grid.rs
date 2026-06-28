@@ -81,7 +81,7 @@ pub fn square_index(row: u8, col: u8) -> u8 {
 
 #[inline]
 pub fn unpack_square(sq: u8) -> (u8, u8) {
-    (sq / 9, sq % 9)
+    crate::bench_instr::count(|b| &mut b.unpack_square, || (sq / 9, sq % 9))
 }
 
 // ── Centered u128 flood layout (11×11 stride, 9×9 playable) ─────────────────
@@ -101,12 +101,25 @@ pub const fn flood_bit_index(row: u8, col: u8) -> u32 {
 
 #[inline]
 pub fn flood_bit_sq(sq: u8) -> u128 {
-    let (r, c) = unpack_square(sq);
-    1u128 << flood_bit_index(r, c)
+    crate::bench_instr::count(
+        |b| &mut b.flood_bit_sq,
+        || {
+            let (r, c) = unpack_square(sq);
+            1u128 << flood_bit_index(r, c)
+        },
+    )
 }
 
 #[inline]
 pub fn flood_sq_from_bit(bit: u32) -> Option<u8> {
+    crate::bench_instr::record(
+        |b| &mut b.flood_sq_from_bit,
+        || flood_sq_from_bit_inner(bit),
+    )
+}
+
+#[inline]
+fn flood_sq_from_bit_inner(bit: u32) -> Option<u8> {
     if bit >= 128 {
         return None;
     }

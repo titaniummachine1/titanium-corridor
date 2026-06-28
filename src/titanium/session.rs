@@ -9,7 +9,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use super::{move_id_to_algebraic, algebraic_to_move_id, GameState, TitaniumSearch};
+use super::{algebraic_to_move_id, move_id_to_algebraic, GameState, TitaniumSearch};
 
 fn reply_ready(stdout: &mut io::Stdout) {
     let _ = writeln!(stdout, "ready");
@@ -26,7 +26,9 @@ fn build_search(engine_flag: &str, g: GameState) -> Box<TitaniumSearch> {
     let mut search = match engine_flag {
         "ace-v13-pure" => TitaniumSearch::new(g),
         "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
+        "titanium-v15-medium" => TitaniumSearch::grafted_medium(g, None),
         "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
+        "titanium-v16" => TitaniumSearch::grafted_v16(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
             TitaniumSearch::grafted_no_raceproof(g, None)
         }
@@ -51,7 +53,7 @@ fn replay(moves: &[String]) -> Result<GameState, String> {
 }
 
 /// Blocking REPL holding one warm `TitaniumSearch` for the process lifetime.
-pub fn run_titanium_session_stdio(engine_flag: &str) {
+pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
     let mut search = build_search(engine_flag, GameState::new());
     let mut applied: Vec<String> = Vec::new();
     let stdin = io::stdin();
@@ -130,7 +132,40 @@ pub fn run_titanium_session_stdio(engine_flag: &str) {
                 }
                 let time_sec: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4.0);
                 let time_ms = (time_sec * 1000.0).max(1.0) as u64;
+                #[cfg(not(target_arch = "wasm32"))]
+                let result =
+                    search.think_with_threads(time_ms, 30, false, true, engine_flag, threads);
+                #[cfg(target_arch = "wasm32")]
                 let result = search.think(time_ms, 30, false, true, engine_flag);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let helper_nodes = result
+                        .helper_nodes
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let helper_depths = result
+                        .helper_completed_depths
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let _ = writeln!(
+                        stdout,
+                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}]}}",
+                        engine_flag,
+                        result.stop_reason,
+                        result.depth,
+                        result.nodes,
+                        result.main_thread_nodes,
+                        helper_nodes,
+                        result.total_nodes,
+                        result.main_completed_depth,
+                        helper_depths,
+                    );
+                    let _ = stdout.flush();
+                }
                 if result.mv == super::TITANIUM_NO_MOVE {
                     let _ = writeln!(stdout, "bestmove (none)");
                 } else {

@@ -6,7 +6,7 @@ use crate::titanium::game::{GameState, ZOBRIST};
 
 pub const POSITION_SCHEMA_VERSION: u8 = 1;
 pub const PACKED_STATE_LEN: usize = 24;
-pub const FEATURE_SCHEMA: &str = "halfpw-sparse-route5-ws14-v1";
+pub const FEATURE_SCHEMA: &str = "halfpw-sparse-route5-ws20-cat-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedFields {
@@ -202,8 +202,8 @@ mod tests {
         let packed = pack_state(&g);
         assert_eq!(g.turn, 0);
         assert_eq!(packed[5], 1); // 1 - engine.turn
-        // After 3 moves: engine turn=1 (pawn[1]'s turn).
-        // Dataset side_to_move = 1-1 = 0.
+                                  // After 3 moves: engine turn=1 (pawn[1]'s turn).
+                                  // Dataset side_to_move = 1-1 = 0.
         let g2 = game_from_moves(&["e2", "e8", "e3"]);
         let packed2 = pack_state(&g2);
         assert_eq!(g2.turn, 1);
