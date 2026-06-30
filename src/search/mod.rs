@@ -5,6 +5,7 @@ pub mod context;
 pub mod deprecated;
 pub mod genmove;
 pub mod greedy;
+pub mod cat_index_lmr;
 pub mod lmr_profile;
 pub mod lmr_viz;
 pub mod move_pack;

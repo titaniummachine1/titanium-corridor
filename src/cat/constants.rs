@@ -16,5 +16,17 @@ pub const CAT_HOT_CM: u16 = 160;
 /// Cold fringe — extra LMR reduction below this.
 pub const CAT_COLD_CM: u16 = 60;
 
+/// Dead CAT tail — at or below this % of position peak → minimum child depth (max LMR).
+pub const CAT_TAIL_DEAD_RATIO_PCT: u16 = 10;
+
+/// Heavy fringe — above dead tail, up to this % of peak → strong cut, not absolute max.
+pub const CAT_HEAVY_FRINGE_RATIO_PCT: u16 = 20;
+
 /// Sentinel when BFS finds no path.
 pub const DIST_PENALTY: u8 = 255;
+
+/// Impact/bitmask path only — dense `corridor_heat` keeps `MAX_RELEVANT_CORRIDOR_DELTA`.
+pub const MAX_IMPACT_HEAT_DELTA: usize = 8;
+
+/// Compiled default path-distance bias (basis points). Search worker stays at 0.
+pub const DEFAULT_CAT_DISTANCE_BIAS_BP: i16 = 0;

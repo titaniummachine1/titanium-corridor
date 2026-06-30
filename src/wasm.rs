@@ -59,8 +59,7 @@ pub fn last_panic() -> String {
 /// The site uses this as telemetry to prove browser searches are using the
 /// internal Rayon pool rather than JavaScript-distributed fake workers.
 #[cfg(target_arch = "wasm32")]
-pub static HELPER_STARTS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+pub static HELPER_STARTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 #[cfg(target_arch = "wasm32")]
 pub fn note_helper_start() {
     HELPER_STARTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -183,7 +182,10 @@ pub struct WasmCatEngine {
 impl WasmCatEngine {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmCatEngine {
-        WasmCatEngine { board: Board::new(), applied: Vec::new() }
+        WasmCatEngine {
+            board: Board::new(),
+            applied: Vec::new(),
+        }
     }
 
     /// CAT JSON for `moves` (space-separated algebraic), reusing the warm board.
@@ -192,24 +194,34 @@ impl WasmCatEngine {
         cat_snapshot_json(&mut self.board)
     }
 
-    /// LMR plan JSON for `moves` at `aggression` ∈ [0,1] — same warm board,
-    /// single-thread. Per-move `childDepthUsed`/`childDepthFull` give the search-
-    /// depth %. Mirrors the live Titanium connected LMR (one knob over index +
-    /// impact), so the overlay shows what the engine actually does.
+    /// LMR plan JSON — `lmr_aggression_percent` is viz tuning, -500..150.
     pub fn lmr_snapshot(
         &mut self,
         moves: &str,
         time_ms: u32,
         id_depth: u32,
-        aggression: f64,
+        lmr_aggression_percent: i32,
     ) -> String {
         self.sync_to(moves);
         crate::search::lmr_viz::lmr_snapshot_json(
             &mut self.board,
             u64::from(time_ms),
             id_depth,
-            aggression,
+            lmr_aggression_percent,
         )
+    }
+
+    /// Path tilt for CAT heat visualization (basis points). Visualization worker only.
+    pub fn set_cat_distance_bias_bp(&mut self, bias: i16) {
+        crate::cat::build::set_cat_distance_bias_bp(bias);
+    }
+
+    pub fn get_cat_distance_bias_bp(&self) -> i16 {
+        crate::cat::build::cat_distance_bias_bp()
+    }
+
+    pub fn default_cat_distance_bias_bp() -> i16 {
+        crate::cat::build::default_cat_distance_bias_bp()
     }
 }
 

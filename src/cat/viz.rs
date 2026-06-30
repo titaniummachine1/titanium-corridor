@@ -236,9 +236,10 @@ mod tests {
             warm < 45,
             "corridor CAT should not flood the board, got {warm} warm squares"
         );
-        let e3 = values[square_index(2, 4) as usize];
+        // e4 = one step ahead of P1's pawn (e3); the pawn square itself is zeroed.
+        let e4 = values[square_index(3, 4) as usize];
         let a1 = values[square_index(0, 0) as usize];
-        assert!(e3 > a1, "pawn corridor hotter than far corner");
+        assert!(e4 > a1, "pawn corridor hotter than far corner");
         assert!(a1 < CAT_COLD_CM, "far corner stays cold fringe");
     }
 
@@ -258,9 +259,11 @@ mod tests {
             warm < 35,
             "mid-game CAT overlay should stay corridor-focused, got {warm} warm squares"
         );
-        let e6 = values[square_index(5, 4) as usize];
+        // f6 (row 5, col 5) = on white's detour corridor around P2 at e6.
+        // The pawn square e6 itself is zeroed; check an adjacent corridor cell.
+        let f6 = values[square_index(5, 5) as usize];
         let a1 = values[square_index(0, 0) as usize];
-        assert!(e6 >= CAT_COLD_CM, "white pawn corridor visible");
+        assert!(f6 >= CAT_COLD_CM, "white detour corridor visible");
         assert!(a1 < CAT_COLD_CM, "far corner cold");
     }
 

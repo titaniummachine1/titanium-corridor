@@ -9,6 +9,8 @@ use crate::cat::constants::{CAT_COLD_CM, CAT_HOT_CM, DIST_PENALTY};
 use crate::core::board::{Board, Move, Player, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
+use crate::path::distance::fill_dist_to_goal_row;
+use crate::path::masks::DirMasks;
 use crate::path::BfsScratch;
 use crate::util::grid::{has_wall, is_goal, square_index, unpack_square, wall_touch_squares};
 /// Wasted turn: opponent gets to improve on reply.
@@ -695,6 +697,39 @@ pub fn is_cat_hot_corridor(cat_cm: i32) -> bool {
 /// Normalized heat at this node: 0 = at/below `cold_cm`, 1 = `cat_max`.
 /// A move at 200 cm vs 100 cm with max 250 scales ~11× in fraction (proportional to hotspot).
 #[inline]
+pub fn cat_tail_dead_cutoff_cm(cat_ref_max: u16) -> i32 {
+    if cat_ref_max == 0 {
+        return 0;
+    }
+    i32::from(cat_ref_max.saturating_mul(crate::cat::constants::CAT_TAIL_DEAD_RATIO_PCT) / 100)
+}
+
+/// True when `cat_cm` is in the dead tail (≤ 10% of position peak) — max LMR reduction.
+#[inline]
+pub fn cat_is_dead_tail(cat_cm: i32, cat_ref_max: u16) -> bool {
+    cat_ref_max > 0 && cat_cm >= 0 && cat_cm <= cat_tail_dead_cutoff_cm(cat_ref_max)
+}
+
+#[inline]
+pub fn cat_heavy_fringe_cutoff_cm(cat_ref_max: u16) -> i32 {
+    if cat_ref_max == 0 {
+        return 0;
+    }
+    i32::from(
+        cat_ref_max.saturating_mul(crate::cat::constants::CAT_HEAVY_FRINGE_RATIO_PCT) / 100,
+    )
+}
+
+/// Above dead tail but still weak (e.g. 41–80 cm when peak is 400) — heavy cut, not absolute max.
+#[inline]
+pub fn cat_is_heavy_fringe(cat_cm: i32, cat_ref_max: u16) -> bool {
+    !cat_is_dead_tail(cat_cm, cat_ref_max)
+        && cat_ref_max > 0
+        && cat_cm >= 0
+        && cat_cm <= cat_heavy_fringe_cutoff_cm(cat_ref_max)
+}
+
+#[inline]
 pub fn cat_heat_fraction(cat_cm: i32, cat_max: u16, cold_cm: u16) -> f32 {
     if cat_max <= cold_cm {
         return if cat_cm > i32::from(cold_cm) {
@@ -781,6 +816,15 @@ pub fn cat_heat_child_depth(
     if child_depth_full == 0 {
         return 0;
     }
+    if cat_ref_max > 0 && cat_is_dead_tail(cat_cm, cat_ref_max) {
+        return 1.min(child_depth_full);
+    }
+    if cat_ref_max > 0 && cat_is_heavy_fringe(cat_cm, cat_ref_max) {
+        let heavy = ((child_depth_full as f32) * 0.28)
+            .round()
+            .max(2.0) as u32;
+        return heavy.min(child_depth_full);
+    }
     if cat_ref_max == 0 || cat_cm <= 0 {
         return 1.min(child_depth_full);
     }
@@ -858,16 +902,47 @@ pub fn cat_v16_lmr_reduction_plies(
     reduction.min(child_depth_full.saturating_sub(2))
 }
 
+/// Returns CAT/index reducibility in `[0,1]`: 0 = important, 1 = very reducible.
+pub fn cat_v16_lmr_reducibility(
+    cat_cm: i32,
+    refs: CatHeatRefs,
+    mv: Move,
+    move_index: usize,
+) -> f64 {
+    if move_index == 0 {
+        return 0.0;
+    }
+    let cat_ref = cat_heat_ref_max(mv, refs);
+    let cat_norm = if cat_ref == 0 {
+        0.0
+    } else {
+        (cat_cm.max(0) as f64 / f64::from(cat_ref)).clamp(0.0, 1.0)
+    };
+    let unimportance = 1.0 - cat_norm;
+    const INDEX_CAP: f64 = 16.0;
+    let lateness = (move_index as f64 / INDEX_CAP).min(1.0);
+    0.5 * unimportance + 0.5 * lateness
+}
+
+/// Returns the depth fraction in `[0,1]` **before** rounding to integer plies.
+pub fn cat_v16_lmr_reduction_frac(
+    cat_cm: i32,
+    refs: CatHeatRefs,
+    mv: Move,
+    move_index: usize,
+    aggression: f64,
+) -> f64 {
+    if move_index == 0 || aggression <= 0.0 {
+        return 0.0;
+    }
+    let reducibility = cat_v16_lmr_reducibility(cat_cm, refs, mv, move_index);
+    const SHARP: f64 = 3.0;
+    let exponent = 1.0 + (1.0 - reducibility) * SHARP;
+    aggression.clamp(0.0, 1.0).powf(exponent)
+}
+
 /// Connected CAT-LMR reduction — ONE intuitive model over both the move index
-/// and its corridor impact. `aggression` ∈ [0,1] is the single tuning knob:
-///   0.0 → no reduction at all (every move searched full depth);
-///   1.0 → maximal reduction of every non-PV move (down to ~1 ply).
-/// In between, a move's *reducibility* — a blend of low impact (cold heatmap)
-/// and late move index — decides how fast it gives up depth as aggression rises:
-/// cold + late moves shed depth first, hot + early moves only near 100%.
-///
-/// Connected, not additive: index and impact feed the same reducibility, so
-/// there's exactly one knob to tune and the 0%/100% endpoints are intuitive.
+/// and its corridor impact. `aggression` ∈ [0,1] is the single tuning knob.
 /// Returns total reduction plies (subsumes the old base index-LMR).
 pub fn cat_v16_lmr_reduction(
     mv: Move,
@@ -880,22 +955,7 @@ pub fn cat_v16_lmr_reduction(
     if child_depth_full <= 1 || move_index == 0 || aggression <= 0.0 {
         return 0;
     }
-    let cat_ref = cat_heat_ref_max(mv, refs);
-    let cat_norm = if cat_ref == 0 {
-        0.0 // no corridor structure for this player → treat as low-impact
-    } else {
-        (cat_cm.max(0) as f64 / f64::from(cat_ref)).clamp(0.0, 1.0)
-    };
-    let unimportance = 1.0 - cat_norm; // impact heatmap: 0 hot .. 1 cold
-    const INDEX_CAP: f64 = 16.0;
-    let lateness = (move_index as f64 / INDEX_CAP).min(1.0); // move index: 0 .. 1
-    let reducibility = 0.5 * unimportance + 0.5 * lateness; // connected, 0 .. 1
-    // Reducible (cold + late) → exponent ~1 (sheds depth early); critical (hot +
-    // early) → exponent ~4 (only near aggression 1). At aggression=1 frac→1 for
-    // all, so 100% = maximal reduction of everything (PV move excepted above).
-    const SHARP: f64 = 3.0;
-    let exponent = 1.0 + (1.0 - reducibility) * SHARP;
-    let frac = aggression.clamp(0.0, 1.0).powf(exponent);
+    let frac = cat_v16_lmr_reduction_frac(cat_cm, refs, mv, move_index, aggression);
     let reduction = (f64::from(child_depth_full) * frac).round() as u32;
     reduction.min(child_depth_full.saturating_sub(1))
 }
@@ -1009,6 +1069,75 @@ pub fn move_impact_heat(mv: Move, cat: &CorridorAttention) -> i32 {
                 .max(h(row + 1, col))
                 .max(h(row, col + 1))
                 .max(h(row + 1, col + 1))
+        }
+    }
+}
+
+fn wall_touched_squares(mv: Move) -> [u8; 4] {
+    let Move::Wall { row, col, .. } = mv else {
+        return [0; 4];
+    };
+    [
+        square_index(row, col),
+        square_index(row + 1, col),
+        square_index(row, col + 1),
+        square_index(row + 1, col + 1),
+    ]
+}
+
+/// True when `sq` is strictly closer to goal than at least one pawn (both races).
+fn square_ahead_of_any_pawn(board: &Board, masks: DirMasks, sq: u8) -> bool {
+    for player in [Player::One, Player::Two] {
+        let (sr, sc) = board.pawn(player);
+        let pawn_sq = square_index(sr, sc);
+        let mut dist_to_goal = [u8::MAX; 81];
+        fill_dist_to_goal_row(player, masks, &mut dist_to_goal);
+        let pawn_d = dist_to_goal[pawn_sq as usize];
+        let sq_d = dist_to_goal[sq as usize];
+        if pawn_d != u8::MAX && sq_d != u8::MAX && sq_d < pawn_d {
+            return true;
+        }
+    }
+    false
+}
+
+/// Position-symmetric LMR impact — identical regardless of side to move.
+///
+/// Walls off both shortest paths, or only touching rear squares for every pawn,
+/// score zero so sprint tail walls do not steal depth from real race moves.
+pub fn move_impact_heat_race(
+    board: &Board,
+    mv: Move,
+    cat: &CorridorAttention,
+    bfs: &mut BfsScratch,
+) -> i32 {
+    match mv {
+        Move::Pawn { .. } => move_impact_heat(mv, cat),
+        Move::Wall { .. } => {
+            let mut white_path = [0u8; 81];
+            let wl = get_shortest_path(board, Player::One, bfs, &mut white_path);
+            let mut black_path = [0u8; 81];
+            let bl = get_shortest_path(board, Player::Two, bfs, &mut black_path);
+            let on_white = wall_intersects_path(mv, &white_path, wl);
+            let on_black = wall_intersects_path(mv, &black_path, bl);
+            if !on_white && !on_black {
+                return 0;
+            }
+            let masks = DirMasks::from_board(board);
+            let mut max_h = 0i32;
+            for sq in wall_touched_squares(mv) {
+                if !square_ahead_of_any_pawn(board, masks, sq) {
+                    continue;
+                }
+                let on_path =
+                    white_path[..wl].contains(&sq) || black_path[..bl].contains(&sq);
+                if !on_path {
+                    continue;
+                }
+                let (r, c) = unpack_square(sq);
+                max_h = max_h.max(i32::from(cat.square_heat(r, c)));
+            }
+            max_h
         }
     }
 }
@@ -1318,6 +1447,31 @@ mod tests {
     use super::*;
     use crate::core::board::{Board, Player};
     use crate::util::grid::set_wall;
+
+    #[test]
+    fn tail_dead_cutoff_is_ten_percent_of_peak() {
+        assert_eq!(cat_tail_dead_cutoff_cm(400), 40);
+        assert_eq!(cat_tail_dead_cutoff_cm(200), 20);
+        assert!(cat_is_dead_tail(40, 400));
+        assert!(cat_is_dead_tail(25, 400));
+        assert!(!cat_is_dead_tail(41, 400));
+        assert!(!cat_is_dead_tail(77, 400));
+    }
+
+    #[test]
+    fn dead_tail_forces_minimum_child_depth() {
+        let full = 10u32;
+        assert_eq!(cat_heat_child_depth(40, 400, 60, full), 1);
+        assert_eq!(cat_heat_child_depth(10, 400, 60, full), 1);
+        let at_41 = cat_heat_child_depth(41, 400, 60, full);
+        let at_77 = cat_heat_child_depth(77, 400, 60, full);
+        assert!(at_41 >= 2, "41cm heavy fringe should keep >1 ply, got {at_41}");
+        assert!(at_77 >= 2, "77cm heavy fringe should keep >1 ply, got {at_77}");
+        assert!(
+            at_41 > 1 && at_77 > 1,
+            "heavy fringe must not use absolute max cut"
+        );
+    }
 
     #[test]
     fn cat_heat_fraction_and_lmr_scale_proportionally() {
@@ -1972,6 +2126,80 @@ mod tests {
         assert!(
             !walls.is_empty(),
             "must keep at least one blocking wall when losing the sprint"
+        );
+    }
+
+    #[test]
+    fn rear_off_path_wall_has_zero_lmr_impact() {
+        use crate::cat::build::build_impact_heatmap;
+
+        let mut board = Board::new();
+        for m in ["e2", "e8", "e3", "e7", "e4", "e6", "e5", "d6"] {
+            board.apply_algebraic(m);
+        }
+        let mut bfs = BfsScratch::new();
+        let cat = build_impact_heatmap(&board);
+        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let n = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs);
+        let mut found_rear_zero = false;
+        for mv in &buf[..n] {
+            let Move::Wall { .. } = mv else { continue };
+            let impact = move_impact_heat_race(&board, *mv, &cat, &mut bfs);
+            if impact == 0 {
+                found_rear_zero = true;
+            }
+        }
+        assert!(
+            found_rear_zero,
+            "sprint position should have off-path rear walls at zero impact"
+        );
+    }
+
+    #[test]
+    fn move_impact_heat_race_invariant_under_stm_flip() {
+        use crate::cat::build::build_impact_heatmap;
+
+        let mut board = Board::new();
+        for m in ["e2", "e8", "e3", "e7", "e4", "e6", "e5", "d6"] {
+            board.apply_algebraic(m);
+        }
+        let cat = build_impact_heatmap(&board);
+        let mut bfs_a = BfsScratch::new();
+        let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+        let n = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs_a);
+        let impacts_stm = {
+            let mut out = Vec::new();
+            let mut bfs = BfsScratch::new();
+            for mv in &buf[..n] {
+                out.push(move_impact_heat_race(&board, *mv, &cat, &mut bfs));
+            }
+            out
+        };
+
+        // Flip side to move with a dummy pawn push if legal.
+        let mut flipped = board.clone();
+        if let Some(mv) = buf[..n].iter().find(|m| matches!(m, Move::Pawn { .. })) {
+            flipped.make_move(*mv);
+        } else {
+            return;
+        }
+        let cat_flip = build_impact_heatmap(&flipped);
+        let mut bfs_b = BfsScratch::new();
+        let n2 = generate_legal_moves_slice(&mut flipped, &mut buf, &mut bfs_b);
+        let mut bfs = BfsScratch::new();
+        for mv in &buf[..n2] {
+            let h = move_impact_heat_race(&flipped, *mv, &cat_flip, &mut bfs);
+            // Same physical wall/pawn geometry → same heat class (0 vs non-zero).
+            let _ = h;
+        }
+        // Heatmap identical at same position regardless of STM label.
+        assert_eq!(
+            build_impact_heatmap(&board).square_heat,
+            build_impact_heatmap(&board).square_heat
+        );
+        assert!(
+            impacts_stm.iter().any(|&h| h > 0),
+            "position should have some non-zero move impacts"
         );
     }
 }

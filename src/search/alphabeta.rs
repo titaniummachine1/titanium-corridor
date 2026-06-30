@@ -7,13 +7,14 @@ use crate::cat::constants::DIST_PENALTY;
 use crate::cat::prune::OrderExtras;
 use crate::cat::prune::{
     self, collect_search_moves, get_shortest_path, is_tactical_move, move_corridor_attention,
-    move_immediate_gain, order_moves, our_path_gain, path_distance,
+    move_impact_heat_race, move_immediate_gain, order_moves, our_path_gain, path_distance,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
 use crate::path::BfsScratch;
+use crate::search::cat_index_lmr::cat_index_lmr_reduction;
 use crate::search::lmr_profile::{
     apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
     MateStopReason, MateZoneState,
@@ -1016,6 +1017,11 @@ fn negamax_inner(
     } else {
         crate::cat::CorridorAttention::default()
     };
+    let impact_cat = if depth >= 2 {
+        crate::cat::build::build_impact_heatmap_for_stm(board, state.bfs)
+    } else {
+        crate::cat::CorridorAttention::default()
+    };
 
     let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
     let n = collect_search_moves(
@@ -1103,8 +1109,12 @@ fn negamax_inner(
     let mut moves_searched = 0usize;
     let original_alpha = alpha;
 
-    let cat_refs = prune::cat_heat_refs(&buf, n, board, &cat);
-    let cat_max = cat_refs.all;
+    let mut max_move_impact = 0u32;
+    for i in 0..n {
+        let impact = move_impact_heat_race(board, buf[i], &impact_cat, state.bfs)
+        .max(0) as u32;
+        max_move_impact = max_move_impact.max(impact);
+    }
 
     // At root, clear diagnostics so only the current depth's data is retained.
     if ply == 0 {
@@ -1114,9 +1124,13 @@ fn negamax_inner(
     }
 
     let profile = state.lmr_profile;
+    let child_depth_full = depth.saturating_sub(1);
+    let first_reducible_rank = profile.lmr_after_move.saturating_add(1).max(2);
+    let aggression_g = profile.aggression as f64;
 
     for i in 0..n {
         let mv = buf[i];
+        let move_rank = i + 1;
 
         // ── Tactical classification ───────────────────────────────────────────
         // Compute this once per move — used by both futility and LMR.
@@ -1124,10 +1138,15 @@ fn negamax_inner(
         //   (a) Shortens our BFS distance to goal (pawn), or
         //   (b) Disturbs the opponent's shortest path (wall).
         // Tactical moves are NEVER reduced or pruned.
-        let cat_cm = move_corridor_attention(board, mv, &cat);
-        let heat_ratio_hot =
-            prune::is_lmr_heat_hot(cat_cm, cat_max, profile.cold_cm, profile.hot_ratio_pct);
-        let corridor_relevant = cat_cm >= i32::from(profile.cold_cm);
+        let impact_cm = move_impact_heat_race(board, mv, &impact_cat, state.bfs);
+        let corridor_cm = move_corridor_attention(board, mv, &cat);
+        let heat_ratio_hot = prune::is_lmr_heat_hot(
+            impact_cm,
+            max_move_impact as u16,
+            profile.cold_cm,
+            profile.hot_ratio_pct,
+        );
+        let corridor_relevant = corridor_cm >= i32::from(profile.cold_cm);
         let is_tactical = if moves_searched == 0 || depth < LMR_MIN_DEPTH {
             true
         } else if matches!(mv, Move::Wall { .. })
@@ -1156,7 +1175,7 @@ fn negamax_inner(
             && depth <= 2
             && i >= 10
             && matches!(mv, Move::Wall { .. })
-            && cat_cm < i32::from(profile.cold_cm)
+            && corridor_cm < i32::from(profile.cold_cm)
             && !corridor_relevant
             && !is_tactical
             && best_score > -MATE + 200
@@ -1166,36 +1185,18 @@ fn negamax_inner(
         }
 
         // [LMR_BLOCK_START]
-        // CAT distributes search depth — every generated move is visited; cold
-        // slots search at 1–2 plies unless heatmap says otherwise.
-        let cat_child = prune::cat_heat_child_depth(
-            cat_cm,
-            prune::cat_heat_ref_max(mv, cat_refs),
-            profile.cold_cm,
-            depth.saturating_sub(1),
+        // CAT × move-index LMR — normalize against max legal-move impact at this node.
+        let lmr_protected = moves_searched == 0 || is_tactical || depth < LMR_MIN_DEPTH;
+        let reduction = cat_index_lmr_reduction(
+            child_depth_full,
+            move_rank,
+            n,
+            impact_cm,
+            max_move_impact,
+            aggression_g,
+            lmr_protected,
+            first_reducible_rank,
         );
-        let in_full_window = cat_child >= depth.saturating_sub(1).saturating_sub(1);
-        let reduction = if (ply == 0 && moves_searched == 0)
-            || (ply > 0 && is_tactical)
-            || depth < LMR_MIN_DEPTH
-        {
-            0u32
-        } else {
-            let d = (depth as usize).min(63);
-            let m = (i + 1).min(63);
-            let base_r = state.lmr_table[d][m];
-            prune::cat_lmr_total_reduction(
-                mv,
-                cat_cm,
-                cat_refs,
-                profile.cold_cm,
-                depth,
-                base_r,
-                &opp_path,
-                opp_path_len,
-                corridor_relevant,
-            )
-        };
         // [LMR_BLOCK_END]
 
         let nodes_before_root_mv = if ply == 0 && state.log {
@@ -1211,8 +1212,6 @@ fn negamax_inner(
         let mut re_searched = false;
         let child_depth_used = if moves_searched == 0 {
             child_depth
-        } else if ply == 0 {
-            cat_child.max(1).min(child_depth)
         } else {
             child_depth.saturating_sub(reduction)
         };
@@ -1227,11 +1226,7 @@ fn negamax_inner(
             };
             if s > alpha {
                 let null_fail_low = s < beta;
-                let cat_reresearch = heat_ratio_hot
-                    || is_tactical
-                    || corridor_relevant
-                    || matches!(mv, Move::Pawn { .. });
-                if null_fail_low || (reduction > 0 && cat_reresearch) {
+                if null_fail_low || reduction > 0 {
                     if reduction > 0 {
                         state.lmr_re_searches += 1;
                         re_searched = true;
@@ -1284,6 +1279,7 @@ fn negamax_inner(
         };
 
         if ply == 0 {
+            let in_full_window = child_depth_used >= child_depth.saturating_sub(1);
             state.root_moves.push(RootMoveInfo {
                 mv: crate::util::perft::format_move(mv),
                 score,
@@ -1293,7 +1289,7 @@ fn negamax_inner(
                 mate_distance: mate_distance(score),
                 is_pawn: matches!(mv, Move::Pawn { .. }),
                 order: moves_searched,
-                cat_cm,
+                cat_cm: impact_cm,
                 tactical: is_tactical,
                 hot: heat_ratio_hot,
                 reduction,
