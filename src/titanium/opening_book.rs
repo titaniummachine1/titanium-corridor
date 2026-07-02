@@ -17,9 +17,9 @@ use crate::titanium::opening_book_embedded::embedded_opening_book;
 use crate::titanium::packed_state::pack_state_dag;
 use crate::titanium::{algebraic_to_move_id, move_id_to_algebraic};
 
-/// Default opening-book horizon (order + play).
-pub const OPENING_BOOK_MAX_PLIES: usize = 12;
-/// Extended horizon when the top book move has a strong win rate.
+/// Opening-book horizon (order + play): stay in book the full 15 plies.
+pub const OPENING_BOOK_MAX_PLIES: usize = 15;
+/// Hard ceiling — book is never consulted at or past this ply.
 pub const OPENING_BOOK_EXTENDED_MAX_PLIES: usize = 15;
 /// Minimum raw win rate (decided games) to keep book active past [`OPENING_BOOK_MAX_PLIES`].
 pub const OPENING_BOOK_EXTENDED_MIN_WIN_RATE: f64 = 0.55;
@@ -338,16 +338,13 @@ pub fn consult_from_edge_rows(
     let order: Vec<i16> = candidates.iter().map(|c| c.move_id).collect();
     diag.effective_mode = mode;
 
+    // Play mode: always play the best book move while the position is in book.
+    // No confidence gate — the Wilson-ranked top candidate is the pick; the
+    // engine only starts thinking for itself once the book has no hit.
     let direct_play = if mode == OpeningBookMode::Play {
-        if should_play_direct(&candidates) {
-            diag.played_directly = true;
-            diag.selected_move = Some(candidates[0].move_id);
-            Some(candidates[0].move_id)
-        } else {
-            diag.ordered_only = true;
-            diag.effective_mode = OpeningBookMode::Order;
-            None
-        }
+        diag.played_directly = true;
+        diag.selected_move = Some(candidates[0].move_id);
+        Some(candidates[0].move_id)
     } else {
         diag.ordered_only = true;
         None
@@ -607,32 +604,31 @@ mod tests {
     }
 
     #[test]
-    fn play_mode_falls_back_without_confidence() {
-        let candidates = vec![
-            BookCandidate {
-                move_code_u8: 130,
-                algebraic: "f1".into(),
-                move_id: algebraic_to_move_id("f1"),
-                visits: 6,
-                wins_stm: 4,
-                losses_stm: 2,
-                draws: 0,
-                raw_win_rate: 0.667,
-                wilson_lower: wilson_lower_bound(4, 2),
-            },
-            BookCandidate {
-                move_code_u8: 128,
-                algebraic: "e2".into(),
-                move_id: algebraic_to_move_id("e2"),
-                visits: 328,
-                wins_stm: 137,
-                losses_stm: 191,
-                draws: 0,
-                raw_win_rate: 0.418,
-                wilson_lower: wilson_lower_bound(137, 191),
-            },
-        ];
-        assert!(!should_play_direct(&candidates));
+    fn play_mode_always_plays_top_book_move() {
+        // Play mode has no confidence gate: any book hit plays the Wilson-top
+        // candidate directly, all the way to the 15-ply horizon.
+        let mut diag = OpeningBookDiagnostics {
+            mode: OpeningBookMode::Play,
+            ply_from_start: 4,
+            ..Default::default()
+        };
+        let packed = pack_state_dag(&GameState::new());
+        let rows = vec![BookEdgeRow {
+            code: 128,
+            visits: 3,
+            wins: 1,
+            losses: 2,
+            draws: 0,
+        }];
+        let consult = consult_from_edge_rows(
+            &mut diag,
+            OpeningBookMode::Play,
+            &packed,
+            &[algebraic_to_move_id("e2")],
+            &rows,
+        );
+        assert_eq!(consult.direct_play, Some(algebraic_to_move_id("e2")));
+        assert!(diag.played_directly);
     }
 
     #[test]
