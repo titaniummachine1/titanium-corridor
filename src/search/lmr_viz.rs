@@ -514,14 +514,17 @@ mod tests {
     }
 
     #[test]
-    fn ace_baseline_ignores_cat_ratio_above_tail() {
+    fn cat_grades_reduction_above_tail() {
+        // Same ACE base, but colder CAT attention adds graded extra plies.
         let child_full = 7i32;
+        let cold = plan_v16_wall_lmr(12, 8, child_full, 0.15, 1, 0);
         let mid = plan_v16_wall_lmr(12, 8, child_full, 0.50, 1, 0);
         let hot = plan_v16_wall_lmr(12, 8, child_full, 1.0, 1, 0);
         assert_eq!(mid.ace_base_reduction, hot.ace_base_reduction);
-        assert_eq!(mid.final_reduction, hot.final_reduction);
-        assert_eq!(mid.child_depth_used, hot.child_depth_used);
+        assert!(cold.final_reduction > mid.final_reduction);
+        assert!(mid.final_reduction > hot.final_reduction);
         assert_eq!(mid.hard_override, V16HardOverride::None);
+        assert!(cold.child_depth_used > 1, "graded, not hard-cut");
     }
 
     #[test]

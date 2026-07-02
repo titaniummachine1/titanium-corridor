@@ -3381,6 +3381,21 @@ impl TitaniumSearch {
     }
 
     fn order_moves(&self, ply: usize, moves: &mut [i16], tt_move: i16, cm_move: i16) {
+        self.order_moves_prior(ply, moves, tt_move, cm_move, None);
+    }
+
+    /// Ordering: TT > pawn progress > killers > countermove > history. CAT heat
+    /// is a fallback prior ONLY for walls the history table is silent on
+    /// (h == 0), and never for tail moves (≤ 10% of node max attention) — so
+    /// insignificant walls get no ordering credit they haven't earned.
+    fn order_moves_prior(
+        &self,
+        ply: usize,
+        moves: &mut [i16],
+        tt_move: i16,
+        cm_move: i16,
+        cat_prior: Option<(&[i32; 264], u32)>,
+    ) {
         let dist_me = if self.g.turn == 0 {
             &self.d0[self.dist0_idx]
         } else {
@@ -3402,7 +3417,20 @@ impl TitaniumSearch {
             } else if m == k[1] {
                 850_000
             } else {
-                self.history_tbl[m as usize]
+                let h = self.history_tbl[m as usize];
+                if h != 0 {
+                    h
+                } else if let Some((heat, max_h)) = cat_prior {
+                    let cm = heat[m as usize].max(0) as u32;
+                    // Tail cutoff: ≤10% of the hottest legal move stays at 0.
+                    if cm * 10 > max_h {
+                        cm as i32
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
             };
         }
         if ply == 0 {
@@ -3661,7 +3689,31 @@ impl TitaniumSearch {
         } else {
             0
         };
-        self.order_moves(ply, &mut moves[..n], tt_move, cm_move);
+
+        // CAT impact heat, computed BEFORE ordering so it can serve as the
+        // ordering prior for walls the history table knows nothing about.
+        // Cheap BFF impact heatmap (bitboard path-set + flood): a move's
+        // impact is a heatmap lookup (wall = hottest touched square).
+        let mut heat_by_id = [0i32; 264];
+        let mut max_move_impact = 0u32;
+        let cat_lmr_active = self.cat_lmr_v16 && depth >= 2 && n > 0;
+        if cat_lmr_active {
+            if let Some(bridge) = self.bridge.as_mut() {
+                let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
+                for i in 0..n {
+                    let mv = move_id_to_board(moves[i]);
+                    let h = move_impact_heat(mv, &cat);
+                    heat_by_id[moves[i] as usize] = h;
+                    max_move_impact = max_move_impact.max(h.max(0) as u32);
+                }
+            }
+        }
+        let cat_order_prior = if cat_lmr_active && max_move_impact > 0 {
+            Some((&heat_by_id, max_move_impact))
+        } else {
+            None
+        };
+        self.order_moves_prior(ply, &mut moves[..n], tt_move, cm_move, cat_order_prior);
         #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if ply == 0 {
             if let Some(root_moves) = self.lazy_root_moves.as_ref() {
@@ -3677,23 +3729,8 @@ impl TitaniumSearch {
         }
 
         let mut cat_heats = [0i32; 160];
-        let mut max_move_impact = 0u32;
-        let cat_lmr_active = self.cat_lmr_v16 && depth >= 2 && n > 0;
-        if cat_lmr_active {
-            if let Some(bridge) = self.bridge.as_mut() {
-                // Cheap BFF impact heatmap (bitboard path-set + flood) replaces both
-                // the dense corridor build AND the per-move shortest-path recompute
-                // (`move_corridor_attention_with_path` ran 2 BFS per wall move). A
-                // move's impact is now a heatmap lookup via `wall_edge_heat`.
-                let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
-                let mut buf = [BoardMove::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-                for i in 0..n {
-                    buf[i] = move_id_to_board(moves[i]);
-                    // Wall inherits the hottest square it touches; pawn its destination.
-                    cat_heats[i] = move_impact_heat(buf[i], &cat);
-                    max_move_impact = max_move_impact.max(cat_heats[i].max(0) as u32);
-                }
-            }
+        for i in 0..n {
+            cat_heats[i] = heat_by_id[moves[i] as usize];
         }
 
         let mut best = i32::MIN; // JS -Infinity

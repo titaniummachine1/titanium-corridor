@@ -1,6 +1,19 @@
-//! Titanium v16 LMR — ACE v13 graduated baseline + two hard CAT overrides only.
+//! Titanium v16 LMR — ACE v13 graduated baseline + CAT-graded extra reduction.
+//!
+//! Base schedule is v15 (move-index steps 1/2/3). CAT attention then adds a
+//! graded 0..+2 plies for colder moves (full detail, not just the binary tail),
+//! and attention ≤ 10% of node max remains the only hard depth-1 cut.
 
-use crate::search::cat_index_lmr::CAT_ATTENTION_TAIL_CUTOFF;
+use crate::search::cat_index_lmr::{cat_pressure, CAT_ATTENTION_TAIL_CUTOFF};
+
+/// Max extra plies CAT coldness can add on top of the ACE v15 base.
+pub const CAT_EXTRA_REDUCTION_MAX: f64 = 2.0;
+
+/// Graded CAT extra reduction: 0 for hot moves, up to +2 near the tail.
+#[inline]
+pub fn cat_extra_reduction(attention_ratio: f64) -> i32 {
+    (cat_pressure(attention_ratio) * CAT_EXTRA_REDUCTION_MAX).round() as i32
+}
 
 pub const ACE_LMR_AFTER_MOVE: usize = 4;
 pub const ACE_LMR_MIN_DEPTH: i32 = 3;
@@ -77,7 +90,7 @@ pub fn plan_v16_wall_lmr(
             child_depth_used: 1,
         };
     }
-    let final_reduction = ace_base.min(max_safe);
+    let final_reduction = (ace_base + cat_extra_reduction(attention_ratio)).min(max_safe);
     V16LmrPlan {
         ace_base_reduction: ace_base,
         hard_override: V16HardOverride::None,
