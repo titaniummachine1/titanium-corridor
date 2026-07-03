@@ -18,7 +18,16 @@ use titanium::movegen::prewarm;
 use titanium::titanium::net::live_weights_sha256;
 use titanium::titanium::{move_id_to_algebraic, GameState, ThinkResult, TitaniumSearch};
 
-const ENGINE_MODE: &str = "titanium-v15";
+/// Reported + logged engine label. The actual search mode is selected in
+/// `fresh_search` (TITANIUM_BENCH_V16=1 → v16 CAT-LMR), so the label must
+/// follow the same env var or profiles get misattributed.
+fn engine_mode() -> &'static str {
+    if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
+        "titanium-v16"
+    } else {
+        "titanium-v15"
+    }
+}
 const TT_BITS: usize = 20;
 const MAX_DEPTH: i32 = 30;
 
@@ -120,12 +129,30 @@ fn load_position(name: &str) -> GameState {
     g
 }
 
-fn fresh_search(position: &str) -> Box<TitaniumSearch> {
-    let g = load_position(position);
+fn load_position_from_moves(moves: &str) -> GameState {
+    let mut g = GameState::new();
+    for mv in moves.split_whitespace() {
+        g.make_move(algebraic_to_move_id(mv));
+    }
+    g
+}
+
+fn fresh_search(position: &str, moves: Option<&str>) -> Box<TitaniumSearch> {
+    let g = match moves {
+        Some(raw) if !raw.trim().is_empty() => load_position_from_moves(raw),
+        _ => load_position(position),
+    };
+    let lazy_walls = std::env::var("TITANIUM_BENCH_LAZY_WALLS").as_deref() == Ok("1");
     // TITANIUM_BENCH_V16=1 profiles the v16 CAT-LMR engine (default ceiling 1000)
     // so we can A/B the CAT cost vs the v15 baseline on identical positions.
     if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
-        TitaniumSearch::grafted_v16_with_ceiling(g, Some(TT_BITS), 1000)
+        if lazy_walls {
+            TitaniumSearch::grafted_v16_lazy_walls_for_bench(g, Some(TT_BITS), 1000)
+        } else {
+            TitaniumSearch::grafted_v16_with_ceiling(g, Some(TT_BITS), 1000)
+        }
+    } else if lazy_walls {
+        TitaniumSearch::grafted_lazy_walls_for_bench(g, Some(TT_BITS))
     } else {
         TitaniumSearch::grafted(g, Some(TT_BITS))
     }
@@ -139,7 +166,7 @@ fn run_think(
     log: bool,
     threads: usize,
 ) -> ThinkResult {
-    search.think_with_threads(time_ms, max_depth, full, log, ENGINE_MODE, threads)
+    search.think_with_threads(time_ms, max_depth, full, log, engine_mode(), threads)
 }
 
 fn common_meta(position: &str, threads: usize) -> String {
@@ -149,7 +176,7 @@ fn common_meta(position: &str, threads: usize) -> String {
         bin = json_str(&binary_sha256()),
         wt = json_str(&hex32(&live_weights_sha256())),
         pos = json_str(position),
-        em = json_str(ENGINE_MODE),
+        em = json_str(engine_mode()),
         th = threads,
         ttb = TT_BITS,
         ttm = tt_mb(TT_BITS),
@@ -247,7 +274,7 @@ fn emit_result(
 fn bench_time(sec: u64, runs: usize, position: &str, full: bool, log: bool, threads: usize) {
     let time_ms = sec * 1000;
     let g = load_position(position);
-    let mut search = fresh_search(position);
+    let mut search = fresh_search(position, None);
     let _ = run_think(&mut search, time_ms, MAX_DEPTH, full, false, threads);
     search.set_position(g);
 
@@ -314,7 +341,7 @@ fn bench_time(sec: u64, runs: usize, position: &str, full: bool, log: bool, thre
 }
 
 fn bench_depth(target_depth: i32, position: &str, full: bool, threads: usize) {
-    let mut search = fresh_search(position);
+    let mut search = fresh_search(position, None);
     let _ = run_think(
         &mut search,
         60_000,
@@ -343,8 +370,8 @@ fn bench_depth(target_depth: i32, position: &str, full: bool, threads: usize) {
     }
 }
 
-fn bench_profile(sec: u64, position: &str, full: bool, threads: usize) {
-    let mut search = fresh_search(position);
+fn bench_profile(sec: u64, position: &str, moves: Option<&str>, full: bool, threads: usize) {
+    let mut search = fresh_search(position, moves);
     eprintln!(
         "profile: {}s position={} full={} tt_bits={TT_BITS}",
         sec, position, full
@@ -442,6 +469,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("time");
     let position = parse_string(&args, "--position", "startpos");
+    let moves = args
+        .iter()
+        .position(|a| a == "--moves")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str());
     let full = parse_flag(&args, "--full");
     let threads = parse_threads(&args);
     match mode {
@@ -457,11 +489,11 @@ fn main() {
         }
         "profile" => {
             let sec = parse_u64(&args, "--sec", 30);
-            bench_profile(sec, position, full, threads);
+            bench_profile(sec, position, moves, full, threads);
         }
         "instr" => {
             let sec = parse_u64(&args, "--sec", 10);
-            bench_profile(sec, position, full, threads);
+            bench_profile(sec, position, moves, full, threads);
         }
         other => {
             eprintln!(

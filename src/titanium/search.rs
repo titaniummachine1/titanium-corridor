@@ -20,9 +20,10 @@
 //!   commitment gate keeps the wall when no certifier exists).
 
 use crate::titanium::dist::{
-    fill_ace_dist_from_pawn, fill_ace_dist_layers_to_goal, fill_ace_dist_to_goal_with_masks,
-    fill_choke_points, fill_contested, fill_corridor_delta, fill_sparse_route_masks,
-    materialize_distance_layers, shortest_route_bits, width_in_layers,
+    fill_ace_dist_from_pawn, fill_ace_dist_layers_to_goal_p0, fill_ace_dist_layers_to_goal_p1,
+    fill_ace_dist_to_goal_with_masks_p0, fill_ace_dist_to_goal_with_masks_p1, fill_choke_points,
+    fill_contested, fill_corridor_delta, fill_sparse_route_masks, materialize_distance_layers,
+    shortest_route_bits, width_in_layers,
 };
 use crate::titanium::move_id_to_board;
 use crate::util::clock::{Duration, Instant};
@@ -52,7 +53,7 @@ use crate::titanium::race::{
     RACE_STATES,
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
-use crate::util::grid::{FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
+use crate::util::grid::FLOOD_PLAYABLE;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
 use std::sync::Mutex;
 #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
@@ -325,7 +326,7 @@ mod lazy_smp_tests {
 /// 18 bits = 6MB native; wasm gets 16 bits (1.5MB) — browser memory is the
 /// scarce resource there (multi-engine pages have crashed on warm-cache RAM).
 #[cfg(not(target_arch = "wasm32"))]
-const EVAL_CACHE_BITS: usize = 18;
+const EVAL_CACHE_BITS: usize = 21;
 #[cfg(target_arch = "wasm32")]
 const EVAL_CACHE_BITS: usize = 16;
 const EVAL_CACHE_SIZE: usize = 1 << EVAL_CACHE_BITS;
@@ -352,11 +353,22 @@ impl Default for EvalCacheEntry {
 /// Wall-topology → goal-distance-fields cache (both players). Sibling walls and
 /// iterative-deepening re-searches revisit the same topologies constantly; a hit
 /// turns a two-sided BFS reflood into a short memcpy. ~2.8KB/entry.
+///
+/// Adaptive sizing mirrors the TT strategy (`enable_adaptive_tt`/`tt_grow`):
+/// start small so short searches never pay allocation/zeroing for a table they
+/// won't fill, grow on 50% occupancy with a live-entry rehash. Measured on the
+/// i7-4900MQ: 9 bits thrashes at depth 14+ (75% miss, ~1 BFS reflood/node);
+/// 13 bits cuts refloods 25-45%; 14-15 bits are a wash (TLB pressure eats the
+/// extra hits), so 13 caps native. wasm caps lower — browser memory is the
+/// scarce resource there (256MB threaded-build ceiling, one table per worker).
 #[cfg(not(target_arch = "wasm32"))]
-const DIST_LRU_BITS: usize = 9;
+const DIST_LRU_MIN_BITS: usize = 9;
+#[cfg(not(target_arch = "wasm32"))]
+const DIST_LRU_MAX_BITS: usize = 13;
 #[cfg(target_arch = "wasm32")]
-const DIST_LRU_BITS: usize = 7;
-const DIST_LRU_SIZE: usize = 1 << DIST_LRU_BITS;
+const DIST_LRU_MIN_BITS: usize = 7;
+#[cfg(target_arch = "wasm32")]
+const DIST_LRU_MAX_BITS: usize = 10;
 
 #[derive(Clone)]
 struct DistTopoEntry {
@@ -385,8 +397,8 @@ impl Default for DistTopoEntry {
 }
 
 #[inline]
-fn dist_lru_slot(wkey: u64) -> usize {
-    (wkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - DIST_LRU_BITS)) as usize
+fn dist_lru_slot(wkey: u64, bits: usize) -> usize {
+    (wkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
 }
 
 const TT_BITS: usize = 20;
@@ -1123,6 +1135,10 @@ pub struct TitaniumSearch {
     /// zobrist hash does not encode per-player wall counts.
     eval_cache: Vec<EvalCacheEntry>,
     dist_lru: Vec<DistTopoEntry>,
+    /// Current dist_lru index bits (`dist_lru.len() == 1 << dist_lru_bits`).
+    dist_lru_bits: usize,
+    /// Occupied slots; growth trigger at 50% like `tt_filled`/`tt_grow`.
+    dist_lru_filled: usize,
     d1_layer_depth: [usize; MAX_PLY],
     dist0_idx: usize, // active ply slot in d0 (JS: this.dist0 array ref)
     dist1_idx: usize,
@@ -1326,7 +1342,9 @@ impl TitaniumSearch {
             d0_key: [u64::MAX; MAX_PLY],
             d1_key: [u64::MAX; MAX_PLY],
             eval_cache: vec![EvalCacheEntry::default(); EVAL_CACHE_SIZE],
-            dist_lru: vec![DistTopoEntry::default(); DIST_LRU_SIZE],
+            dist_lru: vec![DistTopoEntry::default(); 1 << DIST_LRU_MIN_BITS],
+            dist_lru_bits: DIST_LRU_MIN_BITS,
+            dist_lru_filled: 0,
             d1_layer_depth: [0; MAX_PLY],
             dist0_idx: 0,
             dist1_idx: 0,
@@ -1586,6 +1604,13 @@ impl TitaniumSearch {
         search
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn grafted_lazy_walls_for_bench(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
+        let mut search = Self::grafted(g, tt_bits);
+        search.ti_movegen = false;
+        search
+    }
+
     /// Titanium v15 experimental — wall-ignorance loss certificate (frozen net).
     pub fn grafted_wall_ignore_experimental(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         let mut search = Self::grafted_frozen(g, tt_bits);
@@ -1631,6 +1656,17 @@ impl TitaniumSearch {
         } else {
             crate::cat::CAT_V16_LMR_CEILING_DEFAULT
         };
+        search
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn grafted_v16_lazy_walls_for_bench(
+        g: GameState,
+        tt_bits: Option<usize>,
+        ceiling: u16,
+    ) -> Box<Self> {
+        let mut search = Self::grafted_v16_with_ceiling(g, tt_bits, ceiling);
+        search.ti_movegen = false;
         search
     }
 
@@ -2536,10 +2572,12 @@ impl TitaniumSearch {
 
     /// Copy one player's fields for `wkey` from the topology cache into ply slot.
     fn dist_lru_load(&mut self, wkey: u64, ply: usize, player: usize) -> bool {
-        let e = &self.dist_lru[dist_lru_slot(wkey)];
+        let e = &self.dist_lru[dist_lru_slot(wkey, self.dist_lru_bits)];
         if e.key != wkey {
+            crate::bench_instr::bump(|b| &mut b.dist_lru_miss);
             return false;
         }
+        crate::bench_instr::bump(|b| &mut b.dist_lru_hit);
         if player == 0 {
             self.d0[ply] = e.d0;
             if self.net.route_active {
@@ -2563,7 +2601,11 @@ impl TitaniumSearch {
     fn dist_lru_store(&mut self, wkey: u64) {
         let i0 = self.dist0_idx;
         let i1 = self.dist1_idx;
-        let e = &mut self.dist_lru[dist_lru_slot(wkey)];
+        let slot = dist_lru_slot(wkey, self.dist_lru_bits);
+        let e = &mut self.dist_lru[slot];
+        if e.key == u64::MAX {
+            self.dist_lru_filled += 1;
+        }
         e.key = wkey;
         e.d0 = self.d0[i0];
         e.d1 = self.d1[i1];
@@ -2575,11 +2617,42 @@ impl TitaniumSearch {
             e.d0_layers[..d0].copy_from_slice(&self.d0_layers[i0][..d0]);
             e.d1_layers[..d1].copy_from_slice(&self.d1_layers[i1][..d1]);
         }
+        // Overflow-driven growth, same policy as the TT store path: grow at
+        // 50% occupancy and rehash live entries (always-replace on collision).
+        if self.dist_lru_filled * 2 >= self.dist_lru.len() && self.dist_lru_bits < DIST_LRU_MAX_BITS
+        {
+            self.dist_lru_grow();
+        }
+    }
+
+    /// Grow the dist LRU to the next size and rehash live entries — the
+    /// `tt_grow` strategy applied to the topology cache. +2 bits per step
+    /// (entries are ~2.8KB, so steps are already 4x jumps in bytes).
+    fn dist_lru_grow(&mut self) {
+        let nb = (self.dist_lru_bits + 2).min(DIST_LRU_MAX_BITS);
+        if nb <= self.dist_lru_bits {
+            return;
+        }
+        let old = std::mem::replace(&mut self.dist_lru, vec![DistTopoEntry::default(); 1 << nb]);
+        let mut filled = 0usize;
+        for e in old {
+            if e.key == u64::MAX {
+                continue;
+            }
+            let ni = dist_lru_slot(e.key, nb);
+            if self.dist_lru[ni].key == u64::MAX {
+                filled += 1;
+            }
+            self.dist_lru[ni] = e;
+        }
+        self.dist_lru_bits = nb;
+        self.dist_lru_filled = filled;
     }
 
     fn refresh_dist_inner(&mut self, ply: usize) {
         let stamp = self.g.wall_stamp;
         if self.cached_stamp == stamp {
+            crate::bench_instr::bump(|b| &mut b.refresh_cheap);
             return; // refs already valid for these walls
         }
         if self.cached_stamp == stamp - 1 && self.g.hist_len > 0 {
@@ -2625,9 +2698,9 @@ impl TitaniumSearch {
                         self.d0_key[ply] = wkey;
                         if !self.dist_lru_load(wkey, ply, 0) {
                             reflooded = true;
+                            crate::bench_instr::bump(|b| &mut b.dist_reflood);
                             if self.net.route_active {
-                                self.d0_layer_depth[ply] = fill_ace_dist_layers_to_goal(
-                                    0,
+                                self.d0_layer_depth[ply] = fill_ace_dist_layers_to_goal_p0(
                                     masks.expect("refresh masks"),
                                     &mut self.d0_layers[ply],
                                 );
@@ -2637,8 +2710,7 @@ impl TitaniumSearch {
                                     &mut self.d0[ply],
                                 );
                             } else {
-                                fill_ace_dist_to_goal_with_masks(
-                                    0,
+                                fill_ace_dist_to_goal_with_masks_p0(
                                     masks.expect("refresh masks"),
                                     &mut self.d0[ply],
                                 );
@@ -2652,9 +2724,9 @@ impl TitaniumSearch {
                         self.d1_key[ply] = wkey;
                         if !self.dist_lru_load(wkey, ply, 1) {
                             reflooded = true;
+                            crate::bench_instr::bump(|b| &mut b.dist_reflood);
                             if self.net.route_active {
-                                self.d1_layer_depth[ply] = fill_ace_dist_layers_to_goal(
-                                    1,
+                                self.d1_layer_depth[ply] = fill_ace_dist_layers_to_goal_p1(
                                     masks.expect("refresh masks"),
                                     &mut self.d1_layers[ply],
                                 );
@@ -2664,8 +2736,7 @@ impl TitaniumSearch {
                                     &mut self.d1[ply],
                                 );
                             } else {
-                                fill_ace_dist_to_goal_with_masks(
-                                    1,
+                                fill_ace_dist_to_goal_with_masks_p1(
                                     masks.expect("refresh masks"),
                                     &mut self.d1[ply],
                                 );
@@ -2676,10 +2747,12 @@ impl TitaniumSearch {
                 if reflooded {
                     self.dist_lru_store(wkey);
                 }
+                crate::bench_instr::bump(|b| &mut b.refresh_incr);
                 self.cached_stamp = stamp;
                 return;
             }
         }
+        crate::bench_instr::bump(|b| &mut b.refresh_full);
         self.dist0_idx = ply; // own arrays: ancestors stay intact
         self.dist1_idx = ply;
         let wkey = {
@@ -2697,6 +2770,12 @@ impl TitaniumSearch {
         let d0_todo = !d0_ok && !self.dist_lru_load(wkey, ply, 0);
         let d1_todo = !d1_ok && !self.dist_lru_load(wkey, ply, 1);
         if d0_todo || d1_todo {
+            if d0_todo {
+                crate::bench_instr::bump(|b| &mut b.dist_reflood);
+            }
+            if d1_todo {
+                crate::bench_instr::bump(|b| &mut b.dist_reflood);
+            }
             let masks = self.current_dir_masks();
             crate::bench_instr::record(
                 |b| &mut b.shortest_path,
@@ -2704,7 +2783,7 @@ impl TitaniumSearch {
                     if self.net.route_active {
                         if d0_todo {
                             self.d0_layer_depth[ply] =
-                                fill_ace_dist_layers_to_goal(0, masks, &mut self.d0_layers[ply]);
+                                fill_ace_dist_layers_to_goal_p0(masks, &mut self.d0_layers[ply]);
                             materialize_distance_layers(
                                 &self.d0_layers[ply],
                                 self.d0_layer_depth[ply],
@@ -2713,7 +2792,7 @@ impl TitaniumSearch {
                         }
                         if d1_todo {
                             self.d1_layer_depth[ply] =
-                                fill_ace_dist_layers_to_goal(1, masks, &mut self.d1_layers[ply]);
+                                fill_ace_dist_layers_to_goal_p1(masks, &mut self.d1_layers[ply]);
                             materialize_distance_layers(
                                 &self.d1_layers[ply],
                                 self.d1_layer_depth[ply],
@@ -2722,10 +2801,10 @@ impl TitaniumSearch {
                         }
                     } else {
                         if d0_todo {
-                            fill_ace_dist_to_goal_with_masks(0, masks, &mut self.d0[ply]);
+                            fill_ace_dist_to_goal_with_masks_p0(masks, &mut self.d0[ply]);
                         }
                         if d1_todo {
-                            fill_ace_dist_to_goal_with_masks(1, masks, &mut self.d1[ply]);
+                            fill_ace_dist_to_goal_with_masks_p1(masks, &mut self.d1[ply]);
                         }
                     }
                 },
@@ -3096,6 +3175,24 @@ impl TitaniumSearch {
         res
     }
 
+    /// Free proof lookup only. Used for low-wall transpositions where another
+    /// path already paid for a certificate solve; never launches the solver.
+    #[inline(always)]
+    fn cert_win_cache_hit(&mut self, s: usize) -> bool {
+        let key = (
+            self.g.hash_lo,
+            self.g.hash_hi,
+            s,
+            self.g.wl[0],
+            self.g.wl[1],
+        );
+        if self.cw_cache.get(&key).copied() == Some(1) {
+            self.race_outcome_stats.resolved_cert_memo += 1;
+            return true;
+        }
+        false
+    }
+
     /// Materialize the existing HalfPW child representation without computing
     /// route fields, legal-wall count, or the value projection. Probe/shadow only.
     fn current_hidden_features(&mut self) -> [f64; NET_H] {
@@ -3149,9 +3246,17 @@ impl TitaniumSearch {
                 HandsEmptyPipelineOutcome::LossFloor => hands_empty_loss_floor = true,
             }
         }
+        if self.race_proof
+            && w_me_i + w_opp_i <= 2
+            && (w_me_i + w_opp_i) > 0
+            && self.cert_win_cache_hit(me)
+        {
+            return 2500;
+        }
 
         let hash64 = (self.g.hash_hi as u64) << 32 | self.g.hash_lo as u64;
-        let ec_idx = (hash64.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - EVAL_CACHE_BITS)) as usize;
+        let ec_idx =
+            (hash64.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - EVAL_CACHE_BITS)) as usize;
         let ec_meta = ((self.g.wl[0] as u16) << 8) | (self.g.wl[1] as u16);
         {
             let e = &self.eval_cache[ec_idx];
@@ -3305,7 +3410,16 @@ impl TitaniumSearch {
             val: out,
             meta: ec_meta,
         };
-        self.evaluate_tail(out, depth, me, d_me_i, d_opp_i, w_me_i, w_opp_i, hands_empty_loss_floor)
+        self.evaluate_tail(
+            out,
+            depth,
+            me,
+            d_me_i,
+            d_opp_i,
+            w_me_i,
+            w_opp_i,
+            hands_empty_loss_floor,
+        )
     }
 
     /// Cert/race floors applied on top of the cached pure static eval `out`.

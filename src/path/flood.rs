@@ -50,43 +50,104 @@ pub fn flood_fill(start_sq: u8, masks: DirMasks) -> u128 {
 /// never re-enter the frontier.
 #[inline]
 pub fn flood_to_goal_seeded(start_sq: u8, cache: u128, masks: DirMasks, goal_mask: u128) -> bool {
+    flood_to_goal_seeded_with_depth(start_sq, cache, masks, goal_mask).0
+}
+
+#[inline]
+pub fn flood_to_goal_seeded_with_depth(
+    start_sq: u8,
+    cache: u128,
+    masks: DirMasks,
+    goal_mask: u128,
+) -> (bool, u8) {
     let mut reached = flood_bit_sq(start_sq);
     if reached & goal_mask != 0 {
-        return true;
+        return (true, 0);
     }
     let mut frontier = reached;
     let mut pool = cache & !reached;
+    let mut depth = 0u8;
     while frontier != 0 {
         if frontier & pool != 0 {
             if pool & goal_mask != 0 {
-                return true;
+                return (true, depth);
             }
             reached |= pool;
             frontier |= pool;
             pool = 0;
         }
         frontier = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        if frontier == 0 {
+            break;
+        }
+        depth = depth.saturating_add(1);
         if frontier & goal_mask != 0 {
-            return true;
+            return (true, depth);
         }
         reached |= frontier;
     }
-    false
+    (false, depth)
 }
 
 #[inline]
 pub fn flood_to_goal(start_sq: u8, masks: DirMasks, goal_mask: u128) -> (bool, u128) {
+    let (ok, reached, _) = flood_to_goal_with_depth(start_sq, masks, goal_mask);
+    (ok, reached)
+}
+
+#[inline]
+pub fn flood_to_goal_with_depth(
+    start_sq: u8,
+    masks: DirMasks,
+    goal_mask: u128,
+) -> (bool, u128, u8) {
     let mut reached = flood_bit_sq(start_sq);
     if reached & goal_mask != 0 {
-        return (true, reached);
+        return (true, reached, 0);
     }
     let mut frontier = reached;
+    let mut depth = 0u8;
     while frontier != 0 {
         frontier = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        if frontier == 0 {
+            break;
+        }
+        depth = depth.saturating_add(1);
         reached |= frontier;
         if frontier & goal_mask != 0 {
-            return (true, reached);
+            return (true, reached, depth);
         }
     }
-    (false, reached)
+    (false, reached, depth)
+}
+
+#[inline]
+pub fn flood_component_with_goal_depth(
+    start_sq: u8,
+    masks: DirMasks,
+    goal_mask: u128,
+) -> (bool, u128, u8) {
+    let mut reached = flood_bit_sq(start_sq);
+    let mut frontier = reached;
+    let mut depth = 0u8;
+    let mut goal_depth = if reached & goal_mask != 0 {
+        Some(0)
+    } else {
+        None
+    };
+    while frontier != 0 {
+        frontier = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        if frontier == 0 {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        reached |= frontier;
+        if goal_depth.is_none() && frontier & goal_mask != 0 {
+            goal_depth = Some(depth);
+        }
+    }
+    match goal_depth {
+        Some(d) => (true, reached, d),
+        None => (false, reached, depth),
+    }
 }

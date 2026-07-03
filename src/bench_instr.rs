@@ -61,6 +61,12 @@ pub struct BenchInstr {
     pub nnue_incr_update: OpStat,
     pub eval_cache_hit: OpStat,
     pub eval_cache_miss: OpStat,
+    pub refresh_cheap: OpStat,
+    pub refresh_incr: OpStat,
+    pub refresh_full: OpStat,
+    pub dist_lru_hit: OpStat,
+    pub dist_lru_miss: OpStat,
+    pub dist_reflood: OpStat,
     search_t0: Option<Instant>,
     measured_ns: u128,
 }
@@ -108,7 +114,7 @@ impl BenchInstr {
         }
         let nodes = self.search_nodes;
         let total_ns = self.measured_ns;
-        let ops: [(&str, &OpStat); 33] = [
+        let ops: [(&str, &OpStat); 39] = [
             ("evaluate", &self.evaluate),
             ("eval_race_bound", &self.eval_race_bound),
             ("race_gate_cached", &self.race_gate_cached),
@@ -142,6 +148,12 @@ impl BenchInstr {
             ("nnue_incr_update", &self.nnue_incr_update),
             ("eval_cache_hit", &self.eval_cache_hit),
             ("eval_cache_miss", &self.eval_cache_miss),
+            ("refresh_cheap", &self.refresh_cheap),
+            ("refresh_incr", &self.refresh_incr),
+            ("refresh_full", &self.refresh_full),
+            ("dist_lru_hit", &self.dist_lru_hit),
+            ("dist_lru_miss", &self.dist_lru_miss),
+            ("dist_reflood", &self.dist_reflood),
         ];
         let parts: Vec<String> = ops
             .iter()

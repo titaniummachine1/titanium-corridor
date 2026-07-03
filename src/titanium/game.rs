@@ -7,6 +7,26 @@
 pub const DELTA: [i16; 4] = [-9, 9, -1, 1];
 pub const DIRBIT: [u8; 4] = [1, 2, 4, 8];
 
+const fn ace_goal_bits(row: usize) -> u128 {
+    let mut bits = 0u128;
+    let mut c = 0usize;
+    while c < 9 {
+        bits |= crate::util::grid::FLOOD_BIT_BY_SQ[row * 9 + c];
+        c += 1;
+    }
+    bits
+}
+
+const ACE_P0_GOAL_BITS: u128 = ace_goal_bits(0);
+const ACE_P1_GOAL_BITS: u128 = ace_goal_bits(8);
+
+#[derive(Clone, Copy)]
+struct BitfillPathCheck {
+    open: bool,
+    p0_goal_depth: u8,
+    p1_seeded_proof_depth: u8,
+}
+
 // ── Zobrist (exact JS xorshift sequence so hashes match the reference) ───────
 
 pub struct Zobrist {
@@ -112,7 +132,6 @@ pub struct GameState {
     pub last_wall_ply: usize,
     /// Bumped on every wall make/unmake; dist fields depend only on walls.
     pub wall_stamp: i32,
-    seen: [u8; 81],
 }
 
 impl Default for GameState {
@@ -140,7 +159,6 @@ impl GameState {
             hist_len: 0,
             last_wall_ply: 0,
             wall_stamp: 0,
-            seen: [0; 81],
         }
     }
 
@@ -274,46 +292,48 @@ impl GameState {
         anchors >= 2
     }
 
-    pub fn has_path(&mut self, player: usize) -> bool {
-        let goal = if player == 0 { 0 } else { 8 };
-        let start = self.pawn[player];
-        if start / 9 == goal {
-            return true;
-        }
-        self.seen.fill(0);
-        let mut queue = [0i16; 81];
-        let mut head = 0;
-        let mut tail = 0;
-        queue[tail] = start as i16;
-        tail += 1;
-        self.seen[start] = 1;
-        while head < tail {
-            let u = queue[head] as usize;
-            head += 1;
-            let bm = self.blocked[u] | BORDER[u];
-            for d in 0..4 {
-                if bm & DIRBIT[d] != 0 {
-                    continue;
-                }
-                let v = (u as i16 + DELTA[d]) as usize;
-                if self.seen[v] != 0 {
-                    continue;
-                }
-                if v / 9 == goal {
-                    return true;
-                }
-                self.seen[v] = 1;
-                queue[tail] = v as i16;
-                tail += 1;
-            }
-        }
-        false
+    pub fn has_path(&self, player: usize) -> bool {
+        use crate::path::flood::flood_to_goal_with_depth;
+        use crate::path::masks::DirMasks;
+
+        let masks = DirMasks::from_ace_game(self);
+        let goal = if player == 0 {
+            ACE_P0_GOAL_BITS
+        } else {
+            ACE_P1_GOAL_BITS
+        };
+        flood_to_goal_with_depth(self.pawn[player] as u8, masks, goal).0
     }
 
-    // gen11: `wallCanBlockTopology` and the Titanium path oracle are GONE —
-    // the JS engine deleted the topology fast path (unreachable right-edge
-    // condition let trapping walls skip the path check); `wall_legal` now runs
-    // the anchor-count precheck + own BFS, exactly like the JS.
+    #[inline]
+    fn both_paths_open_bitfill(&self) -> BitfillPathCheck {
+        use crate::path::flood::{
+            flood_component_with_goal_depth, flood_to_goal_seeded_with_depth,
+        };
+        use crate::path::masks::DirMasks;
+
+        let masks = DirMasks::from_ace_game(self);
+        let (ok0, p0_reached, p0_goal_depth) =
+            flood_component_with_goal_depth(self.pawn[0] as u8, masks, ACE_P0_GOAL_BITS);
+        if !ok0 {
+            return BitfillPathCheck {
+                open: false,
+                p0_goal_depth,
+                p1_seeded_proof_depth: 0,
+            };
+        }
+        let (p1_open, p1_seeded_proof_depth) = flood_to_goal_seeded_with_depth(
+            self.pawn[1] as u8,
+            p0_reached,
+            masks,
+            ACE_P1_GOAL_BITS,
+        );
+        BitfillPathCheck {
+            open: p1_open,
+            p0_goal_depth,
+            p1_seeded_proof_depth,
+        }
+    }
 
     pub fn wall_legal(&mut self, wall_type: usize, slot: usize) -> bool {
         if self.wl[self.turn] <= 0 {
@@ -322,15 +342,14 @@ impl GameState {
         if !self.wall_fits(wall_type, slot) {
             return false;
         }
-        // gen11: the `wallCanBlockTopology` gate is GONE from the JS engine —
-        // its right-edge condition was unreachable (the same off-by-one fixed
-        // in Titanium `can_wall_block_topology`), letting trapping walls skip
-        // the path check. Only the sound anchor-count precheck remains.
         if !self.wall_needs_path_check(wall_type, slot) {
             return true;
         }
         self.set_wall_bits(wall_type, slot, true);
-        let ok = self.has_path(0) && self.has_path(1);
+        let checked = self.both_paths_open_bitfill();
+        let _p0_goal_depth = checked.p0_goal_depth;
+        let _p1_seeded_proof_depth = checked.p1_seeded_proof_depth;
+        let ok = checked.open;
         self.set_wall_bits(wall_type, slot, false);
         ok
     }
@@ -455,62 +474,71 @@ impl GameState {
     // ── Distance fields ─────────────────────────────────────────────────────
 
     pub fn compute_dist(&self, player: usize, dist: &mut [u8; 81]) {
-        dist.fill(255);
-        let goal = if player == 0 { 0 } else { 8 };
-        let mut queue = [0i16; 81];
-        let mut head = 0;
-        let mut tail = 0;
-        for c in 0..9 {
-            let cell = goal * 9 + c;
-            dist[cell] = 0;
-            queue[tail] = cell as i16;
-            tail += 1;
-        }
-        while head < tail {
-            let u = queue[head] as usize;
-            head += 1;
-            let du = dist[u] + 1;
-            let bm = self.blocked[u] | BORDER[u];
-            for d in 0..4 {
-                if bm & DIRBIT[d] != 0 {
-                    continue;
-                }
-                let v = (u as i16 + DELTA[d]) as usize;
-                if dist[v] > du {
-                    dist[v] = du;
-                    queue[tail] = v as i16;
-                    tail += 1;
-                }
-            }
+        use crate::path::masks::DirMasks;
+        use crate::titanium::dist::{
+            fill_ace_dist_to_goal_with_masks_p0, fill_ace_dist_to_goal_with_masks_p1,
+        };
+
+        let masks = DirMasks::from_ace_game(self);
+        if player == 0 {
+            fill_ace_dist_to_goal_with_masks_p0(masks, dist);
+        } else {
+            fill_ace_dist_to_goal_with_masks_p1(masks, dist);
         }
     }
 
-    /// BFS steps from `start` cell (255 = unreachable). Used for per-cell player-distance plane.
+    /// Bitboard flood steps from `start` cell (255 = unreachable).
     pub fn compute_steps_from(&self, start: usize, dist: &mut [u8; 81]) {
-        dist.fill(255);
-        if start >= 81 {
-            return;
+        use crate::path::masks::DirMasks;
+        use crate::titanium::dist::fill_ace_dist_from_pawn_with_masks;
+
+        if start < 81 {
+            fill_ace_dist_from_pawn_with_masks(start, DirMasks::from_ace_game(self), dist);
+        } else {
+            dist.fill(255);
         }
-        let mut queue = [0i16; 81];
-        let mut head = 0usize;
-        let mut tail = 0usize;
-        dist[start] = 0;
-        queue[tail] = start as i16;
-        tail += 1;
-        while head < tail {
-            let u = queue[head] as usize;
-            head += 1;
-            let du = dist[u] + 1;
-            let bm = self.blocked[u] | BORDER[u];
-            for d in 0..4 {
-                if bm & DIRBIT[d] != 0 {
-                    continue;
-                }
-                let v = (u as i16 + DELTA[d]) as usize;
-                if dist[v] > du {
-                    dist[v] = du;
-                    queue[tail] = v as i16;
-                    tail += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::titanium::algebraic_to_move_id;
+
+    fn pos(moves: &[&str]) -> GameState {
+        let mut g = GameState::new();
+        for m in moves {
+            g.make_move(algebraic_to_move_id(m));
+        }
+        g
+    }
+
+    #[test]
+    fn bitfill_wall_legal_preserves_path_invariants() {
+        let positions = [
+            pos(&[]),
+            pos(&["e2", "e8", "e3", "e7", "d3h", "d6h", "f3h", "f6h"]),
+            pos(&[
+                "e2", "e8", "e3", "e7", "e4", "e6", "d3h", "d6h", "f3h", "f6h", "d5v", "h3v",
+                "e4h", "h6h",
+            ]),
+            pos(&[
+                "e2", "e8", "e3", "e7", "e4", "e6", "e3h", "e6h", "c3h", "c6h", "g3h", "g6h",
+                "a3h", "e4v", "h3v",
+            ]),
+        ];
+
+        for base in positions {
+            for wall_type in [0usize, 1] {
+                for slot in 0..64usize {
+                    let mut g = base.clone();
+                    if !g.wall_legal(wall_type, slot) {
+                        continue;
+                    }
+                    g.set_wall_bits(wall_type, slot, true);
+                    assert!(g.has_path(0), "p0 path wall_type={wall_type} slot={slot}");
+                    assert!(g.has_path(1), "p1 path wall_type={wall_type} slot={slot}");
+                    g.set_wall_bits(wall_type, slot, false);
                 }
             }
         }
