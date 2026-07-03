@@ -41,6 +41,65 @@ pub const BOOK_ATTENTION_ISHTAR_BONUS: i32 = 1000;
 /// Highest win-rate main line (non-Titanium DAG) — do not change.
 const SACRED_CENTER_LINE: &[&str] = &["e2", "e8", "e3", "e7", "e4", "e6"];
 
+/// Hard-forced Black (Ishtar) replies mined from real Ka-vs-Ishtar games run via
+/// `site/ka_vs_ishtar_match.js` on 2026-07-03. Only Black's moves are forced —
+/// White's moves in these games were Ka's, and Ka LOST (Ka-short vs
+/// Ishtar-short, 3/3 games) or is presumed losing (Ka-intuition vs
+/// Ishtar-medium, game capped at ply 12 before decision) in every source
+/// game. Forcing White's side too would make our own White-side play
+/// deliberately repeat the losing side's moves — so only the proven/assumed
+/// winning (Black) replies are forced here; White's moves stay free search.
+///
+/// Line A (a3h -> a6h): Ka-short vs Ishtar-short, replicated identically in
+/// 3/3 games, Ishtar (Black) won all 3.
+/// Line B (a3h -> e3v): Ka-intuition vs Ishtar-medium, 1 game, undecided at
+/// the ply-12 cutoff but Ishtar-medium is vastly stronger than Ka-intuition.
+/// Both share ply 7 (White's a3h) as context; only one of a6h/e3v is ever
+/// actually forced per game since ply 8 is our own choice when we're Black —
+/// a6h is primary (proven wins); e3v's continuation is kept for completeness
+/// in case ply 8 is ever reached via e3v through some other path.
+const MINED_BLACK_MAINLINE: &[(&[&str], &str)] = &[
+    // Line A: e2 e8 e3 e7 e4 e6 a3h a6h e3h c3v e5 e6h
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h"], "a6h"),
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "a6h", "e3h"],
+        "c3v",
+    ),
+    (
+        &[
+            "e2", "e8", "e3", "e7", "e4", "e6", "a3h", "a6h", "e3h", "c3v", "e5",
+        ],
+        "e6h",
+    ),
+    // Line B: e2 e8 e3 e7 e4 e6 a3h e3v e5 e4 d3h d4h
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "e3v", "e5"],
+        "e4",
+    ),
+    (
+        &[
+            "e2", "e8", "e3", "e7", "e4", "e6", "a3h", "e3v", "e5", "e4", "d3h",
+        ],
+        "d4h",
+    ),
+];
+
+/// Force a mined Black reply when the exact prefix matches (see
+/// `MINED_BLACK_MAINLINE`). Only ever fires on Black's own ply (even
+/// `hist_len`), consistent with only forcing the proven/assumed-winning side.
+pub fn mined_black_mainline_direct_play(g: &GameState, legal_moves: &[i16]) -> Option<i16> {
+    let played = history_algebraic(g);
+    for (prefix, reply) in MINED_BLACK_MAINLINE {
+        if played.len() == prefix.len() && played.iter().zip(prefix.iter()).all(|(a, b)| a == b) {
+            let mv = algebraic_to_move_id(reply);
+            if legal_moves.contains(&mv) {
+                return Some(mv);
+            }
+        }
+    }
+    None
+}
+
 /// Hand-mined Ishtar answers — extra search attention past the force window.
 const ISHTAR_BOOK_LINES: &[(&[&str], &str)] = &[
     (&["h2h"], "e8"),
@@ -309,6 +368,26 @@ impl OpeningBook {
     ) -> OpeningBookConsult {
         if mode == OpeningBookMode::Play {
             if let Some(mv) = sacred_center_direct_play(g, legal_moves) {
+                let attention = BOOK_ATTENTION_WINRATE_SCALE * 2 + BOOK_ATTENTION_ISHTAR_BONUS;
+                let diag = OpeningBookDiagnostics {
+                    mode,
+                    ply_from_start: g.hist_len,
+                    position_hit: true,
+                    effective_mode: OpeningBookMode::Play,
+                    played_directly: true,
+                    ordered_only: false,
+                    selected_move: Some(mv),
+                    db_path: self.db_path_label(),
+                    ..Default::default()
+                };
+                return OpeningBookConsult {
+                    diagnostics: diag,
+                    order: vec![mv],
+                    order_attention: vec![attention],
+                    direct_play: Some(mv),
+                };
+            }
+            if let Some(mv) = mined_black_mainline_direct_play(g, legal_moves) {
                 let attention = BOOK_ATTENTION_WINRATE_SCALE * 2 + BOOK_ATTENTION_ISHTAR_BONUS;
                 let diag = OpeningBookDiagnostics {
                     mode,
@@ -810,6 +889,92 @@ mod tests {
             consult.direct_play,
             Some(algebraic_to_move_id("e6")),
             "sacred ply 6 (e6) must still be forced"
+        );
+    }
+
+    #[test]
+    fn mined_mainline_forces_black_a6h_after_a3h() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in ["e2", "e8", "e3", "e7", "e4", "e6", "a3h"] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        let legal = [algebraic_to_move_id("a6h")];
+        let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+        assert_eq!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("a6h")),
+            "Black's a6h must be forced after White's a3h (proven 3/3 wins)"
+        );
+    }
+
+    #[test]
+    fn mined_mainline_does_not_force_white_a3h() {
+        // White's a3h itself must NOT be forced -- Ka (White) lost every
+        // source game playing it. Only Black's replies are mined-forced.
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in ["e2", "e8", "e3", "e7", "e4", "e6"] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        let legal = [algebraic_to_move_id("a3h"), algebraic_to_move_id("h3h")];
+        let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+        assert_ne!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("a3h")),
+            "White's a3h must stay free search, not forced"
+        );
+    }
+
+    #[test]
+    fn mined_mainline_forces_full_line_a_through_ply_12() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        // White's moves (a3h, e3h, e5) are asserted as-played but not
+        // book-forced; Black's moves (a6h, c3v, e6h) must be forced.
+        let mut g = GameState::new();
+        let white_moves = ["e2", "e3", "e4", "a3h", "e3h", "e5"];
+        let black_forced = ["e8", "e7", "e6", "a6h", "c3v", "e6h"];
+        for i in 0..6 {
+            g.make_move(algebraic_to_move_id(white_moves[i]));
+            let legal = [algebraic_to_move_id(black_forced[i])];
+            let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+            assert_eq!(
+                consult.direct_play,
+                Some(algebraic_to_move_id(black_forced[i])),
+                "Black ply {} ({}) must be forced",
+                g.hist_len + 1,
+                black_forced[i]
+            );
+            g.make_move(algebraic_to_move_id(black_forced[i]));
+        }
+    }
+
+    #[test]
+    fn mined_mainline_forces_line_b_ply_10_and_12_once_on_branch() {
+        // Ply 8 in this branch (e3v) is NOT book-forced -- a6h is the primary
+        // forced ply-8 reply (proven 3/3 wins), so e3v is only ever reached
+        // manually/hypothetically here, exactly like this test constructs it.
+        // Once on that branch, plies 10 (e4) and 12 (d4h) ARE forced.
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in ["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "e3v", "e5"] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        let legal = [algebraic_to_move_id("e4")];
+        let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+        assert_eq!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("e4")),
+            "Black ply 10 (e4) must be forced once on the e3v branch"
+        );
+        g.make_move(algebraic_to_move_id("e4"));
+        g.make_move(algebraic_to_move_id("d3h"));
+        let legal = [algebraic_to_move_id("d4h")];
+        let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+        assert_eq!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("d4h")),
+            "Black ply 12 (d4h) must be forced once on the e3v branch"
         );
     }
 
