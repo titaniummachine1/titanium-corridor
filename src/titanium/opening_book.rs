@@ -27,16 +27,19 @@ pub const PLAY_MIN_VISITS: u32 = 12;
 pub const PLAY_MIN_SHARE: f64 = 0.60;
 pub const PLAY_WILSON_GAP: f64 = 0.02;
 
-/// Plies 1–4: sacred center trunk (`e2 e8 e3 e7`) — always forced, never overridden.
-pub const OPENING_SACRED_MAX_PLY: usize = 4;
-/// Sacred plies only — plies 5+ use search (book ordering bias, never forced).
-pub const OPENING_FORCE_MAX_PLY: usize = 4;
+/// Plies 1–6: sacred center trunk (`e2 e8 e3 e7 e4 e6`) — always forced, never
+/// overridden. e4/e6 is the shared prefix of every mined book line in this file
+/// (Ishtar lines, DAG denials, all ply-7 continuations below) — it was already
+/// the de facto mainline, just not force-extended past ply 4 before.
+pub const OPENING_SACRED_MAX_PLY: usize = 6;
+/// Sacred plies only — plies 7+ use search (book ordering bias, never forced).
+pub const OPENING_FORCE_MAX_PLY: usize = 6;
 /// Root move-order bonus scale: win-rate fraction × this (+ Ishtar tier on top).
 pub const BOOK_ATTENTION_WINRATE_SCALE: i32 = 1000;
 pub const BOOK_ATTENTION_ISHTAR_BONUS: i32 = 1000;
 
 /// Highest win-rate main line (non-Titanium DAG) — do not change.
-const SACRED_CENTER_LINE: &[&str] = &["e2", "e8", "e3", "e7"];
+const SACRED_CENTER_LINE: &[&str] = &["e2", "e8", "e3", "e7", "e4", "e6"];
 
 /// Hand-mined Ishtar answers — extra search attention past the force window.
 const ISHTAR_BOOK_LINES: &[(&[&str], &str)] = &[
@@ -136,7 +139,7 @@ fn on_sacred_center_trunk(g: &GameState) -> bool {
     true
 }
 
-/// Force the canonical center PV for plies 1–4 when still on trunk.
+/// Force the canonical center PV for plies 1–6 when still on trunk.
 pub fn sacred_center_direct_play(g: &GameState, legal_moves: &[i16]) -> Option<i16> {
     if !on_sacred_center_trunk(g) || g.hist_len >= OPENING_SACRED_MAX_PLY {
         return None;
@@ -786,10 +789,10 @@ mod tests {
     }
 
     #[test]
-    fn sacred_center_forces_first_four_plies() {
+    fn sacred_center_forces_first_six_plies() {
         let book = OpeningBook::open(None).expect("embedded book");
         let mut g = GameState::new();
-        for expected in ["e2", "e8", "e3"] {
+        for expected in ["e2", "e8", "e3", "e7", "e4"] {
             let legal = [algebraic_to_move_id(expected)];
             let consult = book.consult(&g, OpeningBookMode::Play, &legal);
             assert_eq!(
@@ -800,10 +803,18 @@ mod tests {
             );
             g.make_move(algebraic_to_move_id(expected));
         }
+        // Ply 6 (e6) is still sacred-forced too — the extended trunk.
+        let legal = [algebraic_to_move_id("e6")];
+        let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+        assert_eq!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("e6")),
+            "sacred ply 6 (e6) must still be forced"
+        );
     }
 
     #[test]
-    fn play_mode_forces_through_ply_4_only() {
+    fn play_mode_forces_through_ply_6_only() {
         let mut diag = OpeningBookDiagnostics {
             mode: OpeningBookMode::Play,
             ply_from_start: 3,
