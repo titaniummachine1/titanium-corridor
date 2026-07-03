@@ -1330,6 +1330,7 @@ pub struct TitaniumSearch {
     opening_book: Option<std::sync::Arc<crate::titanium::opening_book::OpeningBook>>,
     opening_book_mode: crate::titanium::opening_book::OpeningBookMode,
     opening_book_order: Option<Vec<i16>>,
+    opening_book_attention: Option<Vec<i32>>,
     pending_opening_book_diag: Option<crate::titanium::opening_book::OpeningBookDiagnostics>,
     /// GitHub Pages: live `info json` payloads forwarded to the browser worker.
     #[cfg(feature = "wasm")]
@@ -1498,6 +1499,7 @@ impl TitaniumSearch {
             opening_book: None,
             opening_book_mode: crate::titanium::opening_book::OpeningBookMode::Off,
             opening_book_order: None,
+            opening_book_attention: None,
             pending_opening_book_diag: None,
             #[cfg(feature = "wasm")]
             wasm_progress: None,
@@ -1523,6 +1525,7 @@ impl TitaniumSearch {
         use crate::titanium::opening_book::{OpeningBook, OpeningBookMode};
         self.opening_book_mode = mode;
         self.opening_book_order = None;
+        self.opening_book_attention = None;
         self.pending_opening_book_diag = None;
         if mode == OpeningBookMode::Off {
             self.opening_book = None;
@@ -1534,6 +1537,7 @@ impl TitaniumSearch {
     fn prepare_opening_book_at_root(&mut self) -> Option<i16> {
         use crate::titanium::opening_book::OpeningBookMode;
         self.opening_book_order = None;
+        self.opening_book_attention = None;
         self.pending_opening_book_diag = None;
         if self.opening_book_mode == OpeningBookMode::Off {
             return None;
@@ -1547,6 +1551,7 @@ impl TitaniumSearch {
         self.pending_opening_book_diag = Some(consult.diagnostics);
         if !consult.order.is_empty() {
             self.opening_book_order = Some(consult.order);
+            self.opening_book_attention = Some(consult.order_attention);
         }
         consult.direct_play
     }
@@ -2039,6 +2044,7 @@ impl TitaniumSearch {
         worker.race_proof = self.race_proof;
         worker.opening_book_mode = self.opening_book_mode;
         worker.opening_book_order = self.opening_book_order.clone();
+        worker.opening_book_attention = self.opening_book_attention.clone();
         worker.opening_book = self.opening_book.clone();
         worker.tt_gen = self.tt_gen;
         worker.tt_mask = self.tt_mask;
@@ -3862,10 +3868,22 @@ impl TitaniumSearch {
         }
         if ply == 0 {
             if let Some(order) = &self.opening_book_order {
+                let attn = self.opening_book_attention.as_deref();
                 for (rank, &bmv) in order.iter().enumerate() {
                     if let Some(pos) = moves.iter().position(|&m| m == bmv) {
-                        sc[pos] = sc[pos].max(2_100_000_000 - rank as i32);
+                        let boost = attn.and_then(|a| a.get(rank).copied()).unwrap_or(0);
+                        // Above TT move; win-rate + Ishtar tier sets relative priority.
+                        let book_score = 2_050_000_000i32 + boost + (1000 - rank as i32);
+                        sc[pos] = sc[pos].max(book_score);
                     }
+                }
+            }
+            use crate::titanium::move_id_to_algebraic;
+            use crate::titanium::opening_book::opening_move_would_be_denied;
+            for i in 0..n {
+                let alg = move_id_to_algebraic(moves[i]);
+                if opening_move_would_be_denied(&self.g, &alg) {
+                    sc[i] = i32::MIN / 4;
                 }
             }
         }

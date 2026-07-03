@@ -12,7 +12,8 @@ use crate::path::BfsScratch;
 use crate::util::grid::goal_row;
 
 const DISABLE_BOOK_ENV: &str = "TITANIUM_DISABLE_BOOK";
-/// Phase 1 — theory window: book + guard only, no deep search.
+/// Phase 1 — theory window: hand book hints search ordering (plies 5+ in DAG play mode).
+/// Plies 1–4 sacred center are handled in `opening_book.rs`; no forced DAG plies.
 pub const BOOK_MAX_PLY: u32 = 10;
 // Guard covers the book window when no hash entry matches.
 const OPENING_GUARD_FULL_MOVES: u32 = 6;
@@ -67,7 +68,8 @@ struct BookEntry {
 
 const BOOK_LINES: &[BookLine] = &[
     // Center development.  Book = principle variation for search ordering only.
-    // Ply 7 after e4 e6: prefer h3h/a3h over e3v (mined vs strong opponents).
+    // Ply 7 after e4 e6: prefer a3h/e3h over e3v (mined vs strong opponents).
+    // h3h removed — wall-fest e6h e3h c6h g2h g6h is losing, not a forced win.
     BookLine {
         name: "center-start",
         prefix: &[],
@@ -119,13 +121,6 @@ const BOOK_LINES: &[BookLine] = &[
         stm_bias: 0,
     },
     // Alt mined walls — below e3h mainline.
-    BookLine {
-        name: "mined-ply7-h3h",
-        prefix: &["e2", "e8", "e3", "e7", "e4", "e6"],
-        reply: "h3h",
-        priority: 140,
-        stm_bias: 0,
-    },
     BookLine {
         name: "mined-ply7-a3h",
         prefix: &["e2", "e8", "e3", "e7", "e4", "e6"],
@@ -266,20 +261,6 @@ const BOOK_LINES: &[BookLine] = &[
         prefix: &["h2h", "e8", "e2", "e7"],
         reply: "e3",
         priority: 115,
-        stm_bias: 0,
-    },
-    BookLine {
-        name: "mined-h3h-d6h",
-        prefix: &["e2", "e8", "e3", "e7", "e4", "e6", "h3h"],
-        reply: "d6h",
-        priority: 112,
-        stm_bias: 0,
-    },
-    BookLine {
-        name: "mined-h3h-d6h-f3h",
-        prefix: &["e2", "e8", "e3", "e7", "e4", "e6", "h3h", "d6h"],
-        reply: "f3h",
-        priority: 112,
         stm_bias: 0,
     },
     BookLine {
@@ -717,7 +698,7 @@ mod tests {
 
     fn is_anti_gorisanson_ply7(reply: Option<&str>) -> bool {
         // e3h = mined-ply7 mainline (priority 160, proven fair-10v10)
-        matches!(reply, Some("e3h" | "h3h" | "a3h" | "e3v" | "d3v" | "c3v"))
+        matches!(reply, Some("e3h" | "a3h" | "e3v" | "d3v" | "c3v"))
     }
 
     #[test]
@@ -727,6 +708,17 @@ mod tests {
 
         let mut board = replay(&["e2"]);
         assert_eq!(lookup_text(&mut board).as_deref(), Some("e8"));
+    }
+
+    #[test]
+    fn ply7_rejects_h3h_wall_fest_line() {
+        let mut board = replay(&["e2", "e8", "e3", "e7", "e4", "e6"]);
+        let reply = lookup_text(&mut board);
+        assert_ne!(
+            reply.as_deref(),
+            Some("h3h"),
+            "h3h wall-fest line is refuted — must not be book PV, got {reply:?}"
+        );
     }
 
     #[test]

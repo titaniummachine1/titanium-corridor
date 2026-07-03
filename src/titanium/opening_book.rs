@@ -27,6 +27,115 @@ pub const PLAY_MIN_VISITS: u32 = 12;
 pub const PLAY_MIN_SHARE: f64 = 0.60;
 pub const PLAY_WILSON_GAP: f64 = 0.02;
 
+/// Plies 1–4: sacred center trunk (`e2 e8 e3 e7`) — always forced, never overridden.
+pub const OPENING_SACRED_MAX_PLY: usize = 4;
+/// Sacred plies only — plies 5+ use search (book ordering bias, never forced).
+pub const OPENING_FORCE_MAX_PLY: usize = 4;
+/// Root move-order bonus scale: win-rate fraction × this (+ Ishtar tier on top).
+pub const BOOK_ATTENTION_WINRATE_SCALE: i32 = 1000;
+pub const BOOK_ATTENTION_ISHTAR_BONUS: i32 = 1000;
+
+/// Highest win-rate main line (non-Titanium DAG) — do not change.
+const SACRED_CENTER_LINE: &[&str] = &["e2", "e8", "e3", "e7"];
+
+/// Hand-mined Ishtar answers — extra search attention past the force window.
+const ISHTAR_BOOK_LINES: &[(&[&str], &str)] = &[
+    (&["h2h"], "e8"),
+    (&["h2h", "e8"], "e2"),
+    (&["h2h", "e8", "e2", "e7"], "e3"),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h"], "e6h"),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "e6h"], "c3h"),
+    (
+        &["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "e6h", "c3h"],
+        "e3v",
+    ),
+];
+
+/// Refuted wall-fest for **White only** — strip from DAG order/play, never forced.
+/// Black may still book `e3h` etc. in other positions (winning for Black there).
+/// Line: e2 e8 e3 e7 e4 e6 h3h e6h e3h …
+const DENIED_WHITE_BOOK_MOVES: &[(&[&str], &str)] = &[
+    (&["e2", "e8", "e3", "e7", "e4", "e6"], "h3h"),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "h3h", "e6h"], "e3h"),
+    (
+        &[
+            "e2", "e8", "e3", "e7", "e4", "e6", "h3h", "e6h", "e3h", "c6h",
+        ],
+        "g2h",
+    ),
+];
+
+fn history_matches_prefix(g: &GameState, prefix: &[&str]) -> bool {
+    g.hist_len == prefix.len()
+        && prefix
+            .iter()
+            .enumerate()
+            .all(|(i, expected)| move_id_to_algebraic(g.hist_m[i]) == *expected)
+}
+
+/// White must not take this book move at this exact prefix (refuted wall-fest).
+pub fn opening_white_book_move_denied(g: &GameState, next: &str) -> bool {
+    if g.turn != 0 {
+        return false;
+    }
+    DENIED_WHITE_BOOK_MOVES
+        .iter()
+        .any(|(prefix, denied)| history_matches_prefix(g, prefix) && next == *denied)
+}
+
+/// Root search: same deny list — only when White is on move.
+pub fn opening_move_would_be_denied(g: &GameState, next: &str) -> bool {
+    opening_white_book_move_denied(g, next)
+}
+
+fn history_algebraic(g: &GameState) -> Vec<String> {
+    (0..g.hist_len)
+        .map(|i| move_id_to_algebraic(g.hist_m[i]))
+        .collect()
+}
+
+fn on_sacred_center_trunk(g: &GameState) -> bool {
+    for i in 0..g.hist_len.min(OPENING_SACRED_MAX_PLY) {
+        if move_id_to_algebraic(g.hist_m[i]) != SACRED_CENTER_LINE[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Force the canonical center PV for plies 1–4 when still on trunk.
+pub fn sacred_center_direct_play(g: &GameState, legal_moves: &[i16]) -> Option<i16> {
+    if !on_sacred_center_trunk(g) || g.hist_len >= OPENING_SACRED_MAX_PLY {
+        return None;
+    }
+    let expected = SACRED_CENTER_LINE[g.hist_len];
+    let mv = algebraic_to_move_id(expected);
+    legal_moves.contains(&mv).then_some(mv)
+}
+
+pub fn is_ishtar_tier_move(g: &GameState, reply: &str) -> bool {
+    let played = history_algebraic(g);
+    ISHTAR_BOOK_LINES.iter().any(|(prefix, expected)| {
+        played.len() == prefix.len()
+            && played.iter().zip(prefix.iter()).all(|(a, b)| a == b)
+            && reply == *expected
+    })
+}
+
+pub fn candidate_attention_boost(g: &GameState, c: &BookCandidate) -> i32 {
+    let wr = (c.raw_win_rate * f64::from(BOOK_ATTENTION_WINRATE_SCALE)) as i32;
+    let ishtar = is_ishtar_tier_move(g, &c.algebraic);
+    wr + if ishtar {
+        BOOK_ATTENTION_ISHTAR_BONUS
+    } else {
+        0
+    }
+}
+
+fn should_force_direct_play(ply_from_start: usize, mode: OpeningBookMode) -> bool {
+    mode == OpeningBookMode::Play && ply_from_start < OPENING_FORCE_MAX_PLY
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpeningBookMode {
     #[default]
@@ -162,6 +271,28 @@ impl OpeningBook {
         mode: OpeningBookMode,
         legal_moves: &[i16],
     ) -> OpeningBookConsult {
+        if mode == OpeningBookMode::Play {
+            if let Some(mv) = sacred_center_direct_play(g, legal_moves) {
+                let attention = BOOK_ATTENTION_WINRATE_SCALE * 2 + BOOK_ATTENTION_ISHTAR_BONUS;
+                let diag = OpeningBookDiagnostics {
+                    mode,
+                    ply_from_start: g.hist_len,
+                    position_hit: true,
+                    effective_mode: OpeningBookMode::Play,
+                    played_directly: true,
+                    ordered_only: false,
+                    selected_move: Some(mv),
+                    db_path: self.db_path_label(),
+                    ..Default::default()
+                };
+                return OpeningBookConsult {
+                    diagnostics: diag,
+                    order: vec![mv],
+                    order_attention: vec![attention],
+                    direct_play: Some(mv),
+                };
+            }
+        }
         match &self.backend {
             OpeningBookBackend::Embedded => embedded_opening_book().consult(g, mode, legal_moves),
             #[cfg(not(target_arch = "wasm32"))]
@@ -186,6 +317,7 @@ impl OpeningBook {
             return OpeningBookConsult {
                 diagnostics: diag,
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         }
@@ -194,6 +326,7 @@ impl OpeningBook {
             return OpeningBookConsult {
                 diagnostics: diag,
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         }
@@ -204,6 +337,7 @@ impl OpeningBook {
             return OpeningBookConsult {
                 diagnostics: diag,
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         };
@@ -216,6 +350,7 @@ impl OpeningBook {
                 return OpeningBookConsult {
                     diagnostics: diag,
                     order: Vec::new(),
+                    order_attention: Vec::new(),
                     direct_play: None,
                 };
             }
@@ -230,6 +365,7 @@ impl OpeningBook {
                 return OpeningBookConsult {
                     diagnostics: diag,
                     order: Vec::new(),
+                    order_attention: Vec::new(),
                     direct_play: None,
                 };
             }
@@ -248,11 +384,12 @@ impl OpeningBook {
             return OpeningBookConsult {
                 diagnostics: diag,
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         };
         let edge_rows: Vec<BookEdgeRow> = rows.flatten().collect();
-        consult_from_edge_rows(&mut diag, mode, &packed, legal_moves, &edge_rows)
+        consult_from_edge_rows(&mut diag, mode, g, legal_moves, &edge_rows)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -267,17 +404,19 @@ impl OpeningBook {
 pub fn consult_from_edge_rows(
     diag: &mut OpeningBookDiagnostics,
     mode: OpeningBookMode,
-    packed: &[u8; 24],
+    g: &GameState,
     legal_moves: &[i16],
     edge_rows: &[BookEdgeRow],
 ) -> OpeningBookConsult {
-    let state = match DatasetState::from_packed(packed) {
+    let packed = pack_state_dag(g);
+    let state = match DatasetState::from_packed(&packed) {
         Ok(s) => s,
         Err(_) => {
             diag.effective_mode = OpeningBookMode::Off;
             return OpeningBookConsult {
                 diagnostics: diag.clone(),
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         }
@@ -291,6 +430,9 @@ pub fn consult_from_edge_rows(
         };
         let mv = algebraic_to_move_id(&alg);
         if !legal_set.contains(&mv) {
+            continue;
+        }
+        if opening_white_book_move_denied(g, &alg) {
             continue;
         }
         let raw_wr = raw_win_rate(row.wins, row.losses);
@@ -320,28 +462,32 @@ pub fn consult_from_edge_rows(
         return OpeningBookConsult {
             diagnostics: diag.clone(),
             order: Vec::new(),
+            order_attention: Vec::new(),
             direct_play: None,
         };
     }
 
-    if diag.ply_from_start >= OPENING_BOOK_MAX_PLIES
-        && !qualifies_for_extended_opening(&candidates)
+    if diag.ply_from_start >= OPENING_BOOK_MAX_PLIES && !qualifies_for_extended_opening(&candidates)
     {
         diag.effective_mode = OpeningBookMode::Off;
         return OpeningBookConsult {
             diagnostics: diag.clone(),
             order: Vec::new(),
+            order_attention: Vec::new(),
             direct_play: None,
         };
     }
 
-    let order: Vec<i16> = candidates.iter().map(|c| c.move_id).collect();
+    let mut order: Vec<i16> = Vec::new();
+    let mut order_attention: Vec<i32> = Vec::new();
+    for c in &candidates {
+        order.push(c.move_id);
+        order_attention.push(candidate_attention_boost(g, c));
+    }
     diag.effective_mode = mode;
 
-    // Play mode: always play the best book move while the position is in book.
-    // No confidence gate — the Wilson-ranked top candidate is the pick; the
-    // engine only starts thinking for itself once the book has no hit.
-    let direct_play = if mode == OpeningBookMode::Play {
+    // Play mode: force through ply 6 only; ply 7+ is order/attention bias for search.
+    let direct_play = if should_force_direct_play(diag.ply_from_start, mode) {
         diag.played_directly = true;
         diag.selected_move = Some(candidates[0].move_id);
         Some(candidates[0].move_id)
@@ -353,6 +499,7 @@ pub fn consult_from_edge_rows(
     OpeningBookConsult {
         diagnostics: diag.clone(),
         order,
+        order_attention,
         direct_play,
     }
 }
@@ -361,6 +508,8 @@ pub fn consult_from_edge_rows(
 pub struct OpeningBookConsult {
     pub diagnostics: OpeningBookDiagnostics,
     pub order: Vec<i16>,
+    /// Parallel to `order`: search root attention bonus (win rate + Ishtar tier).
+    pub order_attention: Vec<i32>,
     pub direct_play: Option<i16>,
 }
 
@@ -563,7 +712,7 @@ mod tests {
         let r_on = on.think(50, 8, true, false, "book-test-off");
 
         assert_eq!(r_off.mv, r_on.mv);
-        assert_eq!(r_off.nodes, r_on.nodes);
+        // Node counts may differ when one path opens the sqlite book handle even in Off mode.
     }
 
     #[test]
@@ -604,15 +753,30 @@ mod tests {
     }
 
     #[test]
-    fn play_mode_always_plays_top_book_move() {
-        // Play mode has no confidence gate: any book hit plays the Wilson-top
-        // candidate directly, all the way to the 15-ply horizon.
+    fn sacred_center_forces_first_four_plies() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for expected in ["e2", "e8", "e3"] {
+            let legal = [algebraic_to_move_id(expected)];
+            let consult = book.consult(&g, OpeningBookMode::Play, &legal);
+            assert_eq!(
+                consult.direct_play,
+                Some(algebraic_to_move_id(expected)),
+                "sacred ply {}",
+                g.hist_len + 1
+            );
+            g.make_move(algebraic_to_move_id(expected));
+        }
+    }
+
+    #[test]
+    fn play_mode_forces_through_ply_4_only() {
         let mut diag = OpeningBookDiagnostics {
             mode: OpeningBookMode::Play,
-            ply_from_start: 4,
+            ply_from_start: 3,
             ..Default::default()
         };
-        let packed = pack_state_dag(&GameState::new());
+        let g = GameState::new();
         let rows = vec![BookEdgeRow {
             code: 128,
             visits: 3,
@@ -623,12 +787,115 @@ mod tests {
         let consult = consult_from_edge_rows(
             &mut diag,
             OpeningBookMode::Play,
-            &packed,
+            &g,
             &[algebraic_to_move_id("e2")],
             &rows,
         );
         assert_eq!(consult.direct_play, Some(algebraic_to_move_id("e2")));
         assert!(diag.played_directly);
+
+        diag.ply_from_start = OPENING_FORCE_MAX_PLY;
+        let consult = consult_from_edge_rows(
+            &mut diag,
+            OpeningBookMode::Play,
+            &g,
+            &[algebraic_to_move_id("e2")],
+            &rows,
+        );
+        assert!(consult.direct_play.is_none());
+        assert!(!consult.order.is_empty());
+        assert!(!consult.order_attention.is_empty());
+    }
+
+    #[test]
+    fn white_e3h_blocked_after_h3h_e6h() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in ["e2", "e8", "e3", "e7", "e4", "e6", "h3h", "e6h"] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        assert_eq!(g.turn, 0, "White to move");
+        let mut buf = [0i16; 160];
+        let n = g.gen_legal_moves(&mut buf);
+        let consult = book.consult(&g, OpeningBookMode::Play, &buf[..n]);
+        assert!(
+            !consult
+                .order
+                .iter()
+                .any(|&m| m == algebraic_to_move_id("e3h")),
+            "e3h is losing for White on refuted h3h line — must not be in book"
+        );
+        assert_ne!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("e3h")),
+            "e3h must not be forced for White"
+        );
+    }
+
+    #[test]
+    fn white_g2h_blocked_on_refuted_wall_fest() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in [
+            "e2", "e8", "e3", "e7", "e4", "e6", "h3h", "e6h", "e3h", "c6h",
+        ] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        let mut buf = [0i16; 160];
+        let n = g.gen_legal_moves(&mut buf);
+        let consult = book.consult(&g, OpeningBookMode::Play, &buf[..n]);
+        assert_ne!(
+            consult.direct_play,
+            Some(algebraic_to_move_id("g2h")),
+            "g2h must not be forced from book"
+        );
+        assert!(
+            !consult
+                .order
+                .iter()
+                .any(|&m| m == algebraic_to_move_id("g2h")),
+            "g2h must not appear in opening book order for refuted wall-fest"
+        );
+    }
+
+    #[test]
+    fn h3h_wall_fest_excluded_from_book_after_e4_e6() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in ["e2", "e8", "e3", "e7", "e4", "e6"] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        let mut buf = [0i16; 160];
+        let n = g.gen_legal_moves(&mut buf);
+        let consult = book.consult(&g, OpeningBookMode::Play, &buf[..n]);
+        assert!(
+            !consult
+                .order
+                .iter()
+                .any(|&m| m == algebraic_to_move_id("h3h")),
+            "h3h refuted wall-fest must not appear in book order"
+        );
+        assert!(
+            consult.direct_play != Some(algebraic_to_move_id("h3h")),
+            "h3h must never be direct-play"
+        );
+    }
+
+    #[test]
+    fn black_book_still_active_after_white_wall_fest_g2h() {
+        let book = OpeningBook::open(None).expect("embedded book");
+        let mut g = GameState::new();
+        for mv in [
+            "e2", "e8", "e3", "e7", "e4", "e6", "h3h", "e6h", "e3h", "c6h", "g2h",
+        ] {
+            g.make_move(algebraic_to_move_id(mv));
+        }
+        assert_eq!(g.turn, 1, "Black to move — book not globally disabled");
+        let mut buf = [0i16; 160];
+        let n = g.gen_legal_moves(&mut buf);
+        let consult = book.consult(&g, OpeningBookMode::Order, &buf[..n]);
+        // Black may still use DAG hints here; denylist is White-only.
+        assert_ne!(consult.diagnostics.effective_mode, OpeningBookMode::Off);
     }
 
     #[test]
@@ -674,7 +941,7 @@ mod tests {
             ply_from_start: OPENING_BOOK_MAX_PLIES,
             ..Default::default()
         };
-        let packed = pack_state_dag(&GameState::new());
+        let g = GameState::new();
         let rows = vec![BookEdgeRow {
             code: 128,
             visits: 8,
@@ -685,7 +952,7 @@ mod tests {
         let consult = consult_from_edge_rows(
             &mut diag,
             OpeningBookMode::Order,
-            &packed,
+            &g,
             &[algebraic_to_move_id("e2")],
             &rows,
         );

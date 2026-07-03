@@ -2,11 +2,11 @@
 
 use std::sync::OnceLock;
 
+use crate::titanium::game::GameState;
 use crate::titanium::opening_book::{
     consult_from_edge_rows, BookEdgeRow, OpeningBookConsult, OpeningBookDiagnostics,
     OpeningBookMode, OPENING_BOOK_EXTENDED_MAX_PLIES,
 };
-use crate::titanium::game::GameState;
 use crate::titanium::packed_state::pack_state_dag;
 
 const EMBED: &[u8] = include_bytes!("data/non_titanium_opening_dag.bin");
@@ -36,7 +36,10 @@ impl EmbeddedOpeningBook {
             return Err("embedded opening book bad magic".into());
         }
         if data[4] != 1 {
-            return Err(format!("embedded opening book unsupported version: {}", data[4]));
+            return Err(format!(
+                "embedded opening book unsupported version: {}",
+                data[4]
+            ));
         }
         let n_pos = u16::from_le_bytes([data[8], data[9]]) as usize;
         let n_edges = u16::from_le_bytes([data[10], data[11]]) as usize;
@@ -83,9 +86,7 @@ impl EmbeddedOpeningBook {
     }
 
     fn lookup_index(&self, packed: &[u8; 24]) -> Option<usize> {
-        self.positions
-            .binary_search_by(|key| key.cmp(packed))
-            .ok()
+        self.positions.binary_search_by(|key| key.cmp(packed)).ok()
     }
 
     pub fn consult(
@@ -105,6 +106,7 @@ impl EmbeddedOpeningBook {
             return OpeningBookConsult {
                 diagnostics: diag,
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         }
@@ -114,6 +116,7 @@ impl EmbeddedOpeningBook {
             return OpeningBookConsult {
                 diagnostics: diag,
                 order: Vec::new(),
+                order_attention: Vec::new(),
                 direct_play: None,
             };
         };
@@ -130,16 +133,15 @@ impl EmbeddedOpeningBook {
                 draws: e.draws,
             })
             .collect();
-        consult_from_edge_rows(&mut diag, mode, &packed, legal_moves, &rows)
+        consult_from_edge_rows(&mut diag, mode, g, legal_moves, &rows)
     }
 }
 
 static EMBEDDED: OnceLock<EmbeddedOpeningBook> = OnceLock::new();
 
 pub fn embedded_opening_book() -> &'static EmbeddedOpeningBook {
-    EMBEDDED.get_or_init(|| {
-        EmbeddedOpeningBook::parse(EMBED).expect("embedded opening DAG must parse")
-    })
+    EMBEDDED
+        .get_or_init(|| EmbeddedOpeningBook::parse(EMBED).expect("embedded opening DAG must parse"))
 }
 
 #[cfg(test)]
