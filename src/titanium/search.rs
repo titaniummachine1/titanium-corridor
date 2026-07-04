@@ -361,8 +361,14 @@ impl Default for EvalCacheEntry {
 /// 13 bits cuts refloods 25-45%; 14-15 bits are a wash (TLB pressure eats the
 /// extra hits), so 13 caps native. wasm caps lower — browser memory is the
 /// scarce resource there (256MB threaded-build ceiling, one table per worker).
+// One-shot callers (genmove, match, bench) never get to grow past a cold
+// start before they exit, so the adaptive grow-on-occupancy path below barely
+// runs. Starting directly at the steady-state size (~23MB/process) skips that
+// cold-ramp entirely instead of thrashing at 512 entries. Measured +38-49%
+// single-thread NPS on an idle i7-4900MQ vs starting at 1<<9 (startpos, fixed
+// move/score/nodes-shape unchanged — search-identical, cache size only).
 #[cfg(not(target_arch = "wasm32"))]
-const DIST_LRU_MIN_BITS: usize = 9;
+const DIST_LRU_MIN_BITS: usize = 13;
 #[cfg(not(target_arch = "wasm32"))]
 const DIST_LRU_MAX_BITS: usize = 13;
 #[cfg(target_arch = "wasm32")]
