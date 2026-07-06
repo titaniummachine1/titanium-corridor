@@ -1042,6 +1042,57 @@ fn better_defense_candidate(
     order < best_order
 }
 
+/// Clean-winner root move selection: when the root is a proven win and two
+/// candidate moves score EXACTLY the same, prefer the one that doesn't waste
+/// a tempo. Pawn moves make forced-win progress; a wall placement that
+/// achieves the identical proven score is by definition unnecessary (the win
+/// didn't need it), so it only adds branching complexity a human wouldn't
+/// bother with. If both tied candidates are walls (no pawn move ties),
+/// prefer whichever pushes the opponent's distance-to-goal further back —
+/// the mirror of the stubborn-loser opponent-delay preference above, but for
+/// making an already-won position more solid rather than a lost one less bad.
+/// Next, prefer the move CAT's own impact-heat model rates as more
+/// significant (the same attention signal that drives move ordering and LMR
+/// elsewhere) -- among true ties this reads as "which move actually matters
+/// here" rather than falling straight to arbitrary move-generation order.
+/// Never overrides an actual score difference -- this only breaks EXACT ties.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn better_clean_win_candidate(
+    score: i32,
+    static_eval: i32,
+    is_pawn_move: bool,
+    opp_dist_after: i32,
+    cat_heat: i32,
+    order: usize,
+    best_score: i32,
+    best_static: i32,
+    best_is_pawn_move: bool,
+    best_opp_dist_after: i32,
+    best_cat_heat: i32,
+    best_order: usize,
+) -> bool {
+    if best_score == i32::MIN {
+        return true;
+    }
+    if score != best_score {
+        return score > best_score;
+    }
+    if is_pawn_move != best_is_pawn_move {
+        return is_pawn_move;
+    }
+    if !is_pawn_move && opp_dist_after != best_opp_dist_after {
+        return opp_dist_after > best_opp_dist_after;
+    }
+    if cat_heat != best_cat_heat {
+        return cat_heat > best_cat_heat;
+    }
+    if static_eval != best_static {
+        return static_eval > best_static;
+    }
+    order < best_order
+}
+
 #[derive(Debug, Clone)]
 pub struct RootDefenseDiag {
     pub mv: i16,
@@ -4956,6 +5007,137 @@ impl TitaniumSearch {
         Ok(best_score)
     }
 
+    /// Won-position root selection: full-depth search of every legal root move
+    /// with clean-winner move selection (see `better_clean_win_candidate`) --
+    /// among moves tied at the exact same proven-win score, prefer pawn
+    /// progress over a wall placement the win didn't actually need, and among
+    /// tied wall placements prefer whichever pushes the opponent back further.
+    /// Mirrors `root_defense_verify`; same full-width re-search cost, same
+    /// deadline handling (an aborted pass just keeps whatever `root_best` the
+    /// normal alpha-beta pass already found).
+    fn root_clean_win_verify(&mut self, depth: i32) -> Result<i32, TimeUp> {
+        if !self.pure_mode && !self.is_pondering {
+            self.tt_gen = self.tt_gen.wrapping_add(1);
+        }
+        let root_side = self.g.turn;
+        let mut moves = [0i16; 160];
+        let tt_hint = if self.root_best >= 0 {
+            self.root_best
+        } else {
+            0
+        };
+        let n = self.gen_moves(0, depth, tt_hint, &mut moves);
+        if n == 0 {
+            return Ok(self.root_score);
+        }
+        self.order_moves(0, &mut moves[..n], tt_hint, 0);
+        let n = crate::titanium::opening_book::filter_denied_opening_legal_moves(
+            &self.g, &mut moves, n,
+        );
+        if n == 0 {
+            return Ok(self.root_score);
+        }
+
+        // CAT impact heat per candidate, computed once against the root
+        // position (same model that drives move ordering / LMR elsewhere) --
+        // used only as a tie-break signal below, not for pruning or ordering.
+        let mut heat_by_id = [0i32; 264];
+        if let Some(bridge) = self.bridge.as_ref() {
+            let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
+            for &mv_id in &moves[..n] {
+                let mv = move_id_to_board(mv_id);
+                heat_by_id[mv_id as usize] = move_impact_heat(mv, &cat);
+            }
+        }
+
+        let child_depth = depth - 1;
+        let mut best_move = moves[0];
+        let mut best_score = i32::MIN;
+        let mut best_static = i32::MIN;
+        let mut best_opp_dist_after = i32::MIN;
+        let mut best_cat_heat = i32::MIN;
+        let mut best_order = 0usize;
+
+        for i in 0..n {
+            if Instant::now() >= self.deadline {
+                return Err(TimeUp);
+            }
+            let m = moves[i];
+
+            self.refresh_dist(0);
+            let nd0 = self.dist0_idx;
+            let nd1 = self.dist1_idx;
+            let nst = self.cached_stamp;
+            let ndm_lo = self.dir_masks_key_lo;
+            let ndm_hi = self.dir_masks_key_hi;
+            let ndm_cache = self.dir_masks_cache;
+
+            crate::bench_instr::record(
+                |b| &mut b.make_move,
+                || {
+                    self.g.make_move(m);
+                    if let Some(bridge) = self.bridge.as_mut() {
+                        bridge.push(m);
+                    }
+                },
+            );
+            self.refresh_dist(1);
+            let static_eval = {
+                let ev = self.evaluate(0);
+                if self.g.turn == root_side {
+                    ev
+                } else {
+                    -ev
+                }
+            };
+            let opp_dist_after: i32 = if root_side == 0 {
+                self.d1[self.dist1_idx][self.g.pawn[1]] as i32
+            } else {
+                self.d0[self.dist0_idx][self.g.pawn[0]] as i32
+            };
+            let search_score = match self.ab(child_depth, -INF, INF, 1, true, m) {
+                Ok(s) => -s,
+                Err(e) => {
+                    self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
+                    return Err(e);
+                }
+            };
+            self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
+
+            let is_pawn_move = m < 100;
+            let cat_heat = heat_by_id[m as usize];
+            if better_clean_win_candidate(
+                search_score,
+                static_eval,
+                is_pawn_move,
+                opp_dist_after,
+                cat_heat,
+                i,
+                best_score,
+                best_static,
+                best_move < 100,
+                best_opp_dist_after,
+                best_cat_heat,
+                best_order,
+            ) {
+                best_move = m;
+                best_score = search_score;
+                best_static = static_eval;
+                best_opp_dist_after = opp_dist_after;
+                best_cat_heat = cat_heat;
+                best_order = i;
+            }
+        }
+
+        self.root_best = best_move;
+        self.root_score = best_score;
+        if best_move < 100 {
+            self.root_pawn_best = best_move;
+            self.root_pawn_score = best_score;
+        }
+        Ok(best_score)
+    }
+
     /// Entry: pathfix/RaceProof(a) — exact race endgame at ROOT. Cheap-cert
     /// engines resolve the no-wall race with the path-aware classifier plus
     /// tiny forward minimax only for volatile child states; faithful modes keep
@@ -5679,6 +5861,39 @@ impl TitaniumSearch {
                             Ok(defense_score) => {
                                 last_best = self.root_best;
                                 last_score = defense_score;
+                                if self.root_pawn_best >= 0 {
+                                    last_pawn_best = self.root_pawn_best;
+                                    last_pawn_score = self.root_pawn_score;
+                                }
+                                if let Some(entry) = depth_log.last_mut() {
+                                    if entry.depth == d {
+                                        entry.score = last_score;
+                                        entry.pv = if last_best >= 0 {
+                                            super::move_id_to_algebraic(last_best)
+                                        } else {
+                                            String::new()
+                                        };
+                                    }
+                                }
+                                if log {
+                                    self.sync_stream_meta(&depth_log, d, last_score);
+                                    self.emit_stream_progress(true);
+                                }
+                            }
+                            Err(TimeUp) => {
+                                if self.use_partial_iter && self.root_best >= 0 {
+                                    last_best = self.root_best;
+                                    last_score = self.root_score;
+                                }
+                                *stop_reason = "time_up";
+                                break;
+                            }
+                        }
+                    } else if is_proven_win_score(sc) {
+                        match self.root_clean_win_verify(d) {
+                            Ok(win_score) => {
+                                last_best = self.root_best;
+                                last_score = win_score;
                                 if self.root_pawn_best >= 0 {
                                     last_pawn_best = self.root_pawn_best;
                                     last_pawn_score = self.root_pawn_score;
