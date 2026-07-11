@@ -46,7 +46,7 @@ use crate::search::v16_lmr::{
 };
 use crate::titanium::certify::{certify, CertifyOpts};
 use crate::titanium::game::{GameState, ZOBRIST};
-use crate::titanium::net::{net, net_frozen, MAX_NET_H, Net, NET_BKT, NET_MIRC, NET_MIRS};
+use crate::titanium::net::{net, net_frozen, Net, MAX_NET_H, NET_BKT, NET_MIRC, NET_MIRS};
 use crate::titanium::packed_state::FEATURE_SCHEMA;
 use crate::titanium::race::{
     race_outcome_with_dist, solve_race_config, RaceBound, RaceOutcomeStats, RaceScratch, RACE_MATE,
@@ -98,6 +98,68 @@ const ACE_EME_TOP_MOVES: usize = 2;
 /// moves, not a signal meant to override a strong CAT read or distort
 /// iterative deepening.
 const ROUTE_TOUCH_ORDER_BONUS: i32 = 20;
+
+/// Gravity ceiling for the SF-history experiment (`hist_sf`). 2^20 puts a
+/// saturated wall at ~1.05M ordering score — the same neighborhood the legacy
+/// counter reaches on hot walls (and just above pawn-progress scores), so the
+/// relative ordering bands match the legacy mode and the A/B isolates the
+/// side-split/gravity/malus semantics, not a rescale of everything.
+const SF_HIST_MAX: i32 = 1 << 20;
+
+/// Pawn progress changes ordering by 1000 points for each shortest-path step.
+/// Keep the optional history tie-break strictly inside half that gap: even the
+/// most-disfavoured one-step-faster pawn move still outranks the most-favoured
+/// one-step-slower move (a minimum two-point margin).
+const SF_PAWN_HISTORY_TIEBREAK_MAX: i32 = 499;
+
+/// Compress the saturated SF history range into a pawn-only ordering tie-break.
+/// The clamp also makes the bound hold if a caller seeds a table entry directly.
+#[inline]
+fn sf_pawn_history_tiebreak(history: i32) -> i32 {
+    let bounded = history.clamp(-SF_HIST_MAX, SF_HIST_MAX) as i64;
+    (bounded * SF_PAWN_HISTORY_TIEBREAK_MAX as i64 / SF_HIST_MAX as i64) as i32
+}
+
+/// Correction-history table size per side (wall-structure-hash buckets).
+const CORR_SIZE: usize = 1 << 14;
+/// Correction magnitude clamp (cp). Net eval band is ±2000; a correction
+/// beyond ±256 means the static eval is systematically wrong by more than a
+/// wall's worth — cap it rather than let one bucket dominate.
+const CORR_MAX: i32 = 256;
+
+/// Opt-in ProbCut is deliberately narrow: static eval must already exceed the
+/// null-window beta by this many centipawns before it may spend a shallow
+/// verification search. A 200cp margin keeps this experimental cutoff well
+/// away from ordinary evaluation noise.
+const PROBCUT_STATIC_MARGIN: i32 = 200;
+/// The verification search is four plies shallower than the full node. This
+/// leaves at least two plies at the minimum eligible depth (six).
+const PROBCUT_REDUCTION: i32 = 4;
+const PROBCUT_MIN_DEPTH: i32 = 6;
+/// ProbCut is only meaningful for ordinary net-evaluation windows. Keeping it
+/// inside this band excludes mate, race, and certificate score conventions.
+const PROBCUT_MAX_ABS_BETA: i32 = 2_000;
+
+/// Pure eligibility gate for the opt-in ProbCut experiment. `ply > 0` keeps
+/// root search exact, the one-point window excludes PV nodes, and `allow_null`
+/// prevents the verification itself from recursively launching another
+/// speculative cutoff search.
+#[inline]
+fn probcut_is_eligible(
+    depth: i32,
+    alpha: i32,
+    beta: i32,
+    ply: usize,
+    allow_null: bool,
+    static_ev: i32,
+) -> bool {
+    depth >= PROBCUT_MIN_DEPTH
+        && ply > 0
+        && allow_null
+        && beta.saturating_sub(alpha) == 1
+        && beta.abs() < PROBCUT_MAX_ABS_BETA
+        && static_ev >= beta.saturating_add(PROBCUT_STATIC_MARGIN)
+}
 
 /// Pure predicate, factored out for direct unit testing: does this wall
 /// touch a cell on either player's shortest-route set? `route0`/`route1`
@@ -1110,6 +1172,64 @@ mod score_label_tests {
     }
 
     #[test]
+    fn probcut_defaults_off_and_has_an_explicit_setter() {
+        let mut search = TitaniumSearch::new(crate::titanium::game::GameState::new());
+        assert!(!search.probcut);
+        search.set_probcut(true);
+        assert!(search.probcut);
+    }
+
+    #[test]
+    fn sf_history_defaults_off_and_has_an_explicit_setter() {
+        let mut search = TitaniumSearch::new(crate::titanium::game::GameState::new());
+        assert!(!search.sf_history);
+        search.set_sf_history(true);
+        assert!(search.sf_history);
+    }
+
+    #[test]
+    fn sf_pawn_history_tiebreak_cannot_overturn_one_step_of_progress() {
+        assert_eq!(sf_pawn_history_tiebreak(SF_HIST_MAX), 499);
+        assert_eq!(sf_pawn_history_tiebreak(-SF_HIST_MAX), -499);
+        assert_eq!(sf_pawn_history_tiebreak(i32::MAX), 499);
+        assert_eq!(sf_pawn_history_tiebreak(i32::MIN), -499);
+
+        let faster_with_worst_history = 1_000_000 - 5 * 1000 - 499;
+        let slower_with_best_history = 1_000_000 - 6 * 1000 + 499;
+        assert!(faster_with_worst_history > slower_with_best_history);
+    }
+
+    #[test]
+    fn sf_history_switch_reads_pawn_destination_from_the_selected_table() {
+        let mut search = TitaniumSearch::new(crate::titanium::game::GameState::new());
+        let pawn_destination = 42i16;
+        search.history_tbl[pawn_destination as usize] = 17;
+        search.hist_sf[0][pawn_destination as usize] = -29;
+
+        assert_eq!(search.move_hist(0, pawn_destination), 17);
+        search.set_sf_history(true);
+        assert_eq!(search.move_hist(0, pawn_destination), -29);
+    }
+
+    #[test]
+    fn probcut_gate_requires_a_safe_non_root_fail_high_plausibility() {
+        assert!(probcut_is_eligible(6, 99, 100, 1, true, 300));
+        assert!(!probcut_is_eligible(5, 99, 100, 1, true, 300));
+        assert!(!probcut_is_eligible(6, 99, 100, 0, true, 300));
+        assert!(!probcut_is_eligible(6, 99, 100, 1, false, 300));
+        assert!(!probcut_is_eligible(6, 98, 100, 1, true, 300));
+        assert!(!probcut_is_eligible(
+            6,
+            PROBCUT_MAX_ABS_BETA - 1,
+            PROBCUT_MAX_ABS_BETA,
+            1,
+            true,
+            2_300
+        ));
+        assert!(!probcut_is_eligible(6, 99, 100, 1, true, 299));
+    }
+
+    #[test]
     fn w23_root_defense_fully_searches_all_pawns_and_picks_longest_loss() {
         use crate::titanium::algebraic_to_move_id;
         use crate::titanium::game::GameState;
@@ -1633,6 +1753,33 @@ pub struct TitaniumSearch {
     history_tbl: [i32; 512],
     cm: [i16; 512], // countermove table
     killers: [[i16; 2]; MAX_PLY],
+    /// Stockfish-style history experiment (A/B flag, default off): side-split
+    /// `[stm][move]` full-action history updated with the gravity formula
+    /// (`h += bonus − h·|bonus|/MAX`, self-saturating) plus MALUSES — every
+    /// action searched before the beta cutoff at a node gets the negative bonus,
+    /// so ordering mistakes are demoted instead of keeping stale credit.
+    /// When on, replaces `history_tbl` for full-action ordering reads (and wall
+    /// pruning reads);
+    /// `history_tbl` itself keeps updating unchanged so this stays a pure
+    /// read-side experiment (single-axis A/B, same decay policy both modes).
+    sf_history: bool,
+    /// Conservative reduced-depth fail-high verification. Off by default and
+    /// exposed only as an explicit A/B experiment.
+    probcut: bool,
+    hist_sf: [[i32; 512]; 2],
+    /// SF batch 2 (branch build, unconditional): corrected static eval per
+    /// ply, for the `improving` flag (i32::MIN = never written).
+    eval_stack: [i32; MAX_PLY],
+    /// Correction history: `[stm][wall-structure-hash]` → running EMA of
+    /// (search score − static eval) in cp, clamped ±256. Teaches the static
+    /// eval its systematic bias per wall structure, online, no training.
+    /// Applied only in the net-eval band — cert/mate scores never corrected.
+    corr_hist: [[i16; CORR_SIZE]; 2],
+    /// Continuation history: flat `[prev_move << 9 | move]` gravity table —
+    /// scores wall replies to the previous move (the SF conthist analog; our
+    /// `cm` table keeps only the single best reply, this keeps a full score
+    /// surface). Heap Vec: 512*512*4B = 1MB.
+    cont_hist: Vec<i32>,
     // Offline-only LMR counterfactual probe. A target ordinal receives exactly
     // one provisional extra reduction; verification always uses native depth.
     reduction_probe_enabled: bool,
@@ -1880,6 +2027,15 @@ impl TitaniumSearch {
             sub_anc_hi: [0; MAX_PLY],
             history_tbl: [0; 512],
             cm: [0; 512],
+            // Stockfish-style history is an explicit A/B experiment. Production
+            // Titanium stays on the legacy history table unless a caller enables
+            // the experiment with `set_sf_history(true)`.
+            sf_history: false,
+            probcut: false,
+            hist_sf: [[0; 512]; 2],
+            eval_stack: [i32::MIN; MAX_PLY],
+            corr_hist: [[0; CORR_SIZE]; 2],
+            cont_hist: vec![0; 512 * 512],
             killers: [[0; 2]; MAX_PLY],
             reduction_probe_enabled: false,
             reduction_probe_target: None,
@@ -2413,6 +2569,78 @@ impl TitaniumSearch {
         for h in self.history_tbl.iter_mut() {
             *h = (*h as f32 * decay) as i32;
         }
+        for side in self.hist_sf.iter_mut() {
+            for h in side.iter_mut() {
+                *h = (*h as f32 * decay) as i32;
+            }
+        }
+        for h in self.cont_hist.iter_mut() {
+            *h = (*h as f32 * decay) as i32;
+        }
+    }
+
+    /// Enable the Stockfish-style history experiment (side-split + gravity +
+    /// maluses). Off by default; A/B-gated via the match harness before any
+    /// default flip — see the `hist_sf` field docs.
+    pub fn set_sf_history(&mut self, on: bool) {
+        self.sf_history = on;
+    }
+
+    /// Enable the conservative ProbCut experiment. Disabled by default: it
+    /// trades a shallow verification search for a speculative beta cutoff and
+    /// must be measured separately before any broader use.
+    pub fn set_probcut(&mut self, on: bool) {
+        self.probcut = on;
+    }
+
+    /// Full-action history as seen by ordering/pruning: the side-split gravity
+    /// table when the SF-history experiment is on, the legacy shared counter
+    /// otherwise. Pawn destinations already occupy valid move IDs.
+    #[inline]
+    fn move_hist(&self, stm: usize, m: i16) -> i32 {
+        if self.sf_history {
+            self.hist_sf[stm][m as usize]
+        } else {
+            self.history_tbl[m as usize]
+        }
+    }
+
+    /// Gravity update: `h += bonus − h·|bonus|/MAX`. Saturates at ±MAX with no
+    /// overflow guard needed, and pulls stale scores toward the fresh signal
+    /// (a saturated entry that stops earning bonuses decays on every malus).
+    #[inline]
+    fn sf_hist_apply(&mut self, stm: usize, m: i16, bonus: i32) {
+        let h = &mut self.hist_sf[stm][m as usize];
+        *h += bonus - ((*h as i64 * bonus.unsigned_abs() as i64) / SF_HIST_MAX as i64) as i32;
+    }
+
+    /// Same gravity formula on the continuation-history surface.
+    #[inline]
+    fn cont_hist_apply(&mut self, prev_move: i16, m: i16, bonus: i32) {
+        let h = &mut self.cont_hist[((prev_move as usize) << 9) | (m as usize)];
+        *h += bonus - ((*h as i64 * bonus.unsigned_abs() as i64) / SF_HIST_MAX as i64) as i32;
+    }
+
+    #[inline]
+    fn cont_hist_read(&self, prev_move: i16, m: i16) -> i32 {
+        if prev_move > 0 {
+            self.cont_hist[((prev_move as usize) << 9) | (m as usize)]
+        } else {
+            0
+        }
+    }
+
+    /// Wall-structure bucket for the correction history: the incremental
+    /// position zobrist with both pawn components (and the turn component)
+    /// XORed back out — an O(1) walls-only hash, no game.rs changes needed.
+    #[inline]
+    fn wall_corr_index(&self) -> usize {
+        let z = &ZOBRIST;
+        let mut h = self.g.hash_lo ^ z.pawn_lo[0][self.g.pawn[0]] ^ z.pawn_lo[1][self.g.pawn[1]];
+        if self.g.turn == 1 {
+            h ^= z.turn_lo;
+        }
+        (h as usize) & (CORR_SIZE - 1)
     }
 
     /// Advance the root by one ply (predicted opponent move) and adjust state
@@ -2471,6 +2699,19 @@ impl TitaniumSearch {
             self.tt_gen = self.tt_gen.wrapping_add(1);
             for h in self.history_tbl.iter_mut() {
                 *h >>= 1;
+            }
+            // Same aging policy for the SF-history experiment tables (`/ 2`,
+            // not `>>`: arithmetic shift would pin negative entries at -1
+            // forever instead of converging to 0). Correction history is NOT
+            // aged — eval bias per wall structure is slow-moving knowledge,
+            // not a tactical pattern (SF also persists it across moves).
+            for side in self.hist_sf.iter_mut() {
+                for h in side.iter_mut() {
+                    *h /= 2;
+                }
+            }
+            for h in self.cont_hist.iter_mut() {
+                *h /= 2;
             }
         }
     }
@@ -2567,6 +2808,11 @@ impl TitaniumSearch {
     fn fork_lazy_worker(&self, root: &GameState) -> Box<Self> {
         let mut worker = Self::new(root.clone());
         worker.history_tbl = self.history_tbl;
+        worker.sf_history = self.sf_history;
+        worker.probcut = self.probcut;
+        worker.hist_sf = self.hist_sf;
+        worker.corr_hist = self.corr_hist;
+        worker.cont_hist = self.cont_hist.clone();
         worker.cm = self.cm;
         worker.killers = self.killers;
         worker.net = self.net;
@@ -3083,6 +3329,45 @@ impl TitaniumSearch {
     fn ace_over_time_budget(t0: Instant, time_ms: u64, last_score: i32) -> bool {
         let budget = time_ms as f64 * Self::ace_time_fraction(last_score);
         t0.elapsed().as_millis() as f64 > budget
+    }
+
+    /// Projects the next ID iteration's cost as `max(last two iteration
+    /// durations)` and refuses to start it if that projection can't fit the
+    /// remaining budget. Iteration costs are strongly non-monotone (a cheap
+    /// TT/cert-warmed depth can be followed by an expensive one), so a
+    /// growth-multiplier model both over- and under-shoots; the max-of-2 floor
+    /// is a cheap, measured-good alternative to the fixed-fraction
+    /// `ace_over_time_budget` softStop rule above (ported from the ka_ab.js
+    /// "predictStop" experiment in reference/ace.html — kept alongside the
+    /// fraction check as a belt-and-suspenders bound, not a replacement).
+    fn predicted_over_time_budget(
+        t0: Instant,
+        time_ms: u64,
+        depth_log: &[AceDepthLogEntry],
+    ) -> bool {
+        let n = depth_log.len();
+        if n == 0 {
+            return false;
+        }
+        let last_ms = depth_log[n - 1].elapsed_ms as f64
+            - if n >= 2 {
+                depth_log[n - 2].elapsed_ms as f64
+            } else {
+                0.0
+            };
+        let prev_ms = if n >= 2 {
+            depth_log[n - 2].elapsed_ms as f64
+                - if n >= 3 {
+                    depth_log[n - 3].elapsed_ms as f64
+                } else {
+                    0.0
+                }
+        } else {
+            0.0
+        };
+        let projected = last_ms.max(prev_ms).max(20.0);
+        let elapsed = t0.elapsed().as_millis() as f64;
+        elapsed + projected > time_ms as f64
     }
 
     /// Returns (score, route0_bits, route1_bits) so callers can reuse the route bitsets.
@@ -4110,6 +4395,14 @@ impl TitaniumSearch {
             let band = ret.clamp(-CERT_BAND, CERT_BAND);
             return -CERT_WIN_SCORE + band;
         }
+        // Correction history: apply the learned per-wall-structure eval bias.
+        // Net-eval band only — the cert_win 2500 above and every early return
+        // (proven/cert/mate scores) stay untouched, and the corrected value is
+        // clamped inside the band so it can never impersonate a cert score.
+        if ret > -2000 && ret < 2000 {
+            let c = self.corr_hist[me][self.wall_corr_index()] as i32;
+            ret = (ret + c).clamp(-1999, 1999);
+        }
         ret
     }
 
@@ -4372,7 +4665,7 @@ impl TitaniumSearch {
     }
 
     fn order_moves(&self, ply: usize, moves: &mut [i16], tt_move: i16, cm_move: i16) {
-        self.order_moves_prior(ply, moves, tt_move, cm_move, None);
+        self.order_moves_prior(ply, moves, tt_move, cm_move, 0, None);
     }
 
     /// Ordering: TT > pawn progress > killers > countermove > history. CAT heat
@@ -4385,6 +4678,7 @@ impl TitaniumSearch {
         moves: &mut [i16],
         tt_move: i16,
         cm_move: i16,
+        prev_move: i16,
         cat_prior: Option<(&[i32; 264], u32)>,
     ) {
         let dist_me = if self.g.turn == 0 {
@@ -4400,7 +4694,15 @@ impl TitaniumSearch {
             sc[i] = if m == tt_move {
                 2_000_000_000
             } else if m < 100 {
-                1_000_000 - dist_me[m as usize] as i32 * 1000
+                let progress = 1_000_000 - dist_me[m as usize] as i32 * 1000;
+                // Legacy mode intentionally keeps its exact pawn ordering. In
+                // the SF-history A/B, history is only a ±499 tie-break; one
+                // shortest-path step remains worth 1000 points.
+                if self.sf_history {
+                    progress + sf_pawn_history_tiebreak(self.move_hist(self.g.turn, m))
+                } else {
+                    progress
+                }
             } else if m == k[0] {
                 900_000
             } else if m == cm_move {
@@ -4408,7 +4710,10 @@ impl TitaniumSearch {
             } else if m == k[1] {
                 850_000
             } else {
-                let h = self.history_tbl[m as usize];
+                // main history + half-weight continuation history (reply
+                // quality to the specific previous move); CAT heat stays the
+                // fallback only when BOTH stat surfaces are silent.
+                let h = self.move_hist(self.g.turn, m) + self.cont_hist_read(prev_move, m) / 2;
                 if h != 0 {
                     h
                 } else if let Some((heat, max_h)) = cat_prior {
@@ -4636,17 +4941,48 @@ impl TitaniumSearch {
             }
         }
 
-        // reverse futility: hopeless to fall below beta at shallow depth
+        // Static eval once per node (the internal eval cache absorbs
+        // re-visits): feeds reverse futility, null move, the SF `improving`
+        // flag, and the correction-history update at node completion.
+        let static_ev = self.evaluate(depth);
+        self.eval_stack[ply] = static_ev;
+        // improving: static eval rose vs 2 plies ago (same side to move).
+        // Stale same-slot values from sibling lines are tolerated, as in SF.
+        let improving = ply >= 2
+            && self.eval_stack[ply - 2] != i32::MIN
+            && static_ev > self.eval_stack[ply - 2];
+
+        // reverse futility: hopeless to fall below beta at shallow depth.
+        // Tighter margin when improving (prune more from rising positions).
         if depth <= 4 && beta > -2000 && beta < 2000 {
-            let sev = self.evaluate(depth);
-            if sev - 90 * depth >= beta {
-                return Ok(sev);
+            let margin = if improving { 70 } else { 90 } * depth;
+            if static_ev - margin >= beta {
+                return Ok(static_ev);
+            }
+        }
+
+        // Opt-in ProbCut: when the cheap static eval is already comfortably
+        // above an ordinary beta, ask a four-ply-shallower null-window search
+        // to verify the fail-high. The verification reuses this position (no
+        // make/unmake is needed), disables `allow_null` to prevent recursion,
+        // and propagates TimeUp normally. Never run this at the root/PV node.
+        if self.probcut && probcut_is_eligible(depth, alpha, beta, ply, allow_null, static_ev) {
+            let verified = self.ab(
+                depth - PROBCUT_REDUCTION,
+                beta - 1,
+                beta,
+                ply,
+                false,
+                prev_move,
+            )?;
+            if verified >= beta {
+                return Ok(beta); // fail-hard: never leak the speculative score
             }
         }
 
         // null move
         if allow_null && depth >= 3 && ply > 0 {
-            let ev = self.evaluate(depth);
+            let ev = static_ev;
             if ev >= beta {
                 let z = &ZOBRIST;
                 self.g.turn ^= 1;
@@ -4734,21 +5070,36 @@ impl TitaniumSearch {
                 let mut route0 = [0u8; 81];
                 let mut route1 = [0u8; 81];
                 let mut flank_scratch = [0u8; 81];
-                fill_sparse_route_masks(&self.g, self.g.pawn[0], &d0f, &mut route0, &mut flank_scratch);
-                fill_sparse_route_masks(&self.g, self.g.pawn[1], &d1f, &mut route1, &mut flank_scratch);
+                fill_sparse_route_masks(
+                    &self.g,
+                    self.g.pawn[0],
+                    &d0f,
+                    &mut route0,
+                    &mut flank_scratch,
+                );
+                fill_sparse_route_masks(
+                    &self.g,
+                    self.g.pawn[1],
+                    &d1f,
+                    &mut route1,
+                    &mut flank_scratch,
+                );
                 for i in 0..n {
                     if moves[i] < 100 {
                         continue; // pawn moves -- route-touch only makes sense for walls
                     }
-                    if let crate::core::board::Move::Wall { row, col, orientation } =
-                        move_id_to_board(moves[i])
+                    if let crate::core::board::Move::Wall {
+                        row,
+                        col,
+                        orientation,
+                    } = move_id_to_board(moves[i])
                     {
                         if wall_touches_route(row, col, orientation, &route0, &route1) {
                             heat_by_id[moves[i] as usize] += ROUTE_TOUCH_ORDER_BONUS;
-                            max_move_impact = max_move_impact
-                                .max(heat_by_id[moves[i] as usize].max(0) as u32);
-                            max_wall_impact = max_wall_impact
-                                .max(heat_by_id[moves[i] as usize].max(0) as u32);
+                            max_move_impact =
+                                max_move_impact.max(heat_by_id[moves[i] as usize].max(0) as u32);
+                            max_wall_impact =
+                                max_wall_impact.max(heat_by_id[moves[i] as usize].max(0) as u32);
                         }
                     }
                 }
@@ -4759,7 +5110,14 @@ impl TitaniumSearch {
         } else {
             None
         };
-        self.order_moves_prior(ply, &mut moves[..n], tt_move, cm_move, cat_order_prior);
+        self.order_moves_prior(
+            ply,
+            &mut moves[..n],
+            tt_move,
+            cm_move,
+            prev_move,
+            cat_order_prior,
+        );
         #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if ply == 0 {
             if let Some(root_moves) = self.lazy_root_moves.as_ref() {
@@ -4782,16 +5140,25 @@ impl TitaniumSearch {
         let mut best = i32::MIN; // JS -Infinity
         let mut best_move: i16 = 0;
         let mut flag = 2;
+        // SF-history maluses need the walls that were actually SEARCHED at
+        // this node (LMP/seal-check skips must not be penalized — they were
+        // never tried, only ordered).
+        let mut searched_walls = [0i16; 160];
+        let mut searched_wall_count = 0usize;
+        // Pawn candidates are tracked separately so wall continuation history
+        // remains unchanged and only actually searched pawns receive maluses.
+        let mut searched_pawns = [0i16; 160];
+        let mut searched_pawn_count = 0usize;
 
         for i in 0..n {
             let m = moves[i];
             // frontier LMP
             if depth <= 2
                 && ply > 0
-                && i >= 10
+                && i >= if improving { 14 } else { 8 }
                 && m >= 100
                 && m != tt_move
-                && self.history_tbl[m as usize] <= 0
+                && self.move_hist(self.g.turn, m) <= 0
                 && best > -MATE + 200
             {
                 continue;
@@ -4840,6 +5207,26 @@ impl TitaniumSearch {
                     }
                 },
             );
+            // TT prefetch: the child's hash is now final; pull its TT lines
+            // toward L1 while the LMR plan / EME gates below do their work,
+            // masking the probe's memory latency inside the recursive call.
+            // Local-array TT only (lazy-SMP workers carry 1-element dummies).
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+                let local_tt = self.shared_tt.is_none();
+                #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+                let local_tt = true;
+                if local_tt {
+                    let idx = (self.g.hash_lo & self.tt_mask) as usize;
+                    unsafe {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        _mm_prefetch(self.tt_meta.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(self.tt_key_lo.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(self.tt_score.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
+                    }
+                }
+            }
             let new_depth = depth - 1;
             let result = if self.eme
                 && i > 0
@@ -5051,6 +5438,15 @@ impl TitaniumSearch {
                 self.sub_anc_hi[ply] = self.sub_anc_hi[ply + 1];
             }
             let score = result?;
+            if self.sf_history {
+                if m >= 100 {
+                    searched_walls[searched_wall_count] = m;
+                    searched_wall_count += 1;
+                } else {
+                    searched_pawns[searched_pawn_count] = m;
+                    searched_pawn_count += 1;
+                }
+            }
 
             // RaceProof(b): best non-wall root alternative
             if ply == 0 && m < 100 && score > self.root_pawn_score {
@@ -5095,6 +5491,43 @@ impl TitaniumSearch {
                                 }
                             }
                         }
+                        if self.sf_history {
+                            // Side-split gravity credit for the cutoff wall,
+                            // maluses for every wall searched before it (on a
+                            // pawn cutoff the bonus is skipped but the tried
+                            // walls still failed against "just walk" — demote
+                            // them too). Continuation history mirrors both,
+                            // keyed by the previous move.
+                            let stm = self.g.turn;
+                            let bonus = depth * depth;
+                            if m >= 100 {
+                                self.sf_hist_apply(stm, m, bonus);
+                                if prev_move > 0 {
+                                    self.cont_hist_apply(prev_move, m, bonus);
+                                }
+                            } else {
+                                self.sf_hist_apply(stm, m, bonus);
+                            }
+                            for j in 0..searched_wall_count {
+                                let pm = searched_walls[j];
+                                if pm != m {
+                                    self.sf_hist_apply(stm, pm, -bonus);
+                                    if prev_move > 0 {
+                                        self.cont_hist_apply(prev_move, pm, -bonus);
+                                    }
+                                }
+                            }
+                            // The cutoff pawn is already in this array, so the
+                            // inequality leaves its bonus intact while every
+                            // prior pawn that was truly searched gets a malus.
+                            // Skipped LMP/seal-check moves never enter it.
+                            for j in 0..searched_pawn_count {
+                                let pm = searched_pawns[j];
+                                if pm != m {
+                                    self.sf_hist_apply(stm, pm, -bonus);
+                                }
+                            }
+                        }
                         if prev_move > 0 {
                             self.cm[prev_move as usize] = m;
                         }
@@ -5112,6 +5545,24 @@ impl TitaniumSearch {
             ts += ply as i32;
         } else if ts < -(MATE - 2 * MAX_PLY as i32) {
             ts -= ply as i32;
+        }
+        // Correction history update: teach the static eval its bias on this
+        // wall structure when the search verdict can actually contradict it
+        // (SF condition: a fail-low can't prove the static was too low, a
+        // fail-high can't prove it was too high). Weight grows with depth.
+        if static_ev > -2000
+            && static_ev < 2000
+            && best > -2000
+            && best < 2000
+            && !(flag == 2 && best >= static_ev)
+            && !(flag == 1 && best <= static_ev)
+        {
+            let idx = self.wall_corr_index();
+            let stm = self.g.turn;
+            let w = (depth + 1).min(16);
+            let step = (best - static_ev) * w / 64;
+            let e = &mut self.corr_hist[stm][idx];
+            *e = ((*e as i32) + step).clamp(-CORR_MAX, CORR_MAX) as i16;
         }
         // ZeroFence-A store: claim leans on an external (path-dependent) rep-0
         let mut sf = flag;
@@ -5874,12 +6325,8 @@ impl TitaniumSearch {
         #[cfg(not(target_arch = "wasm32"))]
         let mut helper_results: Vec<(usize, ThinkResult, Vec<usize>)> = Vec::new();
         let main_allowed = filtered_by_worker[0].len();
-        let (main_root_moves, main_visit_map) = Self::lazy_smp_profile_root_moves(
-            &filtered_by_worker[0],
-            0,
-            main_allowed,
-            true,
-        );
+        let (main_root_moves, main_visit_map) =
+            Self::lazy_smp_profile_root_moves(&filtered_by_worker[0], 0, main_allowed, true);
         self.install_lazy_smp_context(
             0,
             shared_tt.clone(),
@@ -6116,6 +6563,14 @@ impl TitaniumSearch {
                 for h in self.history_tbl.iter_mut() {
                     *h >>= 1;
                 }
+                for side in self.hist_sf.iter_mut() {
+                    for h in side.iter_mut() {
+                        *h /= 2;
+                    }
+                }
+                for h in self.cont_hist.iter_mut() {
+                    *h /= 2;
+                }
             }
         }
         // RaceProof per-think solve budgets + caps
@@ -6215,6 +6670,10 @@ impl TitaniumSearch {
                 *stop_reason = "ace_over_time_budget_before_depth";
                 break;
             }
+            if !full && Self::predicted_over_time_budget(t0, time_ms, &depth_log) {
+                *stop_reason = "predicted_over_time_budget_before_depth";
+                break;
+            }
             if Instant::now() >= self.deadline {
                 *stop_reason = "deadline_before_depth";
                 break;
@@ -6227,16 +6686,33 @@ impl TitaniumSearch {
             self.stream_search_depth = d;
             let nodes_at_depth = self.nodes;
             let result = if d >= 4 && last_score > -2000 && last_score < 2000 {
-                // aspiration
-                let mut lo = last_score - 75;
-                let mut hi = last_score + 75;
+                // aspiration: graded widening (ka_ab.js-style) — a failed bound
+                // widens 4x re-centred on the fail score before falling back to
+                // fully open, so a single fail-high/low doesn't disable the
+                // window's pruning power across the whole re-search; only a
+                // second fail on the SAME side opens it.
+                const ASP_WINDOW: i32 = 75;
+                let mut lo = last_score - ASP_WINDOW;
+                let mut hi = last_score + ASP_WINDOW;
+                let mut low_fails = 0u32;
+                let mut high_fails = 0u32;
                 loop {
                     match self.ab(d, lo, hi, 0, true, 0) {
                         Ok(sc) => {
-                            if sc <= lo {
-                                lo = -INF;
-                            } else if sc >= hi {
-                                hi = INF;
+                            if sc <= lo && lo > -INF {
+                                low_fails += 1;
+                                lo = if low_fails >= 2 {
+                                    -INF
+                                } else {
+                                    sc - 4 * ASP_WINDOW
+                                };
+                            } else if sc >= hi && hi < INF {
+                                high_fails += 1;
+                                hi = if high_fails >= 2 {
+                                    INF
+                                } else {
+                                    sc + 4 * ASP_WINDOW
+                                };
                             } else {
                                 break Ok(sc);
                             }

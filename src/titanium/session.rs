@@ -23,18 +23,24 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
 
 fn build_search(engine_flag: &str, g: GameState) -> Box<TitaniumSearch> {
     // titanium-v15 = production grafted build. ace-v13-ti-pure = JS baseline yardstick.
+    let enable_sf_history = matches!(engine_flag, "titanium-v16-sfhist" | "titanium-v17");
     let mut search = match engine_flag {
         "ace-v13-pure" => TitaniumSearch::new(g),
         "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
         "titanium-v15-medium" => TitaniumSearch::grafted_medium(g, None),
         "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
-        "titanium-v16" => TitaniumSearch::grafted_v16(g, None),
+        "titanium-v16" | "titanium-v16-sfhist" | "titanium-v17" => {
+            TitaniumSearch::grafted_v16(g, None)
+        }
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
             TitaniumSearch::grafted_no_raceproof(g, None)
         }
         "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => TitaniumSearch::grafted(g, None),
         _ => TitaniumSearch::with_ti_movegen(g),
     };
+    if enable_sf_history {
+        search.set_sf_history(true);
+    }
     if engine_flag.contains("pmc") {
         search.enable_eme();
     }

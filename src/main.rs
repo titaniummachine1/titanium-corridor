@@ -76,7 +76,7 @@ fn main() {
         "rollout" => run_rollout(&args),
         "match" => run_match(&args),
         "uci" => titanium::run_uci_stdio(),
-        "session" => match ace_engine_flag(&args) {
+        "session" => match ace_engine_flag(&args).or_else(|| session_engine_flag(&args)) {
             // v15 uses the standard warm session (go TIME_SEC). session_v15 infinite
             // search is kept in-tree but disabled — it regressed vs ti-pure baseline.
             Some(flag) if uses_titanium_module(flag) => {
@@ -107,7 +107,7 @@ fn print_usage() {
         "  titanium lmr [moves...] [--time SEC] [--depth N] — root LMR plan JSON (default depth 8)"
     );
     println!(
-        "  titanium session [--engine ace-v13-ti] — long-lived REPL (TT persists between plies)"
+        "  titanium session [--engine ace-v13-ti|titanium-v17] — long-lived REPL (TT persists between plies)"
     );
     println!(
         "  titanium genmove --engine ace-v13 [moves...] — gen13 ACE port (O1 movegen; ace-v13-pure = faithful 1:1)"
@@ -1581,6 +1581,18 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
     })
 }
 
+/// Session-only A/B engine labels. They are intentionally excluded from the
+/// one-shot `genmove` label set so a session experiment cannot silently run
+/// as an ordinary production engine through a different construction path.
+fn session_engine_flag(args: &[String]) -> Option<&str> {
+    args.windows(2)
+        .find(|pair| {
+            pair[0] == "--engine"
+                && matches!(pair[1].as_str(), "titanium-v16-sfhist" | "titanium-v17")
+        })
+        .map(|pair| pair[1].as_str())
+}
+
 fn parse_threads_arg(args: &[String]) -> usize {
     let mut threads = 1usize;
     let mut i = 0usize;
@@ -1626,6 +1638,8 @@ fn uses_titanium_module(flag: &str) -> bool {
         || flag == "titanium-v14"
         || flag == "titanium-v15"
         || flag == "titanium-v16"
+        || flag == "titanium-v16-sfhist"
+        || flag == "titanium-v17"
         || flag == "titanium-v15-medium"
         || flag == "titanium-v15-frozen"
         || flag == "titanium-v15-no-raceproof"

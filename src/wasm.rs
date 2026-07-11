@@ -419,7 +419,11 @@ impl WasmEngine {
         // <=0 means "no explicit cap" — 128 is effectively unbounded (the
         // search's real ceiling is MAX_PLY=64 recursion depth regardless);
         // an explicit positive value is honored up to that same hard ceiling.
-        let effective_depth = if max_depth > 0 { max_depth.min(64) } else { 128 };
+        let effective_depth = if max_depth > 0 {
+            max_depth.min(64)
+        } else {
+            128
+        };
         let thread_count = usize::try_from(threads.max(1)).unwrap_or(1);
         #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         let result = self.search.think_with_threads(
