@@ -4178,10 +4178,9 @@ mod tests {
                                 }
                             }
                             remaining[aug] = cnt;
-                            // Vacuous AND: the (restricted) defender has no legal
-                            // response ⟹ prover win. Required for the candidate set
-                            // to stay a SUPERSET of the FULL win set.
-                            if cnt == 0 {
+                            // Vacuous AND only when the defender has no legal moves at all.
+                            // If every legal move exceeds max_slack, do not claim a prover win.
+                            if nm == 0 {
                                 win[aug] = true;
                                 q.push_back(aug as u32);
                             }
