@@ -1486,25 +1486,6 @@ pub fn is_proven_loss_score(score: i32) -> bool {
     abs >= MATE - 1_000 || (abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500)
 }
 
-/// Pack a 0/1 wall-slot byte array into a u64 bitboard (bit s = slot s occupied).
-/// ACE wall slots only ever hold 0 or 1; eight bytes gather at a time via the
-/// bit-0 multiply trick so the NNUE accumulator diff is a couple of XORs instead
-/// of a 128-slot byte scan per eval.
-#[inline]
-fn wall_slot_bits(slots: &[u8; 64]) -> u64 {
-    const LSB: u64 = 0x0101_0101_0101_0101;
-    const GATHER: u64 = 0x0102_0408_1020_4080;
-    let mut out = 0u64;
-    let mut i = 0;
-    while i < 8 {
-        let w = u64::from_le_bytes(slots[i * 8..i * 8 + 8].try_into().unwrap());
-        debug_assert!(w & !LSB == 0, "wall slot bytes must be 0/1");
-        out |= ((w & LSB).wrapping_mul(GATHER) >> 56) << (i * 8);
-        i += 1;
-    }
-    out
-}
-
 /// Proven forced win in the race or true-mate band.
 #[inline]
 pub fn is_proven_win_score(score: i32) -> bool {
@@ -4234,8 +4215,8 @@ impl TitaniumSearch {
 
     #[inline(always)]
     fn ensure_nnue_wall_accumulators(&mut self, nw: &Net, b0: i32, b1: i32) {
-        let cur_h = wall_slot_bits(&self.g.hw);
-        let cur_v = wall_slot_bits(&self.g.vw);
+        let cur_h = self.g.hw_bits;
+        let cur_v = self.g.vw_bits;
         if b0 != self.np_b0 || b1 != self.np_b1v {
             crate::bench_instr::record(
                 |b| &mut b.nnue_full_refresh,
