@@ -4,6 +4,7 @@ pub mod alphabeta;
 pub mod cat_index_lmr;
 pub mod context;
 pub mod deprecated;
+pub mod endgame_cert;
 pub mod genmove;
 pub mod greedy;
 pub mod lmr_profile;

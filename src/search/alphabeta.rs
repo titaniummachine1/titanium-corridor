@@ -15,6 +15,7 @@ use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
 use crate::path::BfsScratch;
 use crate::search::cat_index_lmr::cat_index_lmr_reduction;
+use crate::search::endgame_cert::EndgameCert;
 use crate::search::lmr_profile::{
     apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
     MateStopReason, MateZoneState,
@@ -25,6 +26,9 @@ use crate::search::session::GameSearchSession;
 use crate::util::grid::is_goal;
 use crate::util::perft::format_move;
 
+/// Compatibility re-export for existing match diagnostics.
+pub use crate::search::endgame_cert::CERT_PROOFS;
+
 const MATE: i32 = 20_000;
 const MATE_WINDOW: i32 = 500;
 /// Default iterative-deepening ceiling (u8-friendly 256). Same as recursion stack cap.
@@ -33,25 +37,6 @@ pub const DEFAULT_MAX_ID_DEPTH: u32 = 256;
 const MAX_PLY: u32 = DEFAULT_MAX_ID_DEPTH;
 const CM_PER_SQUARE: i32 = 100;
 const MAX_EVAL: i32 = 10_000;
-/// Proven-win score from the v13 endgame certificate. Above any static eval
-/// (`MAX_EVAL`) so a certified line dominates ordinary evaluation, but below the
-/// mate window (`MATE - MATE_WINDOW`) so a real forced mate still outranks it and
-/// mate-distance logic never mistakes a certificate for a mate-in-N.
-const CERT_WIN: i32 = 15_000;
-/// Within-outcome ordering band. The proof fixes the outcome CLASS (win ≫ draw ≫
-/// loss); inside a class the engine's OWN static eval (clamped to ±this) orders
-/// moves, so it plays the materially best move — converting a win and being a
-/// "stubborn loser" (keep racing, obstruct) rather than wandering. Bounded so the
-/// class always dominates and scores stay inside `(MAX_EVAL, mate-window)`.
-const CERT_BAND: i32 = 4_000;
-/// Only consult the (expensive) proof when the race is this close — within this
-/// many tempo a pawn jump can flip win↔loss and the static `dMe<=dOpp` eval can
-/// be wrong. With a wider margin the distance eval is correct, so we trust it and
-/// skip the proof (keeps search fast: neither optimistic nor pessimistic waste).
-const CERT_TEMPO_MARGIN: i32 = 2;
-/// Count of endgame certificate proofs (win or loss) returned this process —
-/// observability for strength matches. Not used by the search itself.
-pub static CERT_PROOFS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const WALL_INVENTORY_CM: i32 = 12;
 const PAWN_PROGRESS_CM: i32 = 6;
 const RACE_LEAD_CM: i32 = 15;
@@ -213,49 +198,6 @@ struct SearchState<'a> {
     last_iter_score_delta: i32,
     /// v13 endgame win-certificate state (see `endgame_cert_floor`).
     cert: EndgameCert,
-}
-
-/// Endgame guaranteed-win/loss proof oracle (v13 `certify_win` via
-/// `titanium::cert_bridge`). Caches verdicts by (hash, side) and bounds total
-/// certify attempts per search so the cost stays negligible.
-struct EndgameCert {
-    enabled: bool,
-    /// Per-attempt certify node budget.
-    budget: u64,
-    /// Max certify *attempts* per whole search (cache hits are free and uncapped).
-    cap: u32,
-    calls: u32,
-    /// (board hash, stm as u8) → proven side (`0`/`1`) or `2` = not provable here.
-    cache: std::collections::HashMap<(u64, u8), u8>,
-    // (oracle removed: replaced by race_minimax — lazy forward search, cheaper
-    //  for the small volatile-position subset than full 13k retrograde build)
-}
-
-impl EndgameCert {
-    fn new(override_: Option<bool>) -> Self {
-        // ON by default: path-aware classifier measured +85 Elo at 2s/move.
-        // Set TITANIUM_ENDGAME_CERT=0 to disable, or pass Some(false) via SearchConfig.
-        let enabled = override_.unwrap_or_else(|| {
-            std::env::var("TITANIUM_ENDGAME_CERT")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        });
-        let budget = std::env::var("TITANIUM_CERT_BUDGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1200);
-        let cap = std::env::var("TITANIUM_CERT_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
-        Self {
-            enabled,
-            budget,
-            cap,
-            calls: 0,
-            cache: std::collections::HashMap::new(),
-        }
-    }
 }
 
 /// Score a repeated position: draw when racing evenly; penalize shuffles when behind.
@@ -651,125 +593,18 @@ fn terminal_score(ply: u32) -> i32 {
     -MATE + ply as i32
 }
 
-/// Leaf score: stand-pat eval plus at most one ply of **forward pawn** pushes.
-/// Wall quiescence was removed (too expensive, fought LMR); this fixes the
-/// odd/even depth oscillation (0 / −1.21 / 0 / …) in symmetric pawn races.
-/// Endgame exact-outcome floor (v13 `certify_win` + v14.1 hands-empty oracle).
+/// Ask the bounded endgame certificate for a solved leaf score.
 ///
-/// The leaf is treated as a TERMINAL (solved) position: the proof gives the exact
-/// win/loss/draw, and we score it in a dominant outcome band while keeping the
-/// engine's own static eval (clamped) as the within-class ordering — so a proven
-/// win is converted and a proven loss is played as a "stubborn loser" (materially
-/// best move, keep racing), and the search NEVER goes blind to a losing leaf.
-///
-/// COST CONTROL: the proof only runs when the race is within `CERT_TEMPO_MARGIN`
-/// (a pawn jump can flip the result there and the static `dMe<=dOpp` eval can be
-/// wrong). With a wider margin the distance eval is already correct, so we return
-/// `None` and let normal eval stand — keeping search fast (no per-leaf proof tax).
+/// The certificate owns its cache and attempt budget. `None` leaves normal static
+/// evaluation untouched; a returned score retains static-eval ordering inside its
+/// proven win or loss class.
 fn endgame_cert_floor(
     state: &mut SearchState<'_>,
     board: &Board,
     stm: Player,
     static_eval: i32,
 ) -> Option<i32> {
-    if !state.cert.enabled {
-        return None; // off by default → zero overhead (no extra dist/proof work)
-    }
-
-    // Outcome class dominates; static eval (clamped) orders within the class so we
-    // play the materially best move (convert / stubborn-defend), never blind.
-    let band = static_eval.clamp(-CERT_BAND, CERT_BAND);
-    let win = CERT_WIN + band;
-    let loss = -CERT_WIN + band;
-
-    // ── Hands-empty: path-aware tempo classifier, exact oracle only if volatile ─
-    // No walls left ⇒ a pure pawn race. Most positions resolve DETERMINISTICALLY
-    // (lead ≥2, or lead ≤1 with non-overlapping shortest paths) — no proof. Only
-    // when the paths overlap AND the lead is ≤1 tempo can a jump flip the result;
-    // there (and only there) we pay for the exact retrograde oracle.
-    if board.walls_remaining[0] == 0 && board.walls_remaining[1] == 0 {
-        use crate::titanium::cert_bridge::{hands_empty_race, RaceVerdict};
-        let mut g = crate::titanium::cert_bridge::titanium_game_from_board(board);
-        match hands_empty_race(&g) {
-            RaceVerdict::Win => {
-                CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(win);
-            }
-            RaceVerdict::Loss => {
-                CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(loss);
-            }
-            RaceVerdict::NeedsProof => match crate::titanium::cert_bridge::race_minimax(&mut g) {
-                crate::titanium::cert_bridge::RaceProof::Win => {
-                    CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Some(win);
-                }
-                crate::titanium::cert_bridge::RaceProof::Loss => {
-                    CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Some(loss);
-                }
-                crate::titanium::cert_bridge::RaceProof::Unknown => return None,
-            },
-        }
-    }
-
-    // Experimental wall-ignorance corridor certificate (feature-gated, default off).
-    if board.walls_remaining[0] + board.walls_remaining[1] > 0 {
-        if let Some(verdict) =
-            crate::titanium::wall_ignore_cert::try_wall_ignore_cert_board(board, false)
-        {
-            CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Some(crate::titanium::wall_ignore_cert::cert_score_from_player(
-                &verdict, stm,
-            ));
-        }
-    }
-
-    // ── 1–2 walls: v13 certificate (sound, incomplete), tempo-gated ──────────
-    let our_dist = state
-        .bfs
-        .shortest_distance(board, stm)
-        .unwrap_or(DIST_PENALTY);
-    let opp_dist = state
-        .bfs
-        .shortest_distance(board, stm.opposite())
-        .unwrap_or(DIST_PENALTY);
-    if (our_dist as i32 - opp_dist as i32).abs() > CERT_TEMPO_MARGIN {
-        return None;
-    }
-    let stm_walls = board.walls_remaining[stm as usize];
-    if stm_walls > 2 || static_eval.abs() >= 3_000 {
-        return None;
-    }
-    let key = (board.hash, stm as u8);
-    let proven = if let Some(&cached) = state.cert.cache.get(&key) {
-        cached
-    } else {
-        if state.cert.calls >= state.cert.cap {
-            return None; // attempt budget spent; only cached verdicts remain free
-        }
-        state.cert.calls += 1;
-        let verdict =
-            crate::titanium::cert_bridge::certify_board(board, state.cert.budget, 0, None);
-        let code = match verdict {
-            Some(Player::One) => 0u8,
-            Some(Player::Two) => 1u8,
-            None => 2u8,
-        };
-        state.cert.cache.insert(key, code);
-        code
-    };
-    match proven {
-        2 => None,
-        side if side == stm as u8 => {
-            CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(win)
-        }
-        _ => {
-            CERT_PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(loss) // opponent's win is proven ⇒ stm is lost (scored, not blind)
-        }
-    }
+    state.cert.score_for(board, stm, static_eval, state.bfs)
 }
 
 fn leaf_eval(
