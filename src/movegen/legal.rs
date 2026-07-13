@@ -8,7 +8,7 @@ use crate::movegen::pawn_bits::{
     generate_pawn_moves_bitboard_with_masks, generate_pawn_moves_shift_slice,
 };
 use crate::path::masks::DirMasks;
-use crate::path::parallel::{pawn_bit, pbff_wall_legal, wall_delta, WallGrids};
+use crate::path::parallel::{bff_wall_legal_with_proof, pawn_bit, wall_delta, WallGrids};
 use crate::path::BfsScratch;
 use crate::util::grid::{can_step, has_wall};
 const DIRS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
@@ -551,6 +551,7 @@ struct WallTrialCtx {
     grids: WallGrids,
     p1_bit: u128,
     p2_bit: u128,
+    proof: u128,
 }
 
 impl WallTrialCtx {
@@ -561,17 +562,25 @@ impl WallTrialCtx {
             grids: WallGrids::from_board(board),
             p1_bit: pawn_bit(r1, c1),
             p2_bit: pawn_bit(r2, c2),
+            proof: 0,
         }
     }
 
     /// Speculative trial: place the wall's blocked-edge delta, run binary flood fill
-    /// for both players (`pbff_wall_legal`; P2 reuses P1 visited bits), roll back.
+    /// for both players (P2 reuses P1's visited bits), then roll back.
     #[inline]
     fn wall_keeps_paths_open(&mut self, row: u8, col: u8, orientation: WallOrientation) -> bool {
         let delta = wall_delta(row, col, orientation);
+        if self.proof != 0 && !delta.touches(self.proof) {
+            crate::bench_instr::bump(|b| &mut b.wall_proof_skip);
+            return true;
+        }
         self.grids.place(delta);
-        let ok = pbff_wall_legal(self.p1_bit, self.p2_bit, &self.grids);
+        let (ok, proof) = bff_wall_legal_with_proof(self.p1_bit, self.p2_bit, &self.grids);
         self.grids.remove(delta);
+        if ok {
+            self.proof = proof;
+        }
         ok
     }
 }

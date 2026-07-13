@@ -164,6 +164,12 @@ impl WallGrids {
         self.north &= !delta.north;
         self.south &= !delta.south;
     }
+
+    /// Whether this wall delta blocks an edge incident to `squares`.
+    #[inline]
+    pub fn touches(&self, squares: u128) -> bool {
+        (self.east | self.west | self.north | self.south) & squares != 0
+    }
 }
 
 /// Blocked-step delta for one wall (internal slot coords, row/col in 0..8).
@@ -212,28 +218,40 @@ pub fn pbff_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) 
 /// goal-tested — POC fix #4), so shared corridors are never re-flooded.
 #[inline]
 pub fn pbff_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u128) -> bool {
+    bff_to_goal_cached_with_visited(start, cache, grids, goal).0
+}
+
+/// Cached second-player flood, including every square reached before success.
+/// When the wave meets `cache`, bit stealing annexes that entire reached set.
+#[inline]
+pub fn bff_to_goal_cached_with_visited(
+    start: u128,
+    cache: u128,
+    grids: &WallGrids,
+    goal: u128,
+) -> (bool, u128) {
     let mut visited = start & FLOOD_PLAYABLE;
     if visited & goal != 0 {
-        return true;
+        return (true, visited);
     }
     let mut wave = visited;
     let mut pool = cache & !visited;
     while wave != 0 {
         if wave & pool != 0 {
-            if pool & goal != 0 {
-                return true;
-            }
             visited |= pool;
             wave |= pool;
             pool = 0;
+            if visited & goal != 0 {
+                return (true, visited);
+            }
         }
         wave = expand_wave(wave, grids) & !visited;
-        if wave & goal != 0 {
-            return true;
-        }
         visited |= wave;
+        if wave & goal != 0 {
+            return (true, visited);
+        }
     }
-    false
+    (false, visited)
 }
 
 /// Wall legality via binary flood fill: both players must reach their goal row
@@ -241,11 +259,26 @@ pub fn pbff_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u1
 /// player 2 floods with visited-bit reuse. Either flood stagnating ⇒ illegal wall.
 #[inline]
 pub fn pbff_wall_legal(p1_start: u128, p2_start: u128, grids: &WallGrids) -> bool {
+    bff_wall_legal_with_proof(p1_start, p2_start, grids).0
+}
+
+/// Wall legality plus the union of both successful flood proofs.
+#[inline]
+pub fn bff_wall_legal_with_proof(
+    p1_start: u128,
+    p2_start: u128,
+    grids: &WallGrids,
+) -> (bool, u128) {
     let (ok1, p1_visited) = pbff_to_goal(p1_start, grids, P1_GOAL_BITS);
     if !ok1 {
-        return false;
+        return (false, 0);
     }
-    pbff_to_goal_cached(p2_start, p1_visited, grids, P2_GOAL_BITS)
+    let (ok2, p2_visited) =
+        bff_to_goal_cached_with_visited(p2_start, p1_visited, grids, P2_GOAL_BITS);
+    if !ok2 {
+        return (false, 0);
+    }
+    (true, p1_visited | p2_visited)
 }
 
 /// Convenience wrapper for one-off queries (oracle / replay validation).
