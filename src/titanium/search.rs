@@ -23,7 +23,7 @@ use crate::titanium::dist::{
     fill_ace_dist_from_pawn, fill_ace_dist_layers_to_goal_p0, fill_ace_dist_layers_to_goal_p1,
     fill_ace_dist_to_goal_with_masks_p0, fill_ace_dist_to_goal_with_masks_p1, fill_choke_points,
     fill_contested, fill_corridor_delta, fill_sparse_route_masks, materialize_distance_layers,
-    shortest_route_bits, width_in_layers,
+    shortest_route_bits, wall_incr_refresh_flags, width_in_layers,
 };
 use crate::titanium::move_id_to_board;
 use crate::util::clock::{Duration, Instant};
@@ -1949,6 +1949,9 @@ pub struct TitaniumSearch {
     dist0_idx: usize, // active ply slot in d0 (JS: this.dist0 array ref)
     dist1_idx: usize,
     cached_stamp: i32,
+    /// After `cat_path_lmr` refresh at `ply+1`, child `ab(ply+1)` may reuse it.
+    pending_cat_child_ply: Option<usize>,
+    ab_after_cat_child: bool,
     dir_masks_key_lo: u32,
     dir_masks_key_hi: u32,
     dir_masks_cache: DirMasks,
@@ -1977,6 +1980,9 @@ pub struct TitaniumSearch {
     /// Opt-in CAT path-aware correction for the wall-LMR branch only. The
     /// correction can only reduce v16's existing reduction by one ply.
     cat_path_lmr: bool,
+    /// Skip CAT `refresh_dist` when the wall cuts neither shortest-path edge.
+    /// Enabled with `cat_path_lmr` on v17 after oracle + parity validation.
+    cat_no_edge_skip: bool,
     /// Ka-AB-style horizon quiescence: extend one ply at depth<=0 when a wall
     /// fight or jump race is tactically noisy. Off by default.
     q_search: bool,
@@ -2212,6 +2218,8 @@ impl TitaniumSearch {
             dist0_idx: 0,
             dist1_idx: 0,
             cached_stamp: -1,
+            pending_cat_child_ply: None,
+            ab_after_cat_child: false,
             dir_masks_key_lo: u32::MAX,
             dir_masks_key_hi: u32::MAX,
             dir_masks_cache: DirMasks::default(),
@@ -2230,6 +2238,7 @@ impl TitaniumSearch {
             cat_lmr_fringe_pct: crate::cat::CAT_V16_FRINGE_PCT_DEFAULT,
             route_touch_ordering: false,
             cat_path_lmr: false,
+            cat_no_edge_skip: false,
             q_search: false,
             q_max: Q_SEARCH_MAX_DEFAULT,
             q_swing_cp: Q_SWING_CP_DEFAULT,
@@ -2361,6 +2370,14 @@ impl TitaniumSearch {
 
     pub fn enable_cat_path_lmr(&mut self) {
         self.cat_path_lmr = true;
+    }
+
+    pub fn enable_cat_no_edge_skip(&mut self) {
+        self.cat_no_edge_skip = true;
+    }
+
+    pub fn cat_no_edge_skip_enabled(&self) -> bool {
+        self.cat_no_edge_skip
     }
 
     pub fn cat_path_lmr_enabled(&self) -> bool {
@@ -2868,7 +2885,7 @@ impl TitaniumSearch {
     /// parity harness to confirm the Python forward pass matches the engine.
     pub fn eval_position(&mut self) -> i32 {
         self.position_changed();
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_EVAL_POSITION);
         self.evaluate(0)
     }
 
@@ -2940,7 +2957,7 @@ impl TitaniumSearch {
 
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn ordered_root_moves_snapshot(&mut self, depth: i32) -> Vec<i16> {
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_LAZY_ROOT);
         if self.bridge.is_some() {
             self.bridge = Some(TiBridge::from_game(&self.g));
         }
@@ -3045,6 +3062,7 @@ impl TitaniumSearch {
         worker.cat_lmr_fringe_pct = self.cat_lmr_fringe_pct;
         worker.route_touch_ordering = self.route_touch_ordering;
         worker.cat_path_lmr = self.cat_path_lmr;
+        worker.cat_no_edge_skip = self.cat_no_edge_skip;
         worker.q_search = self.q_search;
         worker.q_max = self.q_max;
         worker.q_swing_cp = self.q_swing_cp;
@@ -3139,7 +3157,7 @@ impl TitaniumSearch {
 
     pub fn eval_dump_json(&mut self) -> String {
         self.position_changed();
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_EVAL_DUMP);
         let net_eval = self.compute_net_eval_trace().eval;
         let eval = self.evaluate(0);
         let d0_scalar = self.d0[self.dist0_idx][self.g.pawn[0]];
@@ -3281,7 +3299,7 @@ impl TitaniumSearch {
     /// Parity harness only: net eval intermediates without changing ``evaluate()``.
     pub fn eval_parity_trace_json(&mut self) -> String {
         self.position_changed();
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_EVAL_PARITY);
         let trace = self.compute_net_eval_trace();
         let f64s = |arr: &[f64]| {
             let mut s = String::new();
@@ -3499,7 +3517,7 @@ impl TitaniumSearch {
         }
         self.stream_last_emit_ms = elapsed_ms;
         self.stream_last_emit_nodes = self.nodes;
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_PROGRESS);
         let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
         let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
         let elapsed_ms = self.stream_t0.elapsed().as_millis() as u64;
@@ -3693,7 +3711,84 @@ impl TitaniumSearch {
     }
 
     fn refresh_dist(&mut self, ply: usize) {
-        crate::bench_instr::record(|b| &mut b.refresh_dist, || self.refresh_dist_inner(ply))
+        self.refresh_dist_site(ply, crate::bench_instr::REFRESH_SITE_UNKNOWN);
+    }
+
+    fn refresh_dist_site(&mut self, ply: usize, site: u8) {
+        #[cfg(feature = "bench-instrument")]
+        {
+            crate::bench_instr::refresh_site_call_start(site);
+            let t0 = std::time::Instant::now();
+            self.refresh_dist_inner(ply);
+            crate::bench_instr::refresh_site_call_end(site, t0.elapsed());
+        }
+        #[cfg(not(feature = "bench-instrument"))]
+        {
+            let _ = site;
+            self.refresh_dist_inner(ply);
+        }
+    }
+
+    fn refresh_ab_skip_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("TITANIUM_REFRESH_AB_SKIP").is_some())
+    }
+
+    fn cat_child_dist_reuse_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("TITANIUM_CAT_CHILD_DIST_REUSE").is_some())
+    }
+
+    fn should_skip_cat_no_edge_refresh(&self) -> bool {
+        if !self.cat_path_lmr {
+            return false;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Ok(v) = std::env::var("TITANIUM_CAT_NO_EDGE_SKIP") {
+                if v == "0" || v.eq_ignore_ascii_case("false") {
+                    return false;
+                }
+                if v == "1" || v.eq_ignore_ascii_case("true") {
+                    return true;
+                }
+            }
+        }
+        self.cat_no_edge_skip
+    }
+
+    fn dist_indices_valid_for_current_topology(&self) -> bool {
+        let (k_lo, k_hi) = self.wall_topology_key();
+        let wkey = (k_hi as u64) << 32 | k_lo as u64;
+        self.d0_key[self.dist0_idx] == wkey && self.d1_key[self.dist1_idx] == wkey
+    }
+
+    fn dist_refresh_already_valid(&self) -> bool {
+        self.cached_stamp == self.g.wall_stamp && self.dist_indices_valid_for_current_topology()
+    }
+
+    fn maybe_refresh_dist_at_ab(&mut self, ply: usize) {
+        let after_cat = self.pending_cat_child_ply == Some(ply);
+        if after_cat {
+            self.pending_cat_child_ply = None;
+            self.ab_after_cat_child = true;
+            crate::bench_instr::bump_u64(|b| &mut b.cat_child_ab_entries);
+            if self.cached_stamp == self.g.wall_stamp {
+                crate::bench_instr::bump_u64(|b| &mut b.cat_child_ab_dup_valid);
+                if Self::cat_child_dist_reuse_enabled() || Self::refresh_ab_skip_enabled() {
+                    crate::bench_instr::bump_u64(|b| &mut b.cat_child_ab_dup_avoided);
+                    return;
+                }
+                crate::bench_instr::bump_u64(|b| &mut b.cat_child_ab_dup_refresh);
+            }
+        } else {
+            self.ab_after_cat_child = false;
+            if Self::refresh_ab_skip_enabled() && self.dist_refresh_already_valid() {
+                crate::bench_instr::bump_ab_refresh_skipped();
+                return;
+            }
+        }
+        self.refresh_dist_site(ply, crate::bench_instr::REFRESH_SITE_AB);
     }
 
     /// Copy one player's fields for `wkey` from the topology cache into ply slot.
@@ -3778,7 +3873,7 @@ impl TitaniumSearch {
     fn refresh_dist_inner(&mut self, ply: usize) {
         let stamp = self.g.wall_stamp;
         if self.cached_stamp == stamp {
-            crate::bench_instr::bump(|b| &mut b.refresh_cheap);
+            crate::bench_instr::refresh_site_path(0);
             return; // refs already valid for these walls
         }
         if self.cached_stamp == stamp - 1 && self.g.hist_len > 0 {
@@ -3787,21 +3882,15 @@ impl TitaniumSearch {
             // (|dist diff| === 1); equal-dist edges lie on no shortest path.
             let m = self.g.hist_m[self.g.hist_len - 1];
             if m >= 100 {
-                let slot = (m % 100) as usize;
-                let a = (slot >> 3) * 9 + (slot & 7);
-                let (b2, c2, e2) = if m < 200 {
-                    (a + 9, a + 1, a + 10) // hw: two vertical edges
-                } else {
-                    (a + 1, a + 9, a + 10) // vw: two horizontal edges
-                };
-                let refresh0 = {
-                    let d0 = &self.d0[self.dist0_idx];
-                    d0[a] != d0[b2] || d0[c2] != d0[e2]
-                };
-                let refresh1 = {
-                    let d1 = &self.d1[self.dist1_idx];
-                    d1[a] != d1[b2] || d1[c2] != d1[e2]
-                };
+                let (refresh0, refresh1) =
+                    wall_incr_refresh_flags(&self.d0[self.dist0_idx], &self.d1[self.dist1_idx], m);
+                if !refresh0
+                    && !refresh1
+                    && crate::bench_instr::active_refresh_site()
+                        == crate::bench_instr::REFRESH_SITE_CAT_PATH_LMR
+                {
+                    crate::bench_instr::bump_u64(|b| &mut b.cat_incr_no_edge_cut);
+                }
                 let masks = if refresh0 || refresh1 {
                     Some(self.current_dir_masks())
                 } else {
@@ -3824,7 +3913,7 @@ impl TitaniumSearch {
                         self.d0_key[ply] = wkey;
                         if !self.dist_lru_load(wkey, ply, 0) {
                             reflooded = true;
-                            crate::bench_instr::bump(|b| &mut b.dist_reflood);
+                            crate::bench_instr::refresh_site_reflood();
                             if self.net.route_active {
                                 self.d0_layer_depth[ply] = fill_ace_dist_layers_to_goal_p0(
                                     masks.expect("refresh masks"),
@@ -3850,7 +3939,7 @@ impl TitaniumSearch {
                         self.d1_key[ply] = wkey;
                         if !self.dist_lru_load(wkey, ply, 1) {
                             reflooded = true;
-                            crate::bench_instr::bump(|b| &mut b.dist_reflood);
+                            crate::bench_instr::refresh_site_reflood();
                             if self.net.route_active {
                                 self.d1_layer_depth[ply] = fill_ace_dist_layers_to_goal_p1(
                                     masks.expect("refresh masks"),
@@ -3873,12 +3962,12 @@ impl TitaniumSearch {
                 if reflooded {
                     self.dist_lru_store(wkey);
                 }
-                crate::bench_instr::bump(|b| &mut b.refresh_incr);
+                crate::bench_instr::refresh_site_path(1);
                 self.cached_stamp = stamp;
                 return;
             }
         }
-        crate::bench_instr::bump(|b| &mut b.refresh_full);
+        crate::bench_instr::refresh_site_path(2);
         self.dist0_idx = ply; // own arrays: ancestors stay intact
         self.dist1_idx = ply;
         let wkey = {
@@ -3897,10 +3986,10 @@ impl TitaniumSearch {
         let d1_todo = !d1_ok && !self.dist_lru_load(wkey, ply, 1);
         if d0_todo || d1_todo {
             if d0_todo {
-                crate::bench_instr::bump(|b| &mut b.dist_reflood);
+                crate::bench_instr::refresh_site_reflood();
             }
             if d1_todo {
-                crate::bench_instr::bump(|b| &mut b.dist_reflood);
+                crate::bench_instr::refresh_site_reflood();
             }
             let masks = self.current_dir_masks();
             crate::bench_instr::record(
@@ -4672,7 +4761,7 @@ impl TitaniumSearch {
                 -1_000_000 - my_v
             };
             self.g.make_move(c);
-            self.refresh_dist(0);
+            self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_RACE_PICK);
             let d_me = if me == 0 {
                 self.d0[self.dist0_idx][self.g.pawn[0]] as i32
             } else {
@@ -4749,10 +4838,12 @@ impl TitaniumSearch {
             } else {
                 // lazy: geometry only; path-seal checked when the move is searched
                 if self.g.wall_fits(0, slot) {
+                    crate::titanium::lazy_seal::lazy_seal_record_wall_generated();
                     out[n] = 100 + slot as i16;
                     n += 1;
                 }
                 if self.g.wall_fits(1, slot) {
+                    crate::titanium::lazy_seal::lazy_seal_record_wall_generated();
                     out[n] = 200 + slot as i16;
                     n += 1;
                 }
@@ -5062,11 +5153,14 @@ impl TitaniumSearch {
         let d0_now = self.d0[self.dist0_idx][p0];
         let d1_now = self.d1[self.dist1_idx][p1];
         self.g.unmake_move();
-        self.refresh_dist(ply.saturating_sub(1));
+        self.refresh_dist_site(
+            ply.saturating_sub(1),
+            crate::bench_instr::REFRESH_SITE_QSEARCH_UNMAKE,
+        );
         let d0_was = self.d0[self.dist0_idx][p0];
         let d1_was = self.d1[self.dist1_idx][p1];
         self.g.make_move(wall_move);
-        self.refresh_dist(ply);
+        self.refresh_dist_site(ply, crate::bench_instr::REFRESH_SITE_QSEARCH_REMAKE);
         d0_now != d0_was || d1_now != d1_was
     }
 
@@ -5148,7 +5242,7 @@ impl TitaniumSearch {
             }
         }
 
-        self.refresh_dist(ply);
+        self.maybe_refresh_dist_at_ab(ply);
         let nd0 = self.dist0_idx; // restored on every unmake
         let nd1 = self.dist1_idx;
         let nst = self.cached_stamp;
@@ -5231,6 +5325,11 @@ impl TitaniumSearch {
                     let tt_rep = self.tt_rep[idx];
                     if tt_rep == 0 {
                         crate::bench_instr::bump(|b| &mut b.tt_cutoff);
+                        if self.ab_after_cat_child {
+                            crate::bench_instr::bump_u64(|b| {
+                                &mut b.cat_child_ab_tt_cutoff_before_eval
+                            });
+                        }
                         return Ok(es);
                     }
                     // tainted-zero entry: PLAIN ZeroFence ships with the anchor
@@ -5440,6 +5539,18 @@ impl TitaniumSearch {
             cat_heats[i] = heat_by_id[moves[i] as usize];
         }
 
+        let lazy_walls_active =
+            ply > 0 && !(self.ti_movegen && !self.cat_walls && !self.dead_zone_prune);
+        let lazy_seal_mode = crate::titanium::lazy_seal::LazySealMode::from_env();
+        let mut lazy_seal = if lazy_walls_active {
+            Some(crate::titanium::lazy_seal::LazySealNode::from_game(
+                &self.g,
+                lazy_seal_mode,
+            ))
+        } else {
+            None
+        };
+
         let mut best = i32::MIN; // JS -Infinity
         let mut best_move: i16 = 0;
         let mut flag = 2;
@@ -5478,15 +5589,11 @@ impl TitaniumSearch {
             // The CAT and dead-zone paths both emit geometry-only (pseudo-legal)
             // walls, so they STILL need the seal check — only the pure ti_movegen
             // path (full legal gen) can skip it.
-            let lazy_walls = !(self.ti_movegen && !self.cat_walls && !self.dead_zone_prune);
-            if m >= 100 && ply > 0 && lazy_walls {
-                let wt = if m < 200 { 0 } else { 1 };
-                let slot = (m % 100) as usize;
-                if self.g.wall_needs_path_check(wt, slot) {
-                    self.g.set_wall_bits(wt, slot, true);
-                    let paths_ok = self.g.has_path(0) && self.g.has_path(1);
-                    self.g.set_wall_bits(wt, slot, false);
-                    if !paths_ok {
+            if m >= 100 {
+                if let Some(seal) = lazy_seal.as_mut() {
+                    let wt = if m < 200 { 0 } else { 1 };
+                    let slot = (m % 100) as usize;
+                    if !seal.allows_lazy_wall(&mut self.g, wt, slot) {
                         continue; // sealing wall: pseudo-legal only
                     }
                 }
@@ -5579,27 +5686,46 @@ impl TitaniumSearch {
                 };
                 let path_plan =
                     if self.cat_path_lmr && cat_lmr_active && v16_plan.final_reduction > 0 {
-                        // This is deliberately the only experiment-specific
-                        // distance refresh in the candidate pipeline. Defaults
-                        // retain the v16 no-refresh behavior above.
-                        self.refresh_dist(ply + 1);
-                        let post_d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
-                        let post_d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
-                        let (pre_our, pre_opp, post_our, post_opp) = if mover == 0 {
-                            (pre_d0, pre_d1, post_d0, post_d1)
-                        } else {
-                            (pre_d1, pre_d0, post_d1, post_d0)
-                        };
-                        let (_, _, race_gain) = crate::search::cat_index_lmr::compute_race_gain(
-                            pre_our, pre_opp, post_our, post_opp,
+                        crate::bench_instr::bump_u64(|b| &mut b.cat_edge_test_calls);
+                        let (refresh0, refresh1) = wall_incr_refresh_flags(
+                            &self.d0[self.dist0_idx],
+                            &self.d1[self.dist1_idx],
+                            m,
                         );
-                        apply_lmr_path_correction(
-                            v16_plan.final_reduction.max(0) as u32,
-                            new_depth.max(0) as u32,
-                            race_gain,
-                            attention_ratio,
-                            false,
-                        )
+                        if self.should_skip_cat_no_edge_refresh() && !refresh0 && !refresh1 {
+                            crate::bench_instr::bump_u64(|b| &mut b.cat_no_edge_skip);
+                            apply_lmr_path_correction(
+                                v16_plan.final_reduction.max(0) as u32,
+                                new_depth.max(0) as u32,
+                                0,
+                                attention_ratio,
+                                false,
+                            )
+                        } else {
+                            // Distance refresh needed for exact race_gain scalars.
+                            self.refresh_dist_site(
+                                ply + 1,
+                                crate::bench_instr::REFRESH_SITE_CAT_PATH_LMR,
+                            );
+                            self.pending_cat_child_ply = Some(ply + 1);
+                            let post_d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
+                            let post_d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
+                            let (pre_our, pre_opp, post_our, post_opp) = if mover == 0 {
+                                (pre_d0, pre_d1, post_d0, post_d1)
+                            } else {
+                                (pre_d1, pre_d0, post_d1, post_d0)
+                            };
+                            let (_, _, race_gain) = crate::search::cat_index_lmr::compute_race_gain(
+                                pre_our, pre_opp, post_our, post_opp,
+                            );
+                            apply_lmr_path_correction(
+                                v16_plan.final_reduction.max(0) as u32,
+                                new_depth.max(0) as u32,
+                                race_gain,
+                                attention_ratio,
+                                false,
+                            )
+                        }
                     } else {
                         apply_lmr_path_correction(
                             v16_plan.final_reduction.max(0) as u32,
@@ -6078,7 +6204,7 @@ impl TitaniumSearch {
         let mut best_opp_dist_after = i32::MIN;
         let mut best_order = 0usize;
 
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_ROOT_DEF_INIT);
         let own_dist_before: i32 = if root_side == 0 {
             self.d0[self.dist0_idx][self.g.pawn[0]] as i32
         } else {
@@ -6092,7 +6218,7 @@ impl TitaniumSearch {
             let m = moves[i];
             let nodes_before = self.nodes;
 
-            self.refresh_dist(0);
+            self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_ROOT_DEF_BEFORE);
             let nd0 = self.dist0_idx;
             let nd1 = self.dist1_idx;
             let nst = self.cached_stamp;
@@ -6109,7 +6235,7 @@ impl TitaniumSearch {
                     }
                 },
             );
-            self.refresh_dist(1);
+            self.refresh_dist_site(1, crate::bench_instr::REFRESH_SITE_ROOT_DEF_AFTER);
             let static_eval = {
                 let ev = self.evaluate(0);
                 if self.g.turn == root_side {
@@ -6247,7 +6373,7 @@ impl TitaniumSearch {
             }
             let m = moves[i];
 
-            self.refresh_dist(0);
+            self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_ROOT_WIN_BEFORE);
             let nd0 = self.dist0_idx;
             let nd1 = self.dist1_idx;
             let nst = self.cached_stamp;
@@ -6264,7 +6390,7 @@ impl TitaniumSearch {
                     }
                 },
             );
-            self.refresh_dist(1);
+            self.refresh_dist_site(1, crate::bench_instr::REFRESH_SITE_ROOT_WIN_AFTER);
             let static_eval = {
                 let ev = self.evaluate(0);
                 if self.g.turn == root_side {
@@ -6336,7 +6462,7 @@ impl TitaniumSearch {
         let mut stop_reason: &'static str = "unknown";
         if let Some(direct_mv) = self.prepare_opening_book_at_root() {
             let t0 = Instant::now();
-            self.refresh_dist(0);
+            self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_OPENING);
             return ThinkResult {
                 mv: direct_mv,
                 score: 0,
@@ -6397,7 +6523,7 @@ impl TitaniumSearch {
                         1 + d_me[self.g.pawn[me]] as i32
                     }
                 };
-                self.refresh_dist(0);
+                self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_CHEAP_CERT);
                 let d_me_i = if me == 0 {
                     self.d0[self.dist0_idx][self.g.pawn[0]] as i32
                 } else {
@@ -6429,7 +6555,7 @@ impl TitaniumSearch {
 
             if best_m >= 0 {
                 self.rp_root_solves += 1;
-                self.refresh_dist(0);
+                self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_CHEAP_CERT);
                 let rk = best_v.abs();
                 let score = if best_v > 0 {
                     RACE_MATE - rk
@@ -6492,7 +6618,7 @@ impl TitaniumSearch {
                 if let Some((best_m, _best_v, _)) = self.race_root_pick(slot, rv) {
                     self.rp_root_solves += 1;
                     let rk = rv.abs();
-                    self.refresh_dist(0);
+                    self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_RACE_ROOT);
                     return ThinkResult {
                         mv: best_m,
                         score: if rv > 0 {
@@ -6589,7 +6715,7 @@ impl TitaniumSearch {
 
         if let Some(direct_mv) = self.prepare_opening_book_at_root() {
             let t0 = Instant::now();
-            self.refresh_dist(0);
+            self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_OPENING);
             return ThinkResult {
                 mv: direct_mv,
                 score: 0,
@@ -7279,7 +7405,7 @@ impl TitaniumSearch {
         // Root legality guard: never emit a move the true position rejects.
         // Regenerates the legal root list from clean state; if the searched
         // best move is not in it, substitute the best legal alternative.
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_THINK_GUARD);
         let mut legal = [0i16; 160];
         let nlegal = self.gen_moves(0, 1, last_best, &mut legal);
         let root_ok = nlegal > 0 && last_best >= 0 && legal[..nlegal].contains(&last_best);
@@ -7298,7 +7424,7 @@ impl TitaniumSearch {
             }
         }
 
-        self.refresh_dist(0);
+        self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_THINK_FINAL);
         let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
         let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
         let ms = t0.elapsed().as_millis() as u64;

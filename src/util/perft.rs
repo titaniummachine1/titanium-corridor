@@ -12,6 +12,9 @@ pub const PERFT4_STARTPOS: u64 = 247_569_030;
 /// Titanium reaches this in sub-12s (no TT, bulk leaf count), a public record.
 pub const PERFT5_STARTPOS: u64 = 28_837_934_502;
 
+/// Hard wall-clock budget for startpos perft(5). Over this, abort — not worth continuing.
+pub const PERFT5_TIMEOUT_SECS: u64 = 20;
+
 /// Startpos perft(6) — cross-verified (a multi-hour full enumeration).
 pub const PERFT6_STARTPOS: u64 = 3_257_436_276_501;
 
@@ -159,6 +162,40 @@ pub fn perft_fast(board: &mut Board, depth: u32) -> u64 {
     let mut shared = SharedState::new();
     let mut worker = WorkerContext::new();
     perft_fast_ctx(board, depth, Some(&mut shared), &mut worker)
+}
+
+/// [`perft_fast`] on a worker thread; abort the wait after `timeout` (worker left detached).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn perft_fast_timed(
+    board: &Board,
+    depth: u32,
+    timeout: std::time::Duration,
+) -> Result<(u64, std::time::Duration), ()> {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let board_copy = board.clone();
+    let handle = std::thread::Builder::new()
+        .name(format!("perft-d{depth}"))
+        .spawn(move || {
+            let mut fast = board_copy;
+            let t0 = Instant::now();
+            let nodes = perft_fast(&mut fast, depth);
+            let _ = done_tx.send((nodes, t0.elapsed()));
+        })
+        .expect("spawn perft");
+
+    match done_rx.recv_timeout(timeout) {
+        Ok((nodes, elapsed)) => {
+            handle.join().ok();
+            Ok((nodes, elapsed))
+        }
+        Err(_) => {
+            std::mem::forget(handle);
+            Err(())
+        }
+    }
 }
 
 /// Root-split parallel perft — experimental bench path when `threads > 1`.

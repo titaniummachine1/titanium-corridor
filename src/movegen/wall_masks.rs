@@ -197,6 +197,145 @@ pub fn wall_needs_flood_v_mask(board: &Board) -> u64 {
     topo_v_from(board.horizontal_walls, board.vertical_walls)
 }
 
+/// O(1) flood-skip mask from packed wall bitboards (no `Board` alloc).
+#[inline]
+pub fn wall_needs_flood_h_from_bits(horizontal_walls: u64, vertical_walls: u64) -> u64 {
+    topo_h_from(horizontal_walls, vertical_walls)
+}
+
+#[inline]
+pub fn wall_needs_flood_v_from_bits(horizontal_walls: u64, vertical_walls: u64) -> u64 {
+    topo_v_from(horizontal_walls, vertical_walls)
+}
+
+/// True when a candidate wall can touch enough topology to possibly seal.
+#[inline]
+pub fn wall_slot_needs_flood(
+    horizontal_walls: u64,
+    vertical_walls: u64,
+    horizontal: bool,
+    slot: usize,
+) -> bool {
+    let mask = if horizontal {
+        topo_h_from(horizontal_walls, vertical_walls)
+    } else {
+        topo_v_from(horizontal_walls, vertical_walls)
+    };
+    (mask >> slot) & 1 != 0
+}
+
+/// ACE/JS anchor-count precheck — conservative O(25) per slot (bench baseline).
+#[inline]
+pub fn wall_slot_needs_flood_anchor(
+    horizontal_walls: u64,
+    vertical_walls: u64,
+    horizontal: bool,
+    slot: usize,
+) -> bool {
+    let r = (slot / 8) as i32;
+    let c = (slot % 8) as i32;
+    let mut anchors = 0;
+    if horizontal {
+        if c == 0 {
+            anchors += 1;
+        }
+        if c == 7 {
+            anchors += 1;
+        }
+    } else {
+        if r == 0 {
+            anchors += 1;
+        }
+        if r == 7 {
+            anchors += 1;
+        }
+    }
+    let mut dr = -2;
+    while dr <= 2 && anchors < 2 {
+        let rr = r + dr;
+        if rr < 0 || rr > 7 {
+            dr += 1;
+            continue;
+        }
+        let mut dc = -2;
+        while dc <= 2 {
+            let cc = c + dc;
+            if cc < 0 || cc > 7 {
+                dc += 1;
+                continue;
+            }
+            let ss = (rr * 8 + cc) as usize;
+            if (horizontal_walls >> ss) & 1 != 0 || (vertical_walls >> ss) & 1 != 0 {
+                anchors += 1;
+                if anchors >= 2 {
+                    return true;
+                }
+            }
+            dc += 1;
+        }
+        dr += 1;
+    }
+    anchors >= 2
+}
+
+fn wall_needs_flood_h_anchor_mask(horizontal_walls: u64, vertical_walls: u64) -> u64 {
+    let mut mask = 0u64;
+    for slot in 0..64usize {
+        if wall_slot_needs_flood_anchor(horizontal_walls, vertical_walls, true, slot) {
+            mask |= 1u64 << slot;
+        }
+    }
+    mask
+}
+
+fn wall_needs_flood_v_anchor_mask(horizontal_walls: u64, vertical_walls: u64) -> u64 {
+    let mut mask = 0u64;
+    for slot in 0..64usize {
+        if wall_slot_needs_flood_anchor(horizontal_walls, vertical_walls, false, slot) {
+            mask |= 1u64 << slot;
+        }
+    }
+    mask
+}
+
+/// Bench-only: `TITANIUM_BENCH=1` plus `TITANIUM_WALL_FLOOD_SKIP=anchor|old|0`.
+/// Production/tests always use O(1) topo unless both are set.
+#[inline]
+pub fn wall_flood_skip_uses_anchor() -> bool {
+    static ANCHOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANCHOR.get_or_init(|| {
+        if !matches!(
+            std::env::var("TITANIUM_BENCH").ok().as_deref(),
+            Some("1")
+        ) {
+            return false;
+        }
+        matches!(
+            std::env::var("TITANIUM_WALL_FLOOD_SKIP")
+                .ok()
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("anchor" | "0" | "old")
+        )
+    })
+}
+
+/// Flood-skip masks for movegen — topo shift (default) or anchor-count (bench baseline).
+#[inline]
+pub fn wall_needs_flood_masks(board: &Board) -> (u64, u64) {
+    let h = board.horizontal_walls;
+    let v = board.vertical_walls;
+    if wall_flood_skip_uses_anchor() {
+        (
+            wall_needs_flood_h_anchor_mask(h, v),
+            wall_needs_flood_v_anchor_mask(h, v),
+        )
+    } else {
+        (topo_h_from(h, v), topo_v_from(h, v))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

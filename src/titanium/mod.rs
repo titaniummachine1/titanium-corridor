@@ -33,6 +33,7 @@ pub mod field_planes;
 pub mod fields_viz;
 pub mod game;
 pub mod ka_policy;
+pub mod lazy_seal;
 pub mod net;
 pub mod opening_book;
 pub mod opening_book_embedded;

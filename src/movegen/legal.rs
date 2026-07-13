@@ -368,12 +368,17 @@ fn generate_wall_moves_slice(
     // Walls: L1 empty ∧ L2 collision → topo flood-skip → L3 bitboard flood when needed.
     // Flood grids are built only if some candidate actually needs L3.
     let masks = wall_masks(board);
+    let (topo_h, topo_v) = if crate::movegen::wall_masks::wall_flood_skip_uses_anchor() {
+        crate::movegen::wall_masks::wall_needs_flood_masks(board)
+    } else {
+        (masks.topo_h, masks.topo_v)
+    };
     let mut ctx: Option<WallTrialCtx> = None;
     let mut n = 0usize;
     n += collect_wall_orientation(
         board,
         masks.l12_h,
-        masks.topo_h,
+        topo_h,
         WallOrientation::Horizontal,
         &mut out[n..],
         &mut ctx,
@@ -381,7 +386,7 @@ fn generate_wall_moves_slice(
     n += collect_wall_orientation(
         board,
         masks.l12_v,
-        masks.topo_v,
+        topo_v,
         WallOrientation::Vertical,
         &mut out[n..],
         &mut ctx,

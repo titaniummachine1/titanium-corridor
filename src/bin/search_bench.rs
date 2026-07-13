@@ -16,6 +16,7 @@ use titanium::algebraic_to_move_id;
 use titanium::bench_instr;
 use titanium::movegen::prewarm;
 use titanium::titanium::net::live_weights_sha256;
+use titanium::titanium::lazy_seal::{dump_lazy_seal_stats, reset_lazy_seal_stats};
 use titanium::titanium::session::apply_session_experiment_flags;
 use titanium::titanium::{move_id_to_algebraic, GameState, ThinkResult, TitaniumSearch};
 
@@ -23,13 +24,20 @@ use titanium::titanium::{move_id_to_algebraic, GameState, ThinkResult, TitaniumS
 /// `fresh_search` (TITANIUM_BENCH_V16=1 → v16 CAT-LMR), so the label must
 /// follow the same env var or profiles get misattributed.
 fn engine_mode() -> &'static str {
-    if let Ok(flag) = std::env::var("TITANIUM_BENCH_ENGINE") {
-        return Box::leak(flag.into_boxed_str());
-    }
-    if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
-        "titanium-v16"
+    let base = if let Ok(flag) = std::env::var("TITANIUM_BENCH_ENGINE") {
+        flag
+    } else if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
+        "titanium-v16".into()
     } else {
-        "titanium-v15"
+        "titanium-v15".into()
+    };
+    let lazy = std::env::var("TITANIUM_BENCH_LAZY_WALLS").as_deref() == Ok("1");
+    let seal_mode = std::env::var("TITANIUM_LAZY_SEAL_MODE").unwrap_or_default();
+    if lazy {
+        let seal = if seal_mode.is_empty() { "deferred" } else { &seal_mode };
+        Box::leak(format!("{base}-lazy-{seal}").into_boxed_str())
+    } else {
+        Box::leak(base.into_boxed_str())
     }
 }
 const TT_BITS: usize = 20;
@@ -286,6 +294,7 @@ fn emit_result(
 }
 
 fn bench_time(sec: u64, runs: usize, position: &str, full: bool, log: bool, threads: usize) {
+    reset_lazy_seal_stats();
     let time_ms = sec * 1000;
     let g = load_position(position);
     let mut search = fresh_search(position, None);
@@ -352,9 +361,11 @@ fn bench_time(sec: u64, runs: usize, position: &str, full: bool, log: bool, thre
         threads,
         &extra,
     );
+    eprintln!("{}", dump_lazy_seal_stats());
 }
 
 fn bench_depth(target_depth: i32, position: &str, full: bool, threads: usize) {
+    reset_lazy_seal_stats();
     let mut search = fresh_search(position, None);
     let _ = run_think(
         &mut search,
@@ -382,6 +393,7 @@ fn bench_depth(target_depth: i32, position: &str, full: bool, threads: usize) {
     if let Some(instr) = bench_instr::take_json_report() {
         println!("{instr}");
     }
+    eprintln!("{}", dump_lazy_seal_stats());
 }
 
 fn bench_profile(sec: u64, position: &str, moves: Option<&str>, full: bool, threads: usize) {

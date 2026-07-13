@@ -63,8 +63,9 @@ pub use search::{
 pub use util::perft::perft_parallel_root;
 pub use util::perft::{
     format_move, perft, perft_divide, perft_fast, perft_fast_ctx, perft_fast_mode,
-    perft_fast_mode_ctx, perft_iterative, perft_naive, perft_no_tt_mode, perft_pawn_only_mode,
-    PerftContext, PERFT3_STARTPOS, PERFT4_STARTPOS,
+    perft_fast_mode_ctx, perft_fast_timed, perft_iterative, perft_naive, perft_no_tt_mode,
+    perft_pawn_only_mode, PerftContext, PERFT3_STARTPOS, PERFT4_STARTPOS, PERFT5_STARTPOS,
+    PERFT5_TIMEOUT_SECS,
 };
 
 // Titanium v15 production API (formerly `acev13` module path).

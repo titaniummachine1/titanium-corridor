@@ -119,6 +119,10 @@ pub struct GameState {
     pub turn: usize,
     pub hw: [u8; 64],
     pub vw: [u8; 64],
+    /// Packed horizontal wall slots (bit `slot` = wall at slot).
+    pub hw_bits: u64,
+    /// Packed vertical wall slots.
+    pub vw_bits: u64,
     /// Wall-blocked direction bits per cell: N=1 S=2 W=4 E=8 (bounds via BORDER).
     pub blocked: [u8; 81],
     pub hash_lo: u32,
@@ -149,6 +153,8 @@ impl GameState {
             turn: 0,
             hw: [0; 64],
             vw: [0; 64],
+            hw_bits: 0,
+            vw_bits: 0,
             blocked: [0; 81],
             hash_lo: z.pawn_lo[0][76] ^ z.pawn_lo[1][4],
             hash_hi: z.pawn_hi[0][76] ^ z.pawn_hi[1][4],
@@ -181,6 +187,58 @@ impl GameState {
     }
 
     // ── Wall mechanics ──────────────────────────────────────────────────────
+
+    #[inline]
+    fn pack_wall_bits(arr: &[u8; 64]) -> u64 {
+        let mut bits = 0u64;
+        for (s, &on) in arr.iter().enumerate() {
+            if on != 0 {
+                bits |= 1u64 << s;
+            }
+        }
+        bits
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn assert_wall_bits_sync(&self) {
+        debug_assert_eq!(self.hw_bits, Self::pack_wall_bits(&self.hw));
+        debug_assert_eq!(self.vw_bits, Self::pack_wall_bits(&self.vw));
+    }
+
+    /// Convert an ACE wall slot (0..63) to the corresponding `Board` wall bit index.
+    /// Board bits are indexed by `(row * 8 + col)` with row 0 at the top;
+    /// ACE slots are `(7 - row) * 8 + col`.
+    #[inline]
+    pub fn ace_slot_to_board_bit(slot: usize) -> usize {
+        (7 - slot / 8) * 8 + slot % 8
+    }
+
+    /// Convert ACE-slot-ordered wall bits to Board-ordered bits.
+    #[inline]
+    pub fn ace_wall_bits_to_board(bits: u64) -> u64 {
+        let mut out = 0u64;
+        let mut b = bits;
+        while b != 0 {
+            let slot = b.trailing_zeros() as usize;
+            b &= b - 1;
+            out |= 1u64 << Self::ace_slot_to_board_bit(slot);
+        }
+        out
+    }
+
+    /// Convert Board-ordered wall bits to ACE-slot-ordered bits.
+    #[inline]
+    pub fn board_wall_bits_to_ace(bits: u64) -> u64 {
+        let mut out = 0u64;
+        let mut b = bits;
+        while b != 0 {
+            let bit = b.trailing_zeros() as usize;
+            b &= b - 1;
+            let slot = Self::ace_slot_to_board_bit(bit); // inverse is the same reflection
+            out |= 1u64 << slot;
+        }
+        out
+    }
 
     pub fn set_wall_bits(&mut self, wall_type: usize, slot: usize, on: bool) {
         let r = slot / 8;
@@ -244,52 +302,16 @@ impl GameState {
         true
     }
 
-    /// Conservative "cannot possibly seal" precheck (over-counts anchors, so safe to skip BFS).
+    /// O(1) topo shift: skip BFS when the wall cannot touch enough topology to seal.
     pub fn wall_needs_path_check(&self, wall_type: usize, slot: usize) -> bool {
-        let r = (slot / 8) as i32;
-        let c = (slot % 8) as i32;
-        let mut anchors = 0;
-        if wall_type == 0 {
-            if c == 0 {
-                anchors += 1;
-            }
-            if c == 7 {
-                anchors += 1;
-            }
-        } else {
-            if r == 0 {
-                anchors += 1;
-            }
-            if r == 7 {
-                anchors += 1;
-            }
-        }
-        let mut dr = -2;
-        while dr <= 2 && anchors < 2 {
-            let rr = r + dr;
-            if rr < 0 || rr > 7 {
-                dr += 1;
-                continue;
-            }
-            let mut dc = -2;
-            while dc <= 2 {
-                let ccc = c + dc;
-                if ccc < 0 || ccc > 7 {
-                    dc += 1;
-                    continue;
-                }
-                let ss = (rr * 8 + ccc) as usize;
-                if self.hw[ss] != 0 || self.vw[ss] != 0 {
-                    anchors += 1;
-                    if anchors >= 2 {
-                        break;
-                    }
-                }
-                dc += 1;
-            }
-            dr += 1;
-        }
-        anchors >= 2
+        let board_h = Self::ace_wall_bits_to_board(self.hw_bits);
+        let board_v = Self::ace_wall_bits_to_board(self.vw_bits);
+        crate::movegen::wall_masks::wall_slot_needs_flood(
+            board_h,
+            board_v,
+            wall_type == 0,
+            Self::ace_slot_to_board_bit(slot),
+        )
     }
 
     pub fn has_path(&self, player: usize) -> bool {
@@ -412,6 +434,7 @@ impl GameState {
         } else if m < 200 {
             let s0 = (m - 100) as usize;
             self.hw[s0] = 1;
+            self.hw_bits |= 1u64 << s0;
             self.set_wall_bits(0, s0, true);
             self.wl[self.turn] -= 1;
             self.wall_stamp += 1;
@@ -421,6 +444,7 @@ impl GameState {
         } else {
             let s1 = (m - 200) as usize;
             self.vw[s1] = 1;
+            self.vw_bits |= 1u64 << s1;
             self.set_wall_bits(1, s1, true);
             self.wl[self.turn] -= 1;
             self.wall_stamp += 1;
@@ -434,6 +458,8 @@ impl GameState {
         self.hashes_u[hl * 2] = self.hash_lo;
         self.hashes_u[hl * 2 + 1] = self.hash_hi;
         self.hist_len = hl + 1;
+        #[cfg(debug_assertions)]
+        self.assert_wall_bits_sync();
     }
 
     pub fn unmake_move(&mut self) {
@@ -455,6 +481,7 @@ impl GameState {
         } else if m < 200 {
             let s0 = (m - 100) as usize;
             self.hw[s0] = 0;
+            self.hw_bits &= !(1u64 << s0);
             self.set_wall_bits(0, s0, false);
             self.wl[self.turn] += 1;
             self.wall_stamp -= 1;
@@ -463,12 +490,15 @@ impl GameState {
         } else {
             let s1 = (m - 200) as usize;
             self.vw[s1] = 0;
+            self.vw_bits &= !(1u64 << s1);
             self.set_wall_bits(1, s1, false);
             self.wl[self.turn] += 1;
             self.wall_stamp -= 1;
             self.hash_lo ^= z.vw_lo[s1];
             self.hash_hi ^= z.vw_hi[s1];
         }
+        #[cfg(debug_assertions)]
+        self.assert_wall_bits_sync();
     }
 
     // ── Distance fields ─────────────────────────────────────────────────────
@@ -503,6 +533,8 @@ impl GameState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::board::{Board, WallOrientation};
+    use crate::movegen::legal::can_wall_block_topology;
     use crate::titanium::algebraic_to_move_id;
 
     fn pos(moves: &[&str]) -> GameState {
@@ -511,6 +543,77 @@ mod tests {
             g.make_move(algebraic_to_move_id(m));
         }
         g
+    }
+
+    fn board_from_game(g: &GameState) -> Board {
+        let mut b = Board::new();
+        b.horizontal_walls = GameState::ace_wall_bits_to_board(g.hw_bits);
+        b.vertical_walls = GameState::ace_wall_bits_to_board(g.vw_bits);
+        b
+    }
+
+    #[test]
+    fn wall_needs_path_check_matches_topo_oracle() {
+        let positions = [
+            pos(&[]),
+            pos(&["e2", "e8", "e3", "e7", "d3h", "d6h", "f3h", "f6h"]),
+            pos(&[
+                "e2", "e8", "e3", "e7", "e4", "e6", "e3h", "e6h", "c3h", "c6h", "g3h", "g6h",
+                "a3h", "e4v", "h3v",
+            ]),
+        ];
+        for g in positions {
+            let board = board_from_game(&g);
+            for wall_type in [0usize, 1] {
+                for slot in 0..64usize {
+                    // ACE slot row is reflected relative to Board wall row.
+                    let row = (7 - slot / 8) as u8;
+                    let col = (slot % 8) as u8;
+                    let horizontal = wall_type == 0;
+                    let orientation = if horizontal {
+                        WallOrientation::Horizontal
+                    } else {
+                        WallOrientation::Vertical
+                    };
+                    assert_eq!(
+                        g.wall_needs_path_check(wall_type, slot),
+                        can_wall_block_topology(&board, row, col, orientation),
+                        "topo parity wall_type={wall_type} slot={slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn topo_skip_implies_paths_stay_open() {
+        let positions = [
+            pos(&[]),
+            pos(&["e2", "e8", "e3", "e7", "c3h", "c6h", "e4v"]),
+        ];
+        for base in positions {
+            for wall_type in [0usize, 1] {
+                for slot in 0..64usize {
+                    let mut g = base.clone();
+                    if !g.wall_fits(wall_type, slot) {
+                        continue;
+                    }
+                    if g.wall_needs_path_check(wall_type, slot) {
+                        continue;
+                    }
+                    g.set_wall_bits(wall_type, slot, true);
+                    assert!(
+                        g.has_path(0),
+                        "p0 open after topo skip wt={wall_type} slot={slot}"
+                    );
+                    assert!(
+                        g.has_path(1),
+                        "p1 open after topo skip wt={wall_type} slot={slot}"
+                    );
+                    g.set_wall_bits(wall_type, slot, false);
+                }
+            }
+        }
     }
 
     #[test]
@@ -541,6 +644,90 @@ mod tests {
                     g.set_wall_bits(wall_type, slot, false);
                 }
             }
+        }
+    }
+
+    /// Exhaustive ACE slot ↔ Board wall-bit mapping over all 128 placements.
+    #[test]
+    fn ace_board_wall_bit_mapping_exhaustive() {
+        for wall_type in [0usize, 1] {
+            for slot in 0..64usize {
+                let board_bit = GameState::ace_slot_to_board_bit(slot);
+                // Reflection is its own inverse.
+                assert_eq!(
+                    GameState::ace_slot_to_board_bit(board_bit),
+                    slot,
+                    "round-trip slot wt={wall_type} slot={slot} board_bit={board_bit}"
+                );
+
+                let ace_mask = 1u64 << slot;
+                let board_mask = GameState::ace_wall_bits_to_board(ace_mask);
+                assert_eq!(board_mask.count_ones(), 1);
+                assert_eq!(
+                    GameState::board_wall_bits_to_ace(board_mask),
+                    ace_mask,
+                    "bits round-trip wt={wall_type} slot={slot}"
+                );
+                assert_eq!(
+                    board_mask.trailing_zeros() as usize,
+                    board_bit,
+                    "single-bit board index wt={wall_type} slot={slot}"
+                );
+
+                // make/unmake round-trip keeps packed ACE bits in sync.
+                let mut g2 = GameState::new();
+                if !g2.wall_fits(wall_type, slot) {
+                    continue;
+                }
+                let mid = if wall_type == 0 {
+                    100 + slot as i16
+                } else {
+                    200 + slot as i16
+                };
+                g2.make_move(mid);
+                let packed = if wall_type == 0 {
+                    g2.hw_bits
+                } else {
+                    g2.vw_bits
+                };
+                assert_eq!(
+                    packed & ace_mask,
+                    ace_mask,
+                    "make wt={wall_type} slot={slot}"
+                );
+                g2.unmake_move();
+                let packed2 = if wall_type == 0 {
+                    g2.hw_bits
+                } else {
+                    g2.vw_bits
+                };
+                assert_eq!(packed2 & ace_mask, 0, "unmake wt={wall_type} slot={slot}");
+
+                // Topo skip on empty board matches scraped oracle (Board row/col).
+                let row = (7 - slot / 8) as u8;
+                let col = (slot % 8) as u8;
+                let orientation = if wall_type == 0 {
+                    WallOrientation::Horizontal
+                } else {
+                    WallOrientation::Vertical
+                };
+                let board = Board::new();
+                let needs = GameState::new().wall_needs_path_check(wall_type, slot);
+                let oracle = can_wall_block_topology(&board, row, col, orientation);
+                assert_eq!(needs, oracle, "topo wt={wall_type} slot={slot}");
+            }
+        }
+
+        // Corner rows/cols: reflection preserves column; row flips 0↔7.
+        for (label, slot) in [
+            ("top-left", 0usize),
+            ("top-right", 7),
+            ("bottom-left", 56),
+            ("bottom-right", 63),
+        ] {
+            let bb = GameState::ace_slot_to_board_bit(slot);
+            assert_eq!(bb % 8, slot % 8, "{label} col preserved");
+            assert_eq!(bb / 8 + slot / 8, 7, "{label} row reflection");
         }
     }
 }

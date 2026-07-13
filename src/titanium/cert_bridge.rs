@@ -70,6 +70,9 @@ pub fn titanium_game_from_board(board: &Board) -> GameState {
     }
     g.hash_lo = hl;
     g.hash_hi = hh;
+    g.hw_bits = GameState::board_wall_bits_to_ace(board.horizontal_walls);
+    g.vw_bits = GameState::board_wall_bits_to_ace(board.vertical_walls);
+    g.wall_stamp = board.horizontal_walls.count_ones() as i32 + board.vertical_walls.count_ones() as i32;
     g
 }
 

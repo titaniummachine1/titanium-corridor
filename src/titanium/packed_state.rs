@@ -178,6 +178,10 @@ pub fn titanium_game_from_packed(data: &[u8]) -> Result<GameState, String> {
             g.set_wall_bits(1, slot, true);
         }
     }
+    g.hw_bits = fields.horizontal_walls;
+    g.vw_bits = fields.vertical_walls;
+    g.wall_stamp =
+        fields.horizontal_walls.count_ones() as i32 + fields.vertical_walls.count_ones() as i32;
     g.hist_len = 0;
     g.last_wall_ply = 0;
     recompute_hash(&mut g);
