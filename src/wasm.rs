@@ -444,7 +444,7 @@ impl WasmEngine {
         let result = self.search.think_with_threads(
             (movetime_ms as u64).max(1),
             effective_depth,
-            true,
+            false,
             stream,
             &self.engine_label,
             thread_count,
@@ -459,7 +459,7 @@ impl WasmEngine {
             self.search.think(
                 (movetime_ms as u64).max(1),
                 effective_depth,
-                true,
+                false,
                 stream,
                 &self.engine_label,
             )

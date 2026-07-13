@@ -6920,11 +6920,11 @@ impl TitaniumSearch {
                 &mut stop_reason,
             );
             runtime.stop.store(true, Ordering::Relaxed);
-            // Helpers observe `stop` in check_time() and return within ~1k nodes.
+            // Helpers observe `stop` in check_time() and return within ~64 nodes.
             // The seat worker is a Web Worker (not the UI thread), so a brief spin
-            // here is safe. Bounded by a generous fallback deadline so a wedged
-            // helper can never hang the move forever.
-            let latch_deadline = Instant::now() + Duration::from_millis(time_ms.max(1) + 2000);
+            // here is safe. Do not start a second movetime-sized wait after the
+            // main search: that used to overrun the browser clock by seconds.
+            let latch_deadline = runtime.deadline + Duration::from_millis(50);
             while pending.load(Ordering::Acquire) > 0 && Instant::now() < latch_deadline {
                 std::hint::spin_loop();
             }
