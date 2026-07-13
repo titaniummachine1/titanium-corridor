@@ -2,7 +2,7 @@
 //!
 //! Floods run directly in ACE cell index (row 0 = top) using `DirMasks::from_ace_game`
 //! — no Titanium `Board` rebuild and no row-flip remap. Each layer is one
-//! `expand_frontier` u128 step (same binary / bitboard flood family as CAT / movegen `pbff_*`).
+//! `expand_frontier` u128 step (same binary / bitboard flood family as CAT / movegen `bff_*`).
 
 use crate::path::flood::expand_frontier;
 use crate::path::masks::DirMasks;

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::board::{Board, WallOrientation};
 use crate::movegen::wall_masks::{wall_needs_flood_h_from_bits, wall_needs_flood_v_from_bits};
-use crate::path::parallel::{pawn_bit, pbff_wall_legal, wall_delta, WallGrids};
+use crate::path::parallel::{bff_wall_legal, pawn_bit, wall_delta, WallGrids};
 use crate::titanium::game::GameState;
 use crate::util::clock::Instant;
 
@@ -30,7 +30,7 @@ pub struct LazySealStats {
     pub walls_generated: AtomicU64,
     pub prep_time_ns: AtomicU64,
     pub topo_test_time_ns: AtomicU64,
-    pub pbff_time_ns: AtomicU64,
+    pub bff_time_ns: AtomicU64,
 }
 
 static LAZY_SEAL_STATS: LazySealStats = LazySealStats {
@@ -50,7 +50,7 @@ static LAZY_SEAL_STATS: LazySealStats = LazySealStats {
     walls_generated: AtomicU64::new(0),
     prep_time_ns: AtomicU64::new(0),
     topo_test_time_ns: AtomicU64::new(0),
-    pbff_time_ns: AtomicU64::new(0),
+    bff_time_ns: AtomicU64::new(0),
 };
 
 pub fn lazy_seal_stats() -> &'static LazySealStats {
@@ -75,7 +75,7 @@ pub fn reset_lazy_seal_stats() {
     s.walls_generated.store(0, Ordering::Relaxed);
     s.prep_time_ns.store(0, Ordering::Relaxed);
     s.topo_test_time_ns.store(0, Ordering::Relaxed);
-    s.pbff_time_ns.store(0, Ordering::Relaxed);
+    s.bff_time_ns.store(0, Ordering::Relaxed);
 }
 
 pub fn dump_lazy_seal_stats() -> String {
@@ -85,7 +85,7 @@ pub fn dump_lazy_seal_stats() -> String {
         "lazy_seal nodes={} wall_nodes={} risky_nodes={} heavy_ctx={} heavy_ctx_once={} \
         walls_gen={} walls={} safe={} risky={} illegal_risky={} heavy_checks={} \
         topo_computes={} pack_ops={} mutations={} \
-        prep_ms={:.3} topo_ms={:.3} pbff_ms={:.3}",
+        prep_ms={:.3} topo_ms={:.3} bff_ms={:.3}",
         nodes,
         s.nodes_with_wall_searched.load(Ordering::Relaxed),
         s.nodes_with_risky_wall.load(Ordering::Relaxed),
@@ -102,7 +102,7 @@ pub fn dump_lazy_seal_stats() -> String {
         s.state_mutations.load(Ordering::Relaxed),
         s.prep_time_ns.load(Ordering::Relaxed) as f64 / 1e6,
         s.topo_test_time_ns.load(Ordering::Relaxed) as f64 / 1e6,
-        s.pbff_time_ns.load(Ordering::Relaxed) as f64 / 1e6,
+        s.bff_time_ns.load(Ordering::Relaxed) as f64 / 1e6,
     )
 }
 
@@ -114,7 +114,7 @@ fn ace_cell_to_board(cell: usize) -> (u8, u8) {
 /// Strategy for the heavy L3 context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LazySealMode {
-    /// Build `WallGrids` + PBFF state eagerly in `from_game`.
+    /// Build `WallGrids` + BFF state eagerly in `from_game`.
     EagerHeavy,
     /// Compute only topology masks in `from_game`; initialize heavy context on first risky wall.
     DeferredHeavy,
@@ -251,10 +251,10 @@ impl LazySealNode {
         let delta = wall_delta(row, col, orient);
         let trial = self.trial.as_mut().expect("heavy context initialized");
         trial.grids.place(delta);
-        let ok = pbff_wall_legal(trial.p0_bit, trial.p1_bit, &trial.grids);
+        let ok = bff_wall_legal(trial.p0_bit, trial.p1_bit, &trial.grids);
         trial.grids.remove(delta);
         LAZY_SEAL_STATS
-            .pbff_time_ns
+            .bff_time_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         ok
     }

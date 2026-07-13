@@ -1,7 +1,7 @@
 //! Movegen V11 wall-legality core — fixed port of the `quoridor_parallel_engine` POC.
 //!
-//! **Naming:** `pbff_*` = **p**arallel **b**itboard **f**lood **f**ill (binary flood fill /
-//! bitboard BFS) used for fast path-to-goal checks after tentative wall placements. It is
+//! `bff_*` means binary flood fill: bitboard BFS used for fast path-to-goal
+//! checks after tentative wall placements. It is
 //! standard flood fill on `u128` masks, not a separate search or NN subsystem.
 //!
 //! One u128 register holds the whole 9×9 board (centered 11-wide flood layout,
@@ -197,7 +197,7 @@ pub fn expand_wave(wave: u128, grids: &WallGrids) -> u128 {
 /// Binary / bitboard flood fill to goal. Returns (goal reached, visited bits) —
 /// the visited set doubles as the history cache for the second player's run.
 #[inline]
-pub fn pbff_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) {
+pub fn bff_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) {
     let mut visited = start & FLOOD_PLAYABLE;
     if visited & goal != 0 {
         return (true, visited);
@@ -217,7 +217,7 @@ pub fn pbff_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) 
 /// informal “bit theft”): on first contact with the first player's visited region the whole region is annexed (and
 /// goal-tested — POC fix #4), so shared corridors are never re-flooded.
 #[inline]
-pub fn pbff_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u128) -> bool {
+pub fn bff_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u128) -> bool {
     bff_to_goal_cached_with_visited(start, cache, grids, goal).0
 }
 
@@ -258,7 +258,7 @@ pub fn bff_to_goal_cached_with_visited(
 /// after a tentative placement. Player 1 floods selfishly (filling the cache);
 /// player 2 floods with visited-bit reuse. Either flood stagnating ⇒ illegal wall.
 #[inline]
-pub fn pbff_wall_legal(p1_start: u128, p2_start: u128, grids: &WallGrids) -> bool {
+pub fn bff_wall_legal(p1_start: u128, p2_start: u128, grids: &WallGrids) -> bool {
     bff_wall_legal_with_proof(p1_start, p2_start, grids).0
 }
 
@@ -269,7 +269,7 @@ pub fn bff_wall_legal_with_proof(
     p2_start: u128,
     grids: &WallGrids,
 ) -> (bool, u128) {
-    let (ok1, p1_visited) = pbff_to_goal(p1_start, grids, P1_GOAL_BITS);
+    let (ok1, p1_visited) = bff_to_goal(p1_start, grids, P1_GOAL_BITS);
     if !ok1 {
         return (false, 0);
     }
@@ -282,11 +282,11 @@ pub fn bff_wall_legal_with_proof(
 }
 
 /// Convenience wrapper for one-off queries (oracle / replay validation).
-pub fn pbff_wall_legal_board(board: &Board) -> bool {
+pub fn bff_wall_legal_board(board: &Board) -> bool {
     let grids = WallGrids::from_board(board);
     let (r1, c1) = board.pawn(Player::One);
     let (r2, c2) = board.pawn(Player::Two);
-    pbff_wall_legal(pawn_bit(r1, c1), pawn_bit(r2, c2), &grids)
+    bff_wall_legal(pawn_bit(r1, c1), pawn_bit(r2, c2), &grids)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,8 +311,8 @@ pub fn pbff_wall_legal_board(board: &Board) -> bool {
 // (P1 + P2, rebuilt per wall trial because each trial's delta changes the
 // propagators). The setup never amortises on a board this small. The remembered
 // "hundredfold" was KS vs the naive QUEUE BFS — but one-step bitboard flood fill
-// (`expand_wave` / `pbff_wall_legal`) already captures that win on 9×9. There is
-// NO board-difficulty crossover to adapt to on 9×9: `pbff_wall_legal` wins everywhere.
+// (`expand_wave` / `bff_wall_legal`) already captures that win on 9×9. There is
+// NO board-difficulty crossover to adapt to on 9×9: `bff_wall_legal` wins everywhere.
 // KS is kept, correct, and oracle-tested purely as a larger-board reference.
 //
 // Why no anti-wrap file masks are needed (the POC's ray-sweep bug does NOT apply):
@@ -406,9 +406,9 @@ impl KsProp {
 }
 
 /// Alternative bitboard flood implementation (Kogge–Stone occluded fill). Same
-/// path-to-goal semantics as [`pbff_to_goal`]; kept for bench comparison only.
+/// path-to-goal semantics as [`bff_to_goal`]; kept for bench comparison only.
 #[inline]
-pub fn pbff_ks_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) {
+pub fn bff_ks_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) {
     let mut visited = start & FLOOD_PLAYABLE;
     if visited & goal != 0 {
         return (true, visited);
@@ -426,9 +426,9 @@ pub fn pbff_ks_to_goal(start: u128, grids: &WallGrids, goal: u128) -> (bool, u12
     }
 }
 
-/// Alternative implementation of [`pbff_to_goal_cached`] (Player 2, visited-bit reuse).
+/// Alternative implementation of [`bff_to_goal_cached`] (Player 2, visited-bit reuse).
 #[inline]
-pub fn pbff_ks_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u128) -> bool {
+pub fn bff_ks_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal: u128) -> bool {
     let mut visited = start & FLOOD_PLAYABLE;
     if visited & goal != 0 {
         return true;
@@ -454,14 +454,14 @@ pub fn pbff_ks_to_goal_cached(start: u128, cache: u128, grids: &WallGrids, goal:
     }
 }
 
-/// Alternative implementation of [`pbff_wall_legal`] (Kogge–Stone bench path only).
+/// Alternative implementation of [`bff_wall_legal`] (Kogge–Stone bench path only).
 #[inline]
-pub fn pbff_ks_wall_legal(p1_start: u128, p2_start: u128, grids: &WallGrids) -> bool {
-    let (ok1, p1_visited) = pbff_ks_to_goal(p1_start, grids, P1_GOAL_BITS);
+pub fn bff_ks_wall_legal(p1_start: u128, p2_start: u128, grids: &WallGrids) -> bool {
+    let (ok1, p1_visited) = bff_ks_to_goal(p1_start, grids, P1_GOAL_BITS);
     if !ok1 {
         return false;
     }
-    pbff_ks_to_goal_cached(p2_start, p1_visited, grids, P2_GOAL_BITS)
+    bff_ks_to_goal_cached(p2_start, p1_visited, grids, P2_GOAL_BITS)
 }
 
 #[cfg(test)]
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn empty_board_both_reach() {
-        assert!(pbff_wall_legal_board(&Board::new()));
+        assert!(bff_wall_legal_board(&Board::new()));
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
         let mut board = Board::new();
         board.pawns[Player::One as usize] = (7, 4);
         board.pawns[Player::Two as usize] = (6, 4);
-        assert!(pbff_wall_legal_board(&board));
+        assert!(bff_wall_legal_board(&board));
     }
 
     #[test]
@@ -563,7 +563,7 @@ mod tests {
         set_wall(&mut board, 7, 3, WallOrientation::Vertical, true);
         set_wall(&mut board, 7, 4, WallOrientation::Vertical, true);
         assert!(!reach_goal_naive(&board, (8, 4), Player::Two));
-        assert!(!pbff_wall_legal_board(&board));
+        assert!(!bff_wall_legal_board(&board));
     }
 
     #[test]
@@ -573,7 +573,7 @@ mod tests {
         let mut board = Board::new();
         board.pawns[Player::One as usize] = (1, 4);
         board.pawns[Player::Two as usize] = (2, 4);
-        assert!(pbff_wall_legal_board(&board));
+        assert!(bff_wall_legal_board(&board));
     }
 
     #[test]
@@ -619,7 +619,7 @@ mod tests {
             let grids = WallGrids::from_board(&board);
             let expected = reach_goal_naive(&board, p1, Player::One)
                 && reach_goal_naive(&board, p2, Player::Two);
-            let got = pbff_wall_legal(pawn_bit(p1.0, p1.1), pawn_bit(p2.0, p2.1), &grids);
+            let got = bff_wall_legal(pawn_bit(p1.0, p1.1), pawn_bit(p2.0, p2.1), &grids);
             assert_eq!(
                 got, expected,
                 "walls h={:#x} v={:#x} p1={:?} p2={:?}",
@@ -627,7 +627,7 @@ mod tests {
             );
 
             // Kogge-Stone occluded fill must agree with the step-by-step flood.
-            let got_ks = pbff_ks_wall_legal(pawn_bit(p1.0, p1.1), pawn_bit(p2.0, p2.1), &grids);
+            let got_ks = bff_ks_wall_legal(pawn_bit(p1.0, p1.1), pawn_bit(p2.0, p2.1), &grids);
             assert_eq!(
                 got_ks, expected,
                 "KS walls h={:#x} v={:#x} p1={:?} p2={:?}",
@@ -635,13 +635,13 @@ mod tests {
             );
 
             // Single-player floods must match the reference too.
-            let (got1, vis1) = pbff_to_goal(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
+            let (got1, vis1) = bff_to_goal(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
             assert_eq!(got1, reach_goal_naive(&board, p1, Player::One));
-            let (got2, _) = pbff_to_goal(pawn_bit(p2.0, p2.1), &grids, P2_GOAL_BITS);
+            let (got2, _) = bff_to_goal(pawn_bit(p2.0, p2.1), &grids, P2_GOAL_BITS);
             assert_eq!(got2, reach_goal_naive(&board, p2, Player::Two));
 
             // KS single-player reachability + visited-set parity.
-            let (got1_ks, vis1_ks) = pbff_ks_to_goal(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
+            let (got1_ks, vis1_ks) = bff_ks_to_goal(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
             assert_eq!(got1_ks, got1, "KS p1 reach mismatch");
             // When neither reaches the goal the full reachable set must be identical;
             // on a goal hit either may early-exit with a partial set, so only compare
