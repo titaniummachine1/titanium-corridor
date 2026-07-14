@@ -2012,6 +2012,9 @@ fn session_engine_flag(args: &[String]) -> Option<&str> {
         "titanium-v17-no-partial-iter",
         "titanium-v17-no-predict-stop",
         "titanium-v17-no-partial-no-predict",
+        "titanium-v17-race-projection-observe",
+        "titanium-v17-race-projection",
+        "titanium-v17-race-projection-null",
     ];
     args.windows(2)
         .find(|pair| {
@@ -2078,6 +2081,9 @@ fn uses_titanium_module(flag: &str) -> bool {
         || flag == "titanium-v17-no-partial-iter"
         || flag == "titanium-v17-no-predict-stop"
         || flag == "titanium-v17-no-partial-no-predict"
+        || flag == "titanium-v17-race-projection-observe"
+        || flag == "titanium-v17-race-projection"
+        || flag == "titanium-v17-race-projection-null"
         || flag == "titanium-v15-medium"
         || flag == "titanium-v15-frozen"
         || flag == "titanium-v15-no-raceproof"

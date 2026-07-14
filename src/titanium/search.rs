@@ -23,7 +23,7 @@ use crate::titanium::dist::{
     fill_ace_dist_from_pawn, fill_ace_dist_layers_to_goal_p0, fill_ace_dist_layers_to_goal_p1,
     fill_ace_dist_to_goal_with_masks_p0, fill_ace_dist_to_goal_with_masks_p1, fill_choke_points,
     fill_contested, fill_corridor_delta, fill_sparse_route_masks, materialize_distance_layers,
-    shortest_route_bits, wall_incr_refresh_flags, width_in_layers,
+    player_shortest_path_immutable, shortest_route_bits, wall_incr_refresh_flags, width_in_layers,
 };
 use crate::titanium::move_id_to_board;
 use crate::util::clock::{Duration, Instant};
@@ -52,6 +52,11 @@ use crate::titanium::packed_state::FEATURE_SCHEMA;
 use crate::titanium::race::{
     race_outcome_with_dist, solve_race_config, RaceBound, RaceOutcomeStats, RaceScratch, RACE_MATE,
     RACE_STATES,
+};
+use crate::titanium::race_projection::{
+    estimated_remaining_plies, ProjectedProbeMode, ProjectedRaceBudget, ProjectedRaceResult,
+    ProjectedRaceSource, RaceProjectionConfig, RaceProjectionStats, PROJECTION_OBSERVE_PLIES,
+    PROJECTION_QSEARCH_PLIES, PROJECTION_SUFFIX_MAX_PROBES, PROJECTION_SUFFIX_MIN,
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
 use crate::util::grid::FLOOD_PLAYABLE;
@@ -114,6 +119,9 @@ const ROUTE_TOUCH_ORDER_BONUS: i32 = 20;
 const Q_SEARCH_MAX_DEFAULT: i32 = 4;
 /// Static-eval swing threshold in cp (Ka `qSwing=0.15` on a ~400cp net scale).
 const Q_SWING_CP_DEFAULT: i32 = 60;
+/// When combined wall stocks are at most this (and q-search is on), extend wall
+/// moves at the horizon until both hands are empty so the race oracle can fire.
+const LOW_WALL_QSEARCH_MAX_TOTAL: i32 = 3;
 /// saturated wall at ~1.05M ordering score — the same neighborhood the legacy
 /// counter reaches on hot walls (and just above pawn-progress scores), so the
 /// relative ordering bands match the legacy mode and the A/B isolates the
@@ -577,6 +585,7 @@ mod lazy_smp_tests {
                 depth_log: Vec::new(),
                 stop_reason: "test",
                 race_outcome_stats: RaceOutcomeStats::default(),
+                race_projection_stats: RaceProjectionStats::default(),
                 opening_book: None,
                 root_defense_diag: Vec::new(),
             }
@@ -1217,6 +1226,7 @@ pub struct ThinkResult {
     pub depth_log: Vec<AceDepthLogEntry>,
     pub stop_reason: &'static str,
     pub race_outcome_stats: RaceOutcomeStats,
+    pub race_projection_stats: crate::titanium::race_projection::RaceProjectionStats,
     pub opening_book: Option<crate::titanium::opening_book::OpeningBookDiagnostics>,
     /// Last lost-position root defense pass (one entry per legal root move searched).
     pub root_defense_diag: Vec<RootDefenseDiag>,
@@ -1298,6 +1308,21 @@ mod score_label_tests {
         assert_eq!(score_label(MATE - 5), "mate in 5");
         assert_eq!(score_label(-(MATE - 9)), "mated in 9");
         assert_eq!(score_label(42), "cp 42");
+    }
+
+    #[test]
+    fn opening_book_sacred_trunk_survives_incremental_apply_move() {
+        use crate::titanium::opening_book::OpeningBookMode;
+        let mut search = TitaniumSearch::grafted_v16(crate::titanium::game::GameState::new(), None);
+        search.set_opening_book(OpeningBookMode::Play, None);
+        search.apply_move(crate::titanium::algebraic_to_move_id("e2"));
+        let result = search.think(500, 128, false, false, "titanium-v16");
+        assert_eq!(
+            crate::titanium::move_id_to_algebraic(result.mv),
+            "e8",
+            "incremental makemove must still force sacred Black reply"
+        );
+        assert_eq!(result.stop_reason, "opening-book");
     }
 
     #[test]
@@ -1476,6 +1501,15 @@ mod score_label_tests {
     }
 }
 
+/// One tempo in eval units (1 grid step ≈ 100).
+const TEMPO_SCORE: i32 = 100;
+
+/// Full-width root defense: proven loss or ≥5 tempos behind (−500…).
+#[inline]
+pub fn needs_root_defense_verify(score: i32) -> bool {
+    is_proven_loss_score(score) || (score <= -(5 * TEMPO_SCORE) && score < 0)
+}
+
 /// Proven forced loss in the race or true-mate band.
 #[inline]
 pub fn is_proven_loss_score(score: i32) -> bool {
@@ -1539,7 +1573,7 @@ pub fn defense_selection_key(
     own_dist_after: i32,
     opp_dist_after: i32,
 ) -> i32 {
-    if is_proven_loss_score(score) {
+    if needs_root_defense_verify(score) {
         let worsen_penalty = if own_worsens { -1_000_000 } else { 0 };
         -2_000_000 + worsen_penalty + opp_dist_after * 100 - own_dist_after
     } else if is_proven_win_score(score) {
@@ -1574,8 +1608,8 @@ fn better_defense_candidate(
     if best_score == i32::MIN {
         return true;
     }
-    let loss = is_proven_loss_score(score);
-    let best_loss = is_proven_loss_score(best_score);
+    let loss = needs_root_defense_verify(score);
+    let best_loss = needs_root_defense_verify(best_score);
     if loss != best_loss {
         return !loss;
     }
@@ -2008,6 +2042,13 @@ pub struct TitaniumSearch {
     wall_ignore_cert_resolved: Option<bool>,
     /// Early Move Extensions on the first ordered wall moves (mirror of graduated LMR).
     eme: bool,
+    /// Experimental projected hands-empty race oracle (session-flagged).
+    race_projection: crate::titanium::race_projection::RaceProjectionConfig,
+    race_projection_budget: crate::titanium::race_projection::ProjectedRaceBudget,
+    pub race_projection_stats: crate::titanium::race_projection::RaceProjectionStats,
+    projection_move_bonus: [i32; 264],
+    projection_stable_winner: Option<usize>,
+    projection_prev_winner: Option<usize>,
     pub nodes: u64,
     deadline: Instant,
     root_best: i16,
@@ -2053,8 +2094,6 @@ pub struct TitaniumSearch {
     rc_think_solves: u32,
     /// deterministic per-think in-tree solve cap (LRU holds 64: stops config-thrash)
     rc_count_cap: u32,
-    rp_build_ok: bool,
-    rp_root_empty: bool,
     pub rp_demotions: u64,
     pub rp_root_solves: u64,
     /// -1 sentinel: cell 0 (a1) is a legal pawn-move id
@@ -2233,6 +2272,13 @@ impl TitaniumSearch {
             wall_ignore_cert_override: None,
             wall_ignore_cert_resolved: None,
             eme: false,
+            race_projection: crate::titanium::race_projection::RaceProjectionConfig::default(),
+            race_projection_budget: crate::titanium::race_projection::ProjectedRaceBudget::default(
+            ),
+            race_projection_stats: crate::titanium::race_projection::RaceProjectionStats::default(),
+            projection_move_bonus: [0; 264],
+            projection_stable_winner: None,
+            projection_prev_winner: None,
             nodes: 0,
             deadline: Instant::now(),
             root_best: super::TITANIUM_NO_MOVE,
@@ -2265,8 +2311,6 @@ impl TitaniumSearch {
             rc_miss_hi: 0,
             rc_think_solves: 0,
             rc_count_cap: 48,
-            rp_build_ok: false,
-            rp_root_empty: false,
             rp_demotions: 0,
             rp_root_solves: 0,
             root_pawn_best: -1,
@@ -2378,6 +2422,39 @@ impl TitaniumSearch {
 
     pub fn q_search_enabled(&self) -> bool {
         self.q_search
+    }
+
+    pub fn set_race_projection_config(&mut self, cfg: RaceProjectionConfig) {
+        self.race_projection = cfg;
+    }
+
+    pub fn race_projection_config(&self) -> RaceProjectionConfig {
+        self.race_projection
+    }
+
+    #[inline]
+    fn race_projection_active(&self) -> bool {
+        self.race_projection.enabled
+    }
+
+    #[inline]
+    fn race_projection_active_behavior(&self) -> bool {
+        self.race_projection.enabled && !self.race_projection.observe_only
+    }
+
+    #[inline]
+    fn race_projection_active_wall_qsearch(&self) -> bool {
+        self.race_projection_active_behavior() && self.race_projection.wall_qsearch && self.q_search
+    }
+
+    #[inline]
+    fn race_projection_active_null_cutoff(&self) -> bool {
+        self.race_projection_active_behavior() && self.race_projection.null_cutoff && self.q_search
+    }
+
+    #[inline]
+    fn race_projection_active_ordering(&self) -> bool {
+        self.race_projection_active_behavior() && self.race_projection.ordering
     }
 
     pub fn enable_lazy_topn(&mut self) {
@@ -2744,6 +2821,13 @@ impl TitaniumSearch {
     /// Long-lived session path — the next `think` reuses prior analysis.
     pub fn apply_move(&mut self, m: i16) {
         self.g.make_move(m);
+        // TiBridge movegen must track `g` after every incremental ply (WASM
+        // warm sessions, REPL `makemove`). Without this, root opening-book
+        // consult reads correct history from `g` but legal moves from a stale
+        // bridge — sacred e2/e8/e3/e7 trunk fails and the DAG plays walls.
+        if self.bridge.is_some() {
+            self.bridge = Some(TiBridge::from_game(&self.g));
+        }
         if m >= 100 {
             self.cached_stamp = -1;
         }
@@ -3056,6 +3140,9 @@ impl TitaniumSearch {
         worker.cert_eval_leaves_only = self.cert_eval_leaves_only;
         worker.wall_ignore_cert_override = self.wall_ignore_cert_override;
         worker.eme = self.eme;
+        worker.race_projection = self.race_projection;
+        worker.projection_move_bonus = self.projection_move_bonus;
+        worker.projection_stable_winner = self.projection_stable_winner;
         worker.use_partial_iter = self.use_partial_iter;
         worker.pure_mode = self.pure_mode;
         worker.race_proof = self.race_proof;
@@ -4014,6 +4101,14 @@ impl TitaniumSearch {
         self.cached_stamp = stamp;
     }
 
+    /// Hands-empty race oracle: runs at every searched node once both players
+    /// have depleted their wall stocks. `race_proof` is the master switch;
+    /// zero walls in hand is the only position gate.
+    #[inline]
+    fn hands_empty_race_oracle_active(&self) -> bool {
+        self.race_proof && self.g.wl[0] == 0 && self.g.wl[1] == 0
+    }
+
     /// Wall-topology key for `race_tbl` (pawns and turn XORed out).
     fn race_topology_key(&self) -> (u32, u32) {
         let z = &ZOBRIST;
@@ -4062,9 +4157,10 @@ impl TitaniumSearch {
     /// Key = position hash with pawns and turn XORed out (wall config only).
     ///
     /// Only valid when both players have 0 walls in hand — the table indexes
-    /// pawn pairs on a fixed wall topology, not wall-placement races.
+    /// pawn pairs on a fixed wall topology, not wall-placement races. When that
+    /// gate passes, every searched node may probe/build (no iterative-depth gate).
     fn race_tbl(&mut self, force: bool) -> Option<usize> {
-        if self.g.wl[0] != 0 || self.g.wl[1] != 0 {
+        if !self.hands_empty_race_oracle_active() {
             return None;
         }
         let (k_lo, k_hi) = self.race_topology_key();
@@ -4076,9 +4172,8 @@ impl TitaniumSearch {
             return None;
         }
         if !force {
-            // in-tree miss: build only when cheap to amortize (ticket16 SPRT-kill lesson)
-            if !self.rp_build_ok
-                || self.rc_think_solves >= self.rc_count_cap
+            // in-tree miss: time/count caps only (wall depletion is the position gate)
+            if self.rc_think_solves >= self.rc_count_cap
                 || (self.rc_think_solve_ms + self.rc_build_ms) as f64 > self.rc_solve_cap
                 || Instant::now() + Duration::from_millis(self.rc_build_ms) > self.deadline
             {
@@ -4144,7 +4239,7 @@ impl TitaniumSearch {
     }
 
     fn exact_hands_empty_score(&mut self, force: bool) -> Option<i32> {
-        if !self.race_proof || self.g.wl[0] != 0 || self.g.wl[1] != 0 {
+        if !self.hands_empty_race_oracle_active() {
             return None;
         }
         let slot = self.race_tbl(force)?;
@@ -4163,7 +4258,7 @@ impl TitaniumSearch {
     /// after this returns `LossFloor` or when walls remain.
     fn try_hands_empty_endgame(&mut self, d_me_i: i32, d_opp_i: i32) -> HandsEmptyPipelineOutcome {
         // Stage 1: existing `race_tbl` LRU memo (probe only, no build).
-        if self.race_proof {
+        if self.hands_empty_race_oracle_active() {
             let (k_lo, k_hi) = self.race_topology_key();
             if let Some(slot) = self.race_tbl_lru_probe(k_lo, k_hi) {
                 if let Some(score) = self.score_from_race_slot(slot) {
@@ -4195,7 +4290,7 @@ impl TitaniumSearch {
         }
 
         // Stage 3: `race_tbl(false)` — LRU probe then budget-gated build.
-        if self.race_proof {
+        if self.hands_empty_race_oracle_active() {
             if let Some(slot) = self.race_tbl(false) {
                 if let Some(score) = self.score_from_race_slot(slot) {
                     self.race_outcome_stats.resolved_race_tbl += 1;
@@ -4210,6 +4305,365 @@ impl TitaniumSearch {
             HandsEmptyPipelineOutcome::Score(3000 + (d_opp_i - d_me_i) * 50 - d_me_i)
         } else {
             HandsEmptyPipelineOutcome::Score(-3000 - (d_me_i - d_opp_i) * 50 + d_opp_i)
+        }
+    }
+
+    fn projected_probe_mode(&self) -> ProjectedProbeMode {
+        if self.race_projection.cache_only {
+            ProjectedProbeMode::CacheOnly
+        } else if self.race_projection.allow_build {
+            ProjectedProbeMode::AllowBudgetedBuild
+        } else {
+            ProjectedProbeMode::CheapGates
+        }
+    }
+
+    fn score_to_projected_result(
+        &self,
+        score: i32,
+        stm: usize,
+        source: ProjectedRaceSource,
+    ) -> ProjectedRaceResult {
+        let (winner, dtm) = if is_proven_win_score(score) {
+            (stm, Some((RACE_MATE - score).max(1) as i16))
+        } else if is_proven_loss_score(score) {
+            (1 - stm, None)
+        } else if score > 0 {
+            (stm, None)
+        } else {
+            (1 - stm, None)
+        };
+        ProjectedRaceResult {
+            winner,
+            dtm,
+            score,
+            source,
+        }
+    }
+
+    /// Run `f` on a cloned position, restoring `self.g` and distance state afterward.
+    fn with_game_state<R>(&mut self, state: &GameState, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.g.clone();
+        self.g = state.clone();
+        self.refresh_dist(0);
+        let out = f(self);
+        self.g = saved;
+        self.refresh_dist(0);
+        out
+    }
+
+    fn tt_best_move_for(&self, g: &GameState) -> Option<i16> {
+        let idx = (g.hash_lo & self.tt_mask) as usize;
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        let shared_entry = self
+            .shared_tt
+            .as_ref()
+            .and_then(|tt| tt.probe(g.hash_lo, g.hash_hi));
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        let meta = match shared_entry {
+            Some(entry) => entry.meta,
+            None if self.shared_tt.is_some() => 0,
+            None => self.tt_meta.get(idx).copied().unwrap_or(0),
+        };
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+        let meta = self.tt_meta.get(idx).copied().unwrap_or(0);
+        if meta == 0 {
+            return None;
+        }
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        let key_ok = shared_entry.is_some()
+            || (self.tt_key_hi.get(idx).copied() == Some(g.hash_hi)
+                && self.tt_key_lo.get(idx).copied() == Some(g.hash_lo));
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+        let key_ok = self.tt_key_hi.get(idx).copied() == Some(g.hash_hi)
+            && self.tt_key_lo.get(idx).copied() == Some(g.hash_lo);
+        if !key_ok {
+            return None;
+        }
+        let mv = (meta & 1023) as i16;
+        if mv > 0 {
+            Some(mv)
+        } else {
+            None
+        }
+    }
+
+    fn collect_tt_pv_line(&self, root: &GameState, max_plies: usize) -> Vec<i16> {
+        let mut g = root.clone();
+        let mut out = Vec::new();
+        for _ in 0..max_plies {
+            let Some(mv) = self.tt_best_move_for(&g) else {
+                break;
+            };
+            g.make_move(mv);
+            out.push(mv);
+        }
+        out
+    }
+
+    /// Cache-first projected hands-empty probe on the current `self.g`.
+    fn probe_projected_hands_empty_inner(
+        &mut self,
+        mode: ProjectedProbeMode,
+    ) -> Option<ProjectedRaceResult> {
+        let stm = self.g.turn;
+        let walls = self.g.wl[0] + self.g.wl[1];
+
+        // A: exact real-state hands-empty oracle.
+        if walls == 0 {
+            if let Some(score) = self.exact_hands_empty_score(false) {
+                self.race_projection_stats.real_exact_hits += 1;
+                return Some(self.score_to_projected_result(
+                    score,
+                    stm,
+                    ProjectedRaceSource::ExistingRaceTableCache,
+                ));
+            }
+        }
+
+        // A: exact real-state low-wall cert cache (lookup only).
+        if walls > 0 && walls <= 2 {
+            if self.cert_win_cache_hit(stm) {
+                self.race_projection_stats.real_exact_hits += 1;
+                return Some(ProjectedRaceResult {
+                    winner: stm,
+                    dtm: None,
+                    score: 2500,
+                    source: ProjectedRaceSource::ExistingLowWallCache,
+                });
+            }
+            if self.cert_win_cache_hit(1 - stm) {
+                self.race_projection_stats.real_exact_hits += 1;
+                return Some(ProjectedRaceResult {
+                    winner: 1 - stm,
+                    dtm: None,
+                    score: -2500,
+                    source: ProjectedRaceSource::ExistingLowWallCache,
+                });
+            }
+        }
+
+        let saved_wl = self.g.wl;
+        self.g.wl = [0, 0];
+        let mut result = None;
+
+        // B: projected topology race-table LRU (no build).
+        let (k_lo, k_hi) = self.race_topology_key();
+        if let Some(slot) = self.race_tbl_lru_probe(k_lo, k_hi) {
+            if let Some(score) = self.score_from_race_slot(slot) {
+                self.race_projection_stats.projected_cache_hits += 1;
+                result = Some(self.score_to_projected_result(
+                    score,
+                    stm,
+                    ProjectedRaceSource::ExistingRaceTableCache,
+                ));
+            }
+        }
+
+        // C: cheap Gate 1 on projected stocks.
+        if result.is_none() && mode != ProjectedProbeMode::CacheOnly && self.cheap_cert {
+            let d0 = &self.d0[self.dist0_idx];
+            let d1 = &self.d1[self.dist1_idx];
+            let d_me_i = if stm == 0 {
+                d0[self.g.pawn[0]] as i32
+            } else {
+                d1[self.g.pawn[1]] as i32
+            };
+            let d_opp_i = if stm == 0 {
+                d1[self.g.pawn[1]] as i32
+            } else {
+                d0[self.g.pawn[0]] as i32
+            };
+            match race_outcome_with_dist(&self.g, d0, d1, &mut self.race_outcome_stats) {
+                RaceBound::Lower(_) => {
+                    self.race_projection_stats.gate_hits += 1;
+                    result = Some(self.score_to_projected_result(
+                        RACE_MATE - d_me_i.max(1),
+                        stm,
+                        ProjectedRaceSource::CheapDistanceGate,
+                    ));
+                }
+                RaceBound::Upper(_) => {
+                    self.race_projection_stats.gate_hits += 1;
+                    result = Some(self.score_to_projected_result(
+                        -(RACE_MATE - d_opp_i.max(1)),
+                        stm,
+                        ProjectedRaceSource::CheapDistanceGate,
+                    ));
+                }
+                RaceBound::Exact(_) | RaceBound::Unknown => {}
+            }
+        }
+
+        // D: budgeted heavy table build on projected topology.
+        if result.is_none() && mode == ProjectedProbeMode::AllowBudgetedBuild {
+            if self.race_projection_budget.can_build() {
+                let solves_before = self.rc_solves;
+                if let Some(slot) = self.race_tbl(false) {
+                    if self.rc_solves > solves_before {
+                        self.race_projection_budget.note_build();
+                        self.race_projection_stats.builds += 1;
+                    }
+                    if let Some(score) = self.score_from_race_slot(slot) {
+                        result = Some(self.score_to_projected_result(
+                            score,
+                            stm,
+                            ProjectedRaceSource::HeavyTableBuild,
+                        ));
+                    }
+                }
+            } else {
+                self.race_projection_stats.build_denied_budget += 1;
+            }
+        }
+
+        self.g.wl = saved_wl;
+        debug_assert_eq!(self.g.wl, saved_wl);
+
+        if result.is_none() {
+            self.race_projection_stats.cache_misses += 1;
+        }
+        result
+    }
+
+    /// Project wall stocks to zero on an isolated copy; never pollutes TT/eval cache.
+    pub fn probe_projected_hands_empty(
+        &mut self,
+        state: &GameState,
+        mode: ProjectedProbeMode,
+    ) -> Option<ProjectedRaceResult> {
+        if !self.race_projection_budget.can_probe() {
+            self.race_projection_stats.budget_aborts += 1;
+            return None;
+        }
+        let t0 = Instant::now();
+        let out = self.with_game_state(state, |s| s.probe_projected_hands_empty_inner(mode));
+        let dt = t0.elapsed().as_nanos() as u64;
+        self.race_projection_budget.note_probe(dt);
+        self.race_projection_stats.projection_ns += dt;
+        out
+    }
+
+    fn race_projection_suffix_states(&self, pv: &[i16]) -> Vec<GameState> {
+        let mut last_wall = None;
+        for (i, &mv) in pv.iter().enumerate() {
+            if mv >= 100 {
+                last_wall = Some(i);
+            }
+        }
+        let Some(wall_i) = last_wall else {
+            return Vec::new();
+        };
+        let suffix = &pv[wall_i + 1..];
+        if suffix.len() < PROJECTION_SUFFIX_MIN {
+            return Vec::new();
+        }
+        let mut g = self.g.clone();
+        for &mv in &pv[..=wall_i] {
+            g.make_move(mv);
+        }
+        let mut states = Vec::new();
+        for &mv in suffix.iter().take(PROJECTION_SUFFIX_MAX_PROBES) {
+            g.make_move(mv);
+            states.push(g.clone());
+        }
+        states
+    }
+
+    fn race_projection_apply_ordering(&mut self, stable_winner: usize, root_move: i16) {
+        if !self.race_projection_active_ordering() {
+            return;
+        }
+        self.projection_move_bonus = [0; 264];
+        let stm = self.g.turn;
+        let favours_stm = stable_winner == stm;
+        let mut legal = [0i16; 160];
+        let n = self.gen_moves(0, 1, root_move, &mut legal);
+        self.race_projection_stats.ordering_nodes += n as u64;
+        let dist_me = if stm == 0 {
+            &self.d0[self.dist0_idx]
+        } else {
+            &self.d1[self.dist1_idx]
+        };
+        for i in 0..n {
+            let m = legal[i];
+            if favours_stm {
+                if m < 100 {
+                    let boost = 50_000 - dist_me[m as usize] as i32 * 1000;
+                    self.projection_move_bonus[m as usize] = boost;
+                    self.race_projection_stats.pawn_move_boosts += 1;
+                    if m == root_move {
+                        self.projection_move_bonus[m as usize] += 100_000;
+                    }
+                } else {
+                    self.projection_move_bonus[m as usize] = -20_000;
+                    self.race_projection_stats.wall_move_demotions += 1;
+                }
+            } else if m >= 100 {
+                self.projection_move_bonus[m as usize] = 80_000;
+                self.race_projection_stats.wall_move_boosts += 1;
+            } else {
+                self.projection_move_bonus[m as usize] = -30_000;
+            }
+        }
+    }
+
+    fn race_projection_after_completed_iteration(&mut self, depth: i32, root_move: i16) {
+        if !self.race_projection_active() || depth <= 0 {
+            return;
+        }
+        self.race_projection_stats.trigger_checks += 1;
+        let walls_left = self.g.wl[0] + self.g.wl[1];
+        if walls_left == 0 {
+            return;
+        }
+        let w_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
+        let b_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
+        let est = estimated_remaining_plies(w_dist, b_dist, walls_left);
+        if est > PROJECTION_OBSERVE_PLIES {
+            return;
+        }
+        self.race_projection_stats.triggered += 1;
+        if est <= PROJECTION_QSEARCH_PLIES {
+            self.race_projection_stats.short_pv += 1;
+        }
+        let pv = self.collect_tt_pv_line(&self.g, depth as usize * 2);
+        let suffix_states = self.race_projection_suffix_states(&pv);
+        if suffix_states.is_empty() {
+            return;
+        }
+        let mode = self.projected_probe_mode();
+        let mut winners = Vec::new();
+        for state in &suffix_states {
+            self.race_projection_stats.suffix_nodes += 1;
+            if let Some(res) = self.probe_projected_hands_empty(state, mode) {
+                winners.push(res.winner);
+            }
+        }
+        if winners.len() < 2 {
+            return;
+        }
+        let first = winners[0];
+        let stable = winners.iter().all(|&w| w == first);
+        if !stable {
+            self.race_projection_stats.winner_flips += 1;
+            self.projection_stable_winner = None;
+            return;
+        }
+        if self.projection_prev_winner == Some(first) {
+            self.race_projection_stats.stable += 1;
+        }
+        self.projection_prev_winner = Some(first);
+        self.projection_stable_winner = Some(first);
+        if est <= PROJECTION_QSEARCH_PLIES {
+            let prev_bonus = self.projection_move_bonus[root_move as usize];
+            self.race_projection_apply_ordering(first, root_move);
+            if self.race_projection_active_ordering()
+                && root_move >= 0
+                && self.projection_move_bonus[root_move as usize] != prev_bonus
+            {
+                self.race_projection_stats.root_move_changed += 1;
+            }
         }
     }
 
@@ -4436,10 +4890,30 @@ impl TitaniumSearch {
         let d_me_i = d_me_u as i32;
         let d_opp_i = d_opp_u as i32;
         let mut hands_empty_loss_floor = false;
-        if w_me_i == 0 && w_opp_i == 0 && (!self.cert_eval_leaves_only || depth <= 0) {
+        if w_me_i == 0 && w_opp_i == 0 {
             match self.try_hands_empty_endgame(d_me_i, d_opp_i) {
-                HandsEmptyPipelineOutcome::Score(s) => return s,
+                // Proven race/mate scores are sound at any node; the distance
+                // heuristic (±3000) is leaf-only — using it in-tree poisons pruning.
+                HandsEmptyPipelineOutcome::Score(s) => {
+                    if is_proven_win_score(s) || is_proven_loss_score(s) || depth <= 0 {
+                        return s;
+                    }
+                }
                 HandsEmptyPipelineOutcome::LossFloor => hands_empty_loss_floor = true,
+            }
+        }
+        // Both paths fixed by remaining legal walls: evaluate the pure pawn race
+        // as if all stocks were already spent (guides search before depletion).
+        if self.race_projection_active_wall_qsearch()
+            && self.q_search
+            && self.low_wall_endgame_active()
+            && self.player_path_immutable(0)
+            && self.player_path_immutable(1)
+        {
+            if let Some(s) = self.virtual_hands_empty_proven_score() {
+                if is_proven_win_score(s) || is_proven_loss_score(s) || depth <= 0 {
+                    return s;
+                }
             }
         }
         if self.race_proof
@@ -5030,6 +5504,9 @@ impl TitaniumSearch {
                     0
                 }
             };
+            if self.race_projection_active_ordering() {
+                sc[i] += self.projection_move_bonus[m as usize];
+            }
         }
         if ply == 0 {
             if let Some(order) = &self.opening_book_order {
@@ -5101,6 +5578,35 @@ impl TitaniumSearch {
         }
     }
 
+    #[inline]
+    fn low_wall_endgame_active(&self) -> bool {
+        let w = self.g.wl[0] + self.g.wl[1];
+        w > 0 && w <= LOW_WALL_QSEARCH_MAX_TOTAL
+    }
+
+    #[inline]
+    fn player_path_immutable(&mut self, player: usize) -> bool {
+        let d = if player == 0 {
+            &self.d0[self.dist0_idx]
+        } else {
+            &self.d1[self.dist1_idx]
+        };
+        player_shortest_path_immutable(&mut self.g, d)
+    }
+
+    /// Probe the race oracle as if both stocks were already depleted (wl is not
+    /// part of the zobrist key). Returns only proven retrograde scores.
+    fn virtual_hands_empty_proven_score(&mut self) -> Option<i32> {
+        if self.hands_empty_race_oracle_active() {
+            return self.exact_hands_empty_score(false);
+        }
+        let saved = self.g.wl;
+        self.g.wl = [0, 0];
+        let score = self.exact_hands_empty_score(false);
+        self.g.wl = saved;
+        score
+    }
+
     fn q_search_jump_race_trigger(&self) -> bool {
         let me = self.g.turn;
         let from = self.g.pawn[me] as usize;
@@ -5148,6 +5654,15 @@ impl TitaniumSearch {
     fn q_search_should_extend(&mut self, ply: usize, prev_move: i16, static_ev: i32) -> bool {
         if ply == 0 {
             return false;
+        }
+        // Low-wall endgame: extend at the horizon until both hands are empty.
+        if self.race_projection_active_wall_qsearch()
+            && self.q_search
+            && self.low_wall_endgame_active()
+            && self.g.wl[0] + self.g.wl[1] > 0
+        {
+            self.race_projection_stats.qsearch_entries += 1;
+            return true;
         }
         let parent_static = self.eval_stack[ply - 1];
         if parent_static == i32::MIN {
@@ -5366,6 +5881,24 @@ impl TitaniumSearch {
         // null move
         if allow_null && depth >= 3 && ply > 0 {
             let ev = static_ev;
+            // Immutable-path null: if no legal wall can change stm's distance,
+            // the remaining wall stocks cannot alter the race — use the virtual
+            // hands-empty oracle to justify a fail-high when the race is won.
+            if self.race_projection_active_null_cutoff()
+                && self.q_search
+                && self.low_wall_endgame_active()
+            {
+                self.race_projection_stats.null_attempts += 1;
+                let stm = self.g.turn;
+                if self.player_path_immutable(stm) {
+                    if let Some(race) = self.virtual_hands_empty_proven_score() {
+                        if race >= beta && race < MATE - 200 {
+                            self.race_projection_stats.null_cutoffs += 1;
+                            return Ok(beta);
+                        }
+                    }
+                }
+            }
             if ev >= beta {
                 let z = &ZOBRIST;
                 self.g.turn ^= 1;
@@ -5417,6 +5950,7 @@ impl TitaniumSearch {
         // Cheap BFF impact heatmap (bitboard path-set + flood): a move's
         // impact is a heatmap lookup (wall = hottest touched square).
         let mut heat_by_id = [0i32; 264];
+        let mut route_touch_by_id = [false; 264];
         let mut max_move_impact = 0u32;
         // Walls and pawn moves are normalized separately: a pawn destination's
         // heat can dwarf every wall's heat, which previously made the best wall
@@ -5436,48 +5970,38 @@ impl TitaniumSearch {
                     }
                 }
             }
-            // Cheap cold-start nudge (experimental, off by default): a wall
-            // touching a cell on EITHER player's shortest-route set gets a
-            // small flat bonus, on top of (not instead of) the CAT heat
-            // above. Deliberately NOT "does this wall actually block the
-            // path" (that needs walking the path's edges, the expensive
-            // check this replaces) -- just "is it near/adjacent to the
-            // route", from the already-leaf-cheap route masks (bit-parallel
-            // flood, same cost class as the CAT heatmap itself). Small
-            // enough (ROUTE_TOUCH_ORDER_BONUS) to nudge otherwise-similar
-            // moves earlier without overriding a strong CAT signal or
-            // distorting iterative deepening.
-            if self.route_touch_ordering {
-                let d0f = self.d0[self.dist0_idx];
-                let d1f = self.d1[self.dist1_idx];
-                let mut route0 = [0u8; 81];
-                let mut route1 = [0u8; 81];
-                let mut flank_scratch = [0u8; 81];
-                fill_sparse_route_masks(
-                    &self.g,
-                    self.g.pawn[0],
-                    &d0f,
-                    &mut route0,
-                    &mut flank_scratch,
-                );
-                fill_sparse_route_masks(
-                    &self.g,
-                    self.g.pawn[1],
-                    &d1f,
-                    &mut route1,
-                    &mut flank_scratch,
-                );
-                for i in 0..n {
-                    if moves[i] < 100 {
-                        continue; // pawn moves -- route-touch only makes sense for walls
-                    }
-                    if let crate::core::board::Move::Wall {
-                        row,
-                        col,
-                        orientation,
-                    } = move_id_to_board(moves[i])
-                    {
-                        if wall_touches_route(row, col, orientation, &route0, &route1) {
+            let d0f = self.d0[self.dist0_idx];
+            let d1f = self.d1[self.dist1_idx];
+            let mut route0 = [0u8; 81];
+            let mut route1 = [0u8; 81];
+            let mut flank_scratch = [0u8; 81];
+            fill_sparse_route_masks(
+                &self.g,
+                self.g.pawn[0],
+                &d0f,
+                &mut route0,
+                &mut flank_scratch,
+            );
+            fill_sparse_route_masks(
+                &self.g,
+                self.g.pawn[1],
+                &d1f,
+                &mut route1,
+                &mut flank_scratch,
+            );
+            for i in 0..n {
+                if moves[i] < 100 {
+                    continue;
+                }
+                if let crate::core::board::Move::Wall {
+                    row,
+                    col,
+                    orientation,
+                } = move_id_to_board(moves[i])
+                {
+                    if wall_touches_route(row, col, orientation, &route0, &route1) {
+                        route_touch_by_id[moves[i] as usize] = true;
+                        if self.route_touch_ordering {
                             heat_by_id[moves[i] as usize] += ROUTE_TOUCH_ORDER_BONUS;
                             max_move_impact =
                                 max_move_impact.max(heat_by_id[moves[i] as usize].max(0) as u32);
@@ -5654,7 +6178,15 @@ impl TitaniumSearch {
                     // delay was only used to choose a diagnostic tail label, and
                     // refreshing child wall distances here made search pay an
                     // extra flood before the child node needed distances.
-                    plan_v16_wall_lmr(i, depth, new_depth, attention_ratio, 0, 0)
+                    plan_v16_wall_lmr(
+                        i,
+                        depth,
+                        new_depth,
+                        attention_ratio,
+                        0,
+                        0,
+                        route_touch_by_id[m as usize],
+                    )
                 } else {
                     let ace_base = ace_graduated_lmr_reduction(i, depth);
                     let final_reduction = ace_base.min((new_depth - 1).max(0));
@@ -6463,6 +6995,7 @@ impl TitaniumSearch {
                 depth_log: Vec::new(),
                 stop_reason: "opening-book",
                 race_outcome_stats: self.race_outcome_stats,
+                race_projection_stats: self.race_projection_stats,
                 opening_book: self.pending_opening_book_diag.take(),
                 root_defense_diag: Vec::new(),
             };
@@ -6578,18 +7111,14 @@ impl TitaniumSearch {
                     depth_log: Vec::new(),
                     stop_reason: "cheap_cert_root_race",
                     race_outcome_stats: self.race_outcome_stats,
+                    race_projection_stats: self.race_projection_stats,
                     opening_book: None,
                     root_defense_diag: Vec::new(),
                 };
             }
         }
 
-        if self.race_proof
-            && self.g.wl[0] == 0
-            && self.g.wl[1] == 0
-            && self.g.pawn[0] >= 9
-            && self.g.pawn[1] < 72
-        {
+        if self.hands_empty_race_oracle_active() && self.g.pawn[0] >= 9 && self.g.pawn[1] < 72 {
             let rt0 = Instant::now();
             // root-level: always allowed to build (force=true; deadline not set yet)
             let rv = self.race_tbl(true).map_or(0, |s| self.race_value(s)) as i32;
@@ -6623,6 +7152,7 @@ impl TitaniumSearch {
                         depth_log: Vec::new(),
                         stop_reason: "race_proof_root_table",
                         race_outcome_stats: self.race_outcome_stats,
+                        race_projection_stats: self.race_projection_stats,
                         opening_book: None,
                         root_defense_diag: Vec::new(),
                     };
@@ -6716,6 +7246,7 @@ impl TitaniumSearch {
                 depth_log: Vec::new(),
                 stop_reason: "opening-book",
                 race_outcome_stats: self.race_outcome_stats,
+                race_projection_stats: self.race_projection_stats,
                 opening_book: self.pending_opening_book_diag.take(),
                 root_defense_diag: Vec::new(),
             };
@@ -7031,8 +7562,6 @@ impl TitaniumSearch {
         self.rc_solve_cap = time_ms as f64 * 0.25;
         self.rc_blocked = false;
         self.rc_think_solves = 0;
-        self.rp_root_empty = self.race_proof && self.g.wl[0] == 0 && self.g.wl[1] == 0;
-        self.rp_build_ok = false;
         self.stream_log = log;
         self.stream_label = engine_label.to_string();
         self.stream_t0 = t0;
@@ -7042,6 +7571,13 @@ impl TitaniumSearch {
         self.stream_last_emit_nodes = 0;
         self.stream_last_emit_ms = 0;
         self.stream_last_best = super::TITANIUM_NO_MOVE;
+        if self.race_projection_active() {
+            self.race_projection_budget.begin_think(time_ms);
+            self.race_projection_stats = RaceProjectionStats::default();
+            self.projection_move_bonus = [0; 264];
+            self.projection_stable_winner = None;
+            self.projection_prev_winner = None;
+        }
         // Re-sync the mirrored Titanium board from the authoritative ACE game.
         // Kills any drift left over from a previous search (e.g. an unbalanced
         // push/pop on time-abort) before it can poison this move's root list.
@@ -7120,6 +7656,9 @@ impl TitaniumSearch {
         };
 
         for d in start_depth..=max_depth {
+            if self.race_projection_active() {
+                self.race_projection_budget.begin_iteration();
+            }
             if !full && d > 1 && Self::ace_over_time_budget(t0, time_ms, last_score) {
                 *stop_reason = "ace_over_time_budget_before_depth";
                 break;
@@ -7135,8 +7674,6 @@ impl TitaniumSearch {
                 *stop_reason = "deadline_before_depth";
                 break;
             }
-            // RaceProof: in-tree solves only when cheap to amortize
-            self.rp_build_ok = self.rp_root_empty || d >= 6;
             self.root_pawn_best = -1;
             self.root_pawn_score = i32::MIN;
             self.stream_root_score = last_score;
@@ -7213,7 +7750,8 @@ impl TitaniumSearch {
                         self.sync_stream_meta(&depth_log, d, last_score);
                         self.emit_stream_progress(true);
                     }
-                    if is_proven_loss_score(sc) {
+                    self.race_projection_after_completed_iteration(d, last_best);
+                    if needs_root_defense_verify(sc) {
                         match self.root_defense_verify(d) {
                             Ok(defense_score) => {
                                 last_best = self.root_best;
@@ -7280,9 +7818,9 @@ impl TitaniumSearch {
                             }
                         }
                     }
-                    if last_score > MATE - 200 || last_score < -(MATE - 200) {
+                    if is_proven_win_score(last_score) || is_proven_loss_score(last_score) {
                         *stop_reason = "forced_mate_or_loss";
-                        break; // forced result
+                        break; // forced race or mate result
                     }
                     // v8 easy-move stop (acev8_engine.js)
                     if !full
@@ -7453,8 +7991,76 @@ impl TitaniumSearch {
             depth_log,
             stop_reason: *stop_reason,
             race_outcome_stats: self.race_outcome_stats,
+            race_projection_stats: self.race_projection_stats,
             opening_book: self.pending_opening_book_diag.take(),
             root_defense_diag: self.root_defense_diag.clone(),
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod race_projection_tests {
+    use super::*;
+    use crate::titanium::race_projection::{ProjectedProbeMode, ProjectedRaceBudget};
+    use crate::titanium::session::apply_session_experiment_flags;
+
+    fn v17(g: GameState) -> Box<TitaniumSearch> {
+        let mut s = TitaniumSearch::grafted_v16(g, None);
+        apply_session_experiment_flags(&mut s, "titanium-v17");
+        s
+    }
+
+    #[test]
+    fn v17_baseline_parity_fixed_depth() {
+        let g = GameState::new();
+        let mut a = v17(g.clone());
+        let mut b = v17(g);
+        let ra = a.think(60_000, 4, true, false, "titanium-v17");
+        let rb = b.think(60_000, 4, true, false, "titanium-v17");
+        assert_eq!(ra.mv, rb.mv);
+        assert_eq!(ra.score, rb.score);
+        assert_eq!(ra.depth, rb.depth);
+        assert_eq!(ra.nodes, rb.nodes);
+        assert_eq!(ra.race_projection_stats.triggered, 0);
+    }
+
+    #[test]
+    fn projected_probe_restores_wall_stocks() {
+        let mut search = v17(GameState::new());
+        search.g.wl = [2, 1];
+        let before = search.g.clone();
+        let _ = search.probe_projected_hands_empty(&before, ProjectedProbeMode::CacheOnly);
+        assert_eq!(search.g.wl, before.wl);
+        assert_eq!(search.g.hash_lo, before.hash_lo);
+        assert_eq!(search.g.hash_hi, before.hash_hi);
+        assert_eq!(search.g.pawn, before.pawn);
+    }
+
+    #[test]
+    fn cache_only_probe_never_builds_race_table() {
+        let mut search = v17(GameState::new());
+        search.g.wl = [1, 1];
+        let solves_before = search.rc_solves;
+        let _ =
+            search.probe_projected_hands_empty(&search.g.clone(), ProjectedProbeMode::CacheOnly);
+        assert_eq!(search.rc_solves, solves_before);
+    }
+
+    #[test]
+    fn real_hands_empty_matches_projected_probe() {
+        let mut search = v17(GameState::new());
+        search.g.wl = [0, 0];
+        let state = search.g.clone();
+        let a = search.probe_projected_hands_empty(&state, ProjectedProbeMode::CacheOnly);
+        let b = search.probe_projected_hands_empty(&state, ProjectedProbeMode::CheapGates);
+        assert_eq!(a.map(|x| x.score), b.map(|x| x.score));
+    }
+
+    #[test]
+    fn opening_position_skips_projection_triggers() {
+        let mut search = v17(GameState::new());
+        apply_session_experiment_flags(&mut search, "titanium-v17-race-projection-observe");
+        let result = search.think(200, 3, true, false, "titanium-v17-race-projection-observe");
+        assert_eq!(result.race_projection_stats.triggered, 0);
     }
 }

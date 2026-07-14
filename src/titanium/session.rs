@@ -10,6 +10,7 @@
 use std::io::{self, BufRead, Write};
 
 use super::{algebraic_to_move_id, move_id_to_algebraic, GameState, TitaniumSearch};
+use crate::titanium::race_projection::RaceProjectionConfig;
 
 fn reply_ready(stdout: &mut io::Stdout) {
     let _ = writeln!(stdout, "ready");
@@ -38,6 +39,9 @@ fn is_v16_graft(engine_flag: &str) -> bool {
             | "titanium-v17-no-partial-iter"
             | "titanium-v17-no-predict-stop"
             | "titanium-v17-no-partial-no-predict"
+            | "titanium-v17-race-projection-observe"
+            | "titanium-v17-race-projection"
+            | "titanium-v17-race-projection-null"
     )
 }
 
@@ -55,6 +59,9 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
             | "titanium-v17-no-partial-iter"
             | "titanium-v17-no-predict-stop"
             | "titanium-v17-no-partial-no-predict"
+            | "titanium-v17-race-projection-observe"
+            | "titanium-v17-race-projection"
+            | "titanium-v17-race-projection-null"
     );
     let enable_sf_history = matches!(
         engine_flag,
@@ -68,11 +75,14 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
             | "titanium-v17-rfp-ace"
             | "titanium-v17-probcut"
             | "titanium-v17-lmp-ace"
+            | "titanium-v17-race-projection-observe"
+            | "titanium-v17-race-projection"
+            | "titanium-v17-race-projection-null"
     ) || is_v17;
     if enable_sf_history {
         search.set_sf_history(true);
     }
-    if engine_flag.contains("route-touch") {
+    if engine_flag == "titanium-v17" || engine_flag.contains("route-touch") {
         search.enable_route_touch_ordering();
     }
     if engine_flag == "titanium-v17"
@@ -127,6 +137,18 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
     }
     if engine_flag.contains("pmc") {
         search.enable_eme();
+    }
+    match engine_flag {
+        "titanium-v17-race-projection-observe" => {
+            search.set_race_projection_config(RaceProjectionConfig::observe());
+        }
+        "titanium-v17-race-projection" => {
+            search.set_race_projection_config(RaceProjectionConfig::candidate());
+        }
+        "titanium-v17-race-projection-null" => {
+            search.set_race_projection_config(RaceProjectionConfig::candidate_null());
+        }
+        _ => {}
     }
 }
 
@@ -292,17 +314,17 @@ mod session_tests {
     use crate::titanium::game::GameState;
 
     #[test]
-    fn v17_route_touch_session_enables_experiments() {
+    fn v17_route_touch_variant_enables_route_touch_only() {
         let search = build_search("titanium-v17-route-touch", GameState::new());
         assert!(search.route_touch_ordering_enabled());
         assert!(!search.q_search_enabled());
     }
 
     #[test]
-    fn v17_session_enables_qsearch_without_route_touch() {
+    fn v17_session_enables_qsearch_and_route_touch() {
         let search = build_search("titanium-v17", GameState::new());
         assert!(search.q_search_enabled());
-        assert!(!search.route_touch_ordering_enabled());
+        assert!(search.route_touch_ordering_enabled());
     }
 
     #[test]
@@ -386,5 +408,20 @@ mod session_tests {
         let explicit = build_search("titanium-v17-rfp-ace", GameState::new());
         assert!(default.ace_rfp_enabled());
         assert!(explicit.ace_rfp_enabled());
+    }
+
+    #[test]
+    fn v17_race_projection_session_labels() {
+        let v17 = build_search("titanium-v17", GameState::new());
+        let obs = build_search("titanium-v17-race-projection-observe", GameState::new());
+        let cand = build_search("titanium-v17-race-projection", GameState::new());
+        let null = build_search("titanium-v17-race-projection-null", GameState::new());
+        assert!(!v17.race_projection_config().enabled);
+        assert!(obs.race_projection_config().enabled);
+        assert!(obs.race_projection_config().observe_only);
+        assert!(cand.race_projection_config().ordering);
+        assert!(cand.race_projection_config().wall_qsearch);
+        assert!(!cand.race_projection_config().null_cutoff);
+        assert!(null.race_projection_config().null_cutoff);
     }
 }

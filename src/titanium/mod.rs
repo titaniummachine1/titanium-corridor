@@ -41,6 +41,7 @@ pub mod oracle;
 pub mod packed_state;
 pub mod perft;
 pub mod race;
+pub mod race_projection;
 pub mod reduction_sidecar;
 pub mod search;
 pub mod session;
@@ -59,6 +60,7 @@ pub use perft::{
     perft_titanium_ti_timed, perft_titanium_timed, TimedPerftResult, TITANIUM_PERFT4_STARTPOS,
 };
 pub use race::RaceOutcomeStats;
+pub use race_projection::RaceProjectionStats;
 pub use search::{
     board_move_to_move_id, format_root_defense_diag_json, ReductionProbeEvent,
     ReductionShadowStats, RootDefenseDiag, ThinkResult, TitaniumSearch,

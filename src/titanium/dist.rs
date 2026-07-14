@@ -207,6 +207,25 @@ pub fn wall_incr_refresh_flags(d0: &[u8; 81], d1: &[u8; 81], m: i16) -> (bool, b
     )
 }
 
+/// True when no legal wall placement on the board can change this player's
+/// cached goal-distance field — their shortest-path length is fixed regardless
+/// of where remaining stocks are spent.
+#[inline]
+pub fn player_shortest_path_immutable(g: &mut GameState, d_player: &[u8; 81]) -> bool {
+    for wt in 0..2usize {
+        for slot in 0..64usize {
+            if !g.wall_legal(wt, slot) {
+                continue;
+            }
+            let m = (if wt == 0 { 100 } else { 200 }) + slot as i16;
+            if wall_incr_cuts_player_dist(d_player, m) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Inverse flood: distance from each cell to `player`'s goal row (ACE index).
 pub fn fill_ace_dist_to_goal(g: &GameState, player: usize, ace_dist: &mut [u8; 81]) {
     let masks = DirMasks::from_ace_game(g);
@@ -747,6 +766,17 @@ mod tests {
             false_negatives, 0,
             "edge-cut skip would misclassify {false_negatives} / {no_edge_trials} no-edge walls"
         );
+    }
+
+    #[test]
+    fn startpos_shortest_paths_are_mutable() {
+        let mut g = GameState::new();
+        let mut d0 = [0u8; 81];
+        let mut d1 = [0u8; 81];
+        fill_ace_dist_to_goal(&g, 0, &mut d0);
+        fill_ace_dist_to_goal(&g, 1, &mut d1);
+        assert!(!player_shortest_path_immutable(&mut g, &d0));
+        assert!(!player_shortest_path_immutable(&mut g, &d1));
     }
 
     #[test]
