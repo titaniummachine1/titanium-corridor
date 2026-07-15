@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use crate::core::board::{Board, Move, Player, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::util::grid::goal_row;
 
 const DISABLE_BOOK_ENV: &str = "TITANIUM_DISABLE_BOOK";

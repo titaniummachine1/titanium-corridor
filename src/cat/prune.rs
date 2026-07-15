@@ -9,9 +9,9 @@ use crate::cat::constants::{CAT_COLD_CM, CAT_HOT_CM, DIST_PENALTY};
 use crate::core::board::{Board, Move, Player, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
-use crate::path::distance::fill_dist_to_goal_row;
-use crate::path::masks::DirMasks;
-use crate::path::BfsScratch;
+use crate::pathfinding::bfs::layers::fill_dist_to_goal_row;
+use crate::pathfinding::masks::DirMasks;
+use crate::pathfinding::BfsScratch;
 use crate::util::grid::{has_wall, is_goal, square_index, unpack_square, wall_touch_squares};
 /// Wasted turn: opponent gets to improve on reply.
 pub const TEMPO_PENALTY: i32 = -10;
@@ -1576,7 +1576,7 @@ mod tests {
         let n = full.min(buf.len());
         buf[..n].copy_from_slice(&scratch[..n]);
         let mut scores = [0i32; MAX_LEGAL_MOVES];
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let mut opp_path = [0u8; 81];
         let opp_len = get_shortest_path(&board, board.side().opposite(), &mut bfs, &mut opp_path);
         let our_dist = bfs
@@ -1661,7 +1661,7 @@ mod tests {
         );
 
         let mut bfs = BfsScratch::new();
-        let hot_cat = bfs.build_corridor_attention(&board);
+        let hot_cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         assert!(
             wall_shape_attention_bonus(&board, cross, &hot_cat) >= WALL_CROSS_GAP_CM,
             "hot corridor cross-gap should get a tiny ordering nudge"
@@ -1701,7 +1701,7 @@ mod tests {
         board.hash = crate::core::zobrist::hash_board(&board);
 
         let mut bfs = BfsScratch::new();
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let reachable = bfs.both_reachable_mask(&board);
         let our_dist = bfs
             .shortest_distance(&board, Player::One)
@@ -1777,7 +1777,7 @@ mod tests {
         board.hash = crate::core::zobrist::hash_board(&board);
 
         let mut bfs = BfsScratch::new();
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let reachable = bfs.both_reachable_mask(&board);
         let gap_zone = gap_play_zone_mask(reachable);
         // No square is actually sealed here — gap zone must be empty. (The old
@@ -1898,7 +1898,7 @@ mod tests {
     fn wall_search_prunes_enclosed_t_keeps_corridor_blocks() {
         let board = Board::new();
         let mut bfs = BfsScratch::new();
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let reachable = bfs.both_reachable_mask(&board);
         let our_dist = bfs
             .shortest_distance(&board, Player::One)
@@ -1962,7 +1962,7 @@ mod tests {
         ] {
             set_wall(&mut pocket, row, col, orient, true);
         }
-        let cat_pocket = bfs.build_corridor_attention(&pocket);
+        let cat_pocket = crate::cat::build_corridor_attention(&mut bfs, &pocket);
         let reachable_pocket = bfs.both_reachable_mask(&pocket);
         let gap_zone_pocket = gap_play_zone_mask(reachable_pocket);
         let our_dist_pocket = bfs
@@ -2004,7 +2004,7 @@ mod tests {
         set_wall(&mut board, 0, 5, WallOrientation::Vertical, true);
         set_wall(&mut board, 1, 5, WallOrientation::Vertical, true);
         let mut bfs = BfsScratch::new();
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let t_junction = Move::Wall {
             row: 1,
             col: 5,
@@ -2034,7 +2034,7 @@ mod tests {
         let opp = bfs
             .shortest_distance(&board, Player::Two)
             .unwrap_or(DIST_PENALTY);
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let mut opp_path = [0u8; 81];
         let opp_path_len = get_shortest_path(&board, Player::Two, &mut bfs, &mut opp_path);
         let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
@@ -2101,7 +2101,7 @@ mod tests {
             .unwrap_or(DIST_PENALTY);
         assert!(our > opp, "white should be behind in race, W{our} B{opp}");
 
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let mut opp_path = [0u8; 81];
         let opp_path_len = get_shortest_path(&board, Player::Two, &mut bfs, &mut opp_path);
         let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];

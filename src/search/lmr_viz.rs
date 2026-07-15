@@ -9,7 +9,7 @@ use crate::cat::prune::{
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::search::lmr_profile::{compute_stage_t, LmrProfile};
 use crate::search::v16_lmr::{
     plan_v16_pawn_lmr, plan_v16_wall_lmr, V16HardOverride, ACE_LMR_AFTER_MOVE, ACE_LMR_MIN_DEPTH,

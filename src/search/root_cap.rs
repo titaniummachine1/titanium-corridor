@@ -78,7 +78,7 @@ pub fn cap_root_wall_moves(
 mod tests {
     use super::*;
     use crate::core::board::{Board, WallOrientation};
-    use crate::path::BfsScratch;
+    use crate::pathfinding::BfsScratch;
 
     #[test]
     fn pierce_cap_never_drops_cat_hot_walls() {
@@ -87,7 +87,7 @@ mod tests {
             board.apply_algebraic(m);
         }
         let mut bfs = BfsScratch::new();
-        let cat = bfs.build_corridor_attention(&board);
+        let cat = crate::cat::build_corridor_attention(&mut bfs, &board);
         let walls = [
             Move::Wall {
                 row: 3,

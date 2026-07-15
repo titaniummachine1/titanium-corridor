@@ -134,7 +134,7 @@ pub fn board_after_canta_game(game_idx: usize) -> Board {
 mod tests {
     use super::*;
     use crate::movegen::generate_legal_moves;
-    use crate::path::BfsScratch;
+    use crate::pathfinding::BfsScratch;
     use crate::util::perft::perft_fast;
 
     #[test]

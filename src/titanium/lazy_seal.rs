@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::board::{Board, WallOrientation};
 use crate::movegen::wall_masks::{wall_needs_flood_h_from_bits, wall_needs_flood_v_from_bits};
-use crate::path::parallel::{bff_wall_legal, pawn_bit, wall_delta, WallGrids};
+use crate::pathfinding::bff::wall::{bff_wall_legal, pawn_bit, wall_delta, WallGrids};
 use crate::titanium::game::GameState;
 use crate::util::clock::Instant;
 

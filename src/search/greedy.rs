@@ -2,7 +2,7 @@
 
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 
 const DIST_PENALTY: u8 = 255;
 

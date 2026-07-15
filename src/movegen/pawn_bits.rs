@@ -3,7 +3,7 @@
 //! Compare against `generate_pawn_moves_scalar_for` in tests/benches.
 
 use crate::core::board::{Board, Move};
-use crate::path::masks::DirMasks;
+use crate::pathfinding::masks::DirMasks;
 use crate::util::grid::{
     can_step, flood_bit_sq, square_index, unpack_square, FLOOD_SQ_BY_BIT, FLOOD_STRIDE,
 };
@@ -170,7 +170,7 @@ mod tests {
     use super::*;
     use crate::movegen::legal::generate_pawn_moves_scalar_for;
     use crate::movegen::MAX_LEGAL_MOVES;
-    use crate::path::BfsScratch;
+    use crate::pathfinding::BfsScratch;
 
     fn same_pawn_multiset(a: &[Move], b: &[Move]) -> bool {
         if a.len() != b.len() {

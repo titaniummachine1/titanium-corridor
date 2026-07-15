@@ -2,7 +2,7 @@
 
 use crate::core::board::Board;
 use crate::opening::book::{self, BOOK_MAX_PLY};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::search::alphabeta::genmove_algebraic as minimax_algebraic;
 use crate::search::genmove::{GenmoveConfig, GenmoveEngine};
 use crate::search::greedy::choose_greedy_move;

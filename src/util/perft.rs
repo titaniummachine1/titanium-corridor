@@ -30,7 +30,7 @@ use crate::movegen::{
     generate_legal_moves_slice_anchor_baseline, generate_legal_moves_slice_mode,
     generate_pawn_moves_slice_mode, PawnGenMode, MAX_LEGAL_MOVES,
 };
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::search::context::{SharedState, WorkerContext};
 use std::collections::BTreeMap;
 

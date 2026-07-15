@@ -1,8 +1,10 @@
 //! Bitwise flood-fill primitives (centered 11-wide u128 layout).
-//! Shared building blocks for ACE distance fields and `parallel::bff_*` wall trials.
+//! Shared Binary Flood Fill (BFF) building blocks for BFS fields and wall trials.
+
+pub mod wall;
 
 use crate::core::board::Player;
-use crate::path::masks::DirMasks;
+use crate::pathfinding::masks::DirMasks;
 #[cfg(test)]
 use crate::util::grid::pack_flood_mask;
 use crate::util::grid::{flood_bit_sq, goal_row, square_index, FLOOD_PLAYABLE, FLOOD_STRIDE};

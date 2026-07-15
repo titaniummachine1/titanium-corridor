@@ -1,21 +1,23 @@
-//! `BfsScratch` — reusable flood-fill scratch for movegen, search, and CAT.
+//! Board-facing BFS queries shared by engine systems.
 
-use crate::cat::attention::CorridorAttention;
-use crate::cat::build::{build_corridor_attention, corridor_bottleneck_count};
+// Board-facing BFS queries belong here; layer mechanics live in `layers`.
+pub mod layers;
+
 use crate::core::board::{Board, Player};
-use crate::path::flood::{
-    expand_frontier, flood_fill_flood_bits, flood_to_goal, flood_to_goal_seeded, goal_square_mask,
+use crate::pathfinding::bff::{
+    flood_fill_flood_bits, flood_to_goal, flood_to_goal_seeded, flood_to_goal_with_depth,
+    goal_square_mask,
 };
-use crate::path::masks::DirMasks;
-use crate::util::grid::{
-    can_step, flood_bit_sq, goal_row, pack_flood_mask, square_index, unpack_square, FLOOD_PLAYABLE,
+use crate::pathfinding::bfs::layers::{
+    fill_bfs_layers_until_goal, fill_dist_layers_to_goal_row, DistLayers,
 };
+use crate::pathfinding::masks::DirMasks;
+use crate::util::grid::{pack_flood_mask, square_index};
 
-/// Reused flood-fill scratch — pass through perft/move-gen hot loops.
+/// Reused BFS workspace — pass through perft and move-generation hot loops.
 #[derive(Clone)]
 pub struct BfsScratch {
-    visited: u128,
-    queue: [u8; 81],
+    bfs_layers: DistLayers,
     dist_from_pawn: [u8; 81],
     dist_to_goal: [u8; 81],
     /// Cached `DirMasks` for the current board hash — one build per movegen node.
@@ -32,8 +34,7 @@ impl Default for BfsScratch {
 impl BfsScratch {
     pub fn new() -> Self {
         Self {
-            visited: 0,
-            queue: [0; 81],
+            bfs_layers: DistLayers::default(),
             dist_from_pawn: [0; 81],
             dist_to_goal: [0; 81],
             masks_hash: 0,
@@ -59,14 +60,6 @@ impl BfsScratch {
 
     pub(crate) fn dist_scratch_mut(&mut self) -> (&mut [u8; 81], &mut [u8; 81]) {
         (&mut self.dist_from_pawn, &mut self.dist_to_goal)
-    }
-
-    pub fn build_corridor_attention(&mut self, board: &Board) -> CorridorAttention {
-        build_corridor_attention(self, board)
-    }
-
-    pub fn corridor_bottleneck_count(&mut self, board: &Board, player: Player) -> u8 {
-        corridor_bottleneck_count(self, board, player)
     }
 
     #[inline]
@@ -100,24 +93,32 @@ impl BfsScratch {
         let masks = self.dir_masks(board);
         let (sr, sc) = board.pawn(player);
         let start = square_index(sr, sc);
-        let goal_mask = goal_square_mask(player);
+        let (reached_goal, _, depth) =
+            flood_to_goal_with_depth(start, masks, goal_square_mask(player));
+        reached_goal.then_some(depth)
+    }
 
-        let mut reached = flood_bit_sq(start);
-        if reached & goal_mask != 0 {
-            return Some(0);
+    /// Reconstruct one deterministic shortest path using exact BFS wavefronts.
+    ///
+    /// The Binary Flood Fill records one frontier mask per distance. Standard
+    /// Lee BFS backtracking then pops those layers from the reached goal toward
+    /// the pawn, without a queue, parent table, or scalar distance field.
+    pub fn shortest_path(
+        &mut self,
+        board: &Board,
+        player: Player,
+        path_out: &mut [u8; 81],
+    ) -> Option<usize> {
+        let masks = self.dir_masks(board);
+        let (row, col) = board.pawn(player);
+        let start = square_index(row, col);
+
+        if !fill_bfs_layers_until_goal(start, player, masks, &mut self.bfs_layers) {
+            return None;
         }
 
-        let mut frontier = reached;
-        let mut d = 0u8;
-        while frontier != 0 {
-            d += 1;
-            frontier = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
-            if frontier & goal_mask != 0 {
-                return Some(d);
-            }
-            reached |= frontier;
-        }
-        None
+        self.bfs_layers
+            .pop_shortest_path_to(goal_square_mask(player), masks, path_out)
     }
 
     pub fn fill_next_toward_goal(
@@ -126,52 +127,9 @@ impl BfsScratch {
         player: Player,
         next_out: &mut [u8; 81],
     ) {
-        next_out.fill(u8::MAX);
-        let grow = goal_row(player);
-
-        self.visited = 0;
-        let mut head = 0usize;
-        let mut tail = 0usize;
-
-        for col in 0..9u8 {
-            let sq = square_index(grow, col);
-            let mask = 1u128 << sq;
-            if self.visited & mask == 0 {
-                self.visited |= mask;
-                self.queue[tail] = sq;
-                tail += 1;
-            }
-        }
-
-        const NEIGHBORS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
-
-        while head < tail {
-            let sq = self.queue[head];
-            head += 1;
-            let (r, c) = unpack_square(sq);
-
-            for (dr, dc) in NEIGHBORS {
-                let nr = r as i16 + dr as i16;
-                let nc = c as i16 + dc as i16;
-                if !(0..=8).contains(&nr) || !(0..=8).contains(&nc) {
-                    continue;
-                }
-                let nr = nr as u8;
-                let nc = nc as u8;
-                if !can_step(board, nr, nc, -dr, -dc) {
-                    continue;
-                }
-                let nsq = square_index(nr, nc);
-                let mask = 1u128 << nsq;
-                if self.visited & mask != 0 {
-                    continue;
-                }
-                self.visited |= mask;
-                next_out[nsq as usize] = sq;
-                self.queue[tail] = nsq;
-                tail += 1;
-            }
-        }
+        let masks = self.dir_masks(board);
+        fill_dist_layers_to_goal_row(player, masks, &mut self.bfs_layers);
+        self.bfs_layers.fill_bfs_next_steps(masks, next_out);
     }
 }
 
@@ -204,6 +162,10 @@ pub fn can_reach_goal(board: &Board, player: Player) -> bool {
 
 pub fn shortest_distance(board: &Board, player: Player) -> Option<u8> {
     BfsScratch::new().shortest_distance(board, player)
+}
+
+pub fn shortest_path(board: &Board, player: Player, path_out: &mut [u8; 81]) -> Option<usize> {
+    BfsScratch::new().shortest_path(board, player, path_out)
 }
 
 #[inline]

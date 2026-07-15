@@ -46,7 +46,7 @@
 
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::search::alphabeta::eval_stm;
 
 /// Eval→win-probability scale (centipawn-ish). Matches v14.1 `stubValue`/`rprior`

@@ -5,7 +5,7 @@
 //! standard flood fill on `u128` masks, not a separate search or NN subsystem.
 //!
 //! One u128 register holds the whole 9×9 board (centered 11-wide flood layout,
-//! shared with `path::flood`). Wall topology lives in four directional
+//! shared with `pathfinding::bff`). Wall topology lives in four directional
 //! "step out of this square is blocked" bitboards, so a speculative wall trial
 //! is two OR/AND-NOT mask flips instead of a `DirMasks::from_board` rebuild.
 //! Legality of a wall is then a linear-time bitboard flood: every frontier

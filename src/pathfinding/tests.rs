@@ -117,10 +117,12 @@ mod naive_reference {
 mod tests {
     use super::naive_reference::{can_reach_goal_naive, flood_fill_naive, shortest_distance_naive};
     use crate::core::board::{Board, Player, WallOrientation};
-    use crate::path::bfs::{can_reach_goal, shortest_distance, BfsScratch};
-    use crate::path::flood::flood_fill;
-    use crate::path::masks::DirMasks;
-    use crate::util::grid::{set_wall, square_index};
+    use crate::movegen::generate_legal_moves;
+    use crate::pathfinding::bff::flood_fill;
+    use crate::pathfinding::bfs::layers::fill_dist_to_goal_row;
+    use crate::pathfinding::bfs::{can_reach_goal, shortest_distance, BfsScratch};
+    use crate::pathfinding::masks::DirMasks;
+    use crate::util::grid::{can_step, goal_row, set_wall, square_index, unpack_square};
 
     fn assert_bitwise_matches_naive(board: &Board) {
         let masks = DirMasks::from_board(board);
@@ -144,6 +146,70 @@ mod tests {
         }
     }
 
+    fn assert_bfs_path_matches_naive(board: &Board) {
+        let masks = DirMasks::from_board(board);
+        let mut scratch = BfsScratch::new();
+        let mut path = [u8::MAX; 81];
+        let mut next = [u8::MAX; 81];
+        let mut distance_to_goal = [u8::MAX; 81];
+
+        for player in [Player::One, Player::Two] {
+            let expected_distance = shortest_distance_naive(board, player);
+            let path_len = scratch.shortest_path(board, player, &mut path);
+            assert_eq!(
+                path_len.map(|len| (len - 1) as u8),
+                expected_distance,
+                "shortest-path length mismatch for {player:?}"
+            );
+
+            if let Some(len) = path_len {
+                let (pawn_row, pawn_col) = board.pawn(player);
+                assert_eq!(path[0], square_index(pawn_row, pawn_col));
+                assert_eq!(unpack_square(path[len - 1]).0, goal_row(player));
+
+                for step in path[..len].windows(2) {
+                    let (row, col) = unpack_square(step[0]);
+                    let (next_row, next_col) = unpack_square(step[1]);
+                    let dr = next_row as i8 - row as i8;
+                    let dc = next_col as i8 - col as i8;
+                    assert!(
+                        can_step(board, row, col, dr, dc),
+                        "illegal reconstructed step {} -> {} for {player:?}",
+                        step[0],
+                        step[1]
+                    );
+                }
+            }
+
+            scratch.fill_next_toward_goal(board, player, &mut next);
+            fill_dist_to_goal_row(player, masks, &mut distance_to_goal);
+            for sq in 0u8..81 {
+                let distance = distance_to_goal[sq as usize];
+                if distance == 0 || distance == u8::MAX {
+                    assert_eq!(next[sq as usize], u8::MAX);
+                    continue;
+                }
+
+                let next_sq = next[sq as usize];
+                assert_ne!(next_sq, u8::MAX, "missing BFS next step from {sq}");
+                assert_eq!(
+                    distance_to_goal[next_sq as usize] + 1,
+                    distance,
+                    "next step does not descend one BFS layer from {sq}"
+                );
+                let (row, col) = unpack_square(sq);
+                let (next_row, next_col) = unpack_square(next_sq);
+                assert!(can_step(
+                    board,
+                    row,
+                    col,
+                    next_row as i8 - row as i8,
+                    next_col as i8 - col as i8,
+                ));
+            }
+        }
+    }
+
     #[test]
     fn start_position_reachable() {
         let board = Board::new();
@@ -154,6 +220,40 @@ mod tests {
     #[test]
     fn bitwise_flood_matches_naive_on_startpos() {
         assert_bitwise_matches_naive(&Board::new());
+    }
+
+    #[test]
+    fn lee_bfs_path_matches_naive_on_startpos() {
+        assert_bfs_path_matches_naive(&Board::new());
+    }
+
+    #[test]
+    fn lee_bfs_path_matches_naive_on_random_legal_positions() {
+        let mut seed = 0x6a09_e667_f3bc_c909u64;
+        let mut next_random = || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+
+        for target_ply in [4usize, 20, 35] {
+            for _ in 0..100 {
+                let mut board = Board::new();
+                for _ in 0..target_ply {
+                    if board.is_terminal().is_some() {
+                        break;
+                    }
+                    let moves = generate_legal_moves(&board);
+                    if moves.is_empty() {
+                        break;
+                    }
+                    let mv = moves[(next_random() as usize) % moves.len()];
+                    board.apply_move(mv);
+                }
+                assert_bfs_path_matches_naive(&board);
+            }
+        }
     }
 
     #[test]

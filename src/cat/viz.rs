@@ -10,7 +10,7 @@ use crate::cat::prune::{
 };
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::util::perft::format_move;
 
 const WALL_SLOT_COUNT: usize = 128;
@@ -99,7 +99,7 @@ fn direct_wall_heat(
 /// JSON payload for `titanium cat` and `/api/titanium/cat`.
 pub fn cat_snapshot_json(board: &mut Board) -> String {
     let mut bfs = BfsScratch::new();
-    let cat = bfs.build_corridor_attention(board);
+    let cat = crate::cat::build_corridor_attention(&mut bfs, board);
     let white_cat =
         crate::cat::build::build_player_corridor_attention(&mut bfs, board, Player::One);
     let black_cat =

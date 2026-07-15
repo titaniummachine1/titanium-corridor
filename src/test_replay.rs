@@ -2,7 +2,7 @@
 
 use crate::core::board::{Board, Move, WallOrientation};
 use crate::movegen::generate_legal_moves_slice;
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::util::perft::format_move;
 
 fn parse_algebraic(move_str: &str) -> Option<Move> {

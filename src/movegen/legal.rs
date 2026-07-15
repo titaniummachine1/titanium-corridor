@@ -8,9 +8,9 @@ use crate::movegen::pawn_bits::{
     generate_pawn_moves_bitboard_with_masks, generate_pawn_moves_shift_slice,
 };
 use crate::movegen::wall_masks::{wall_occupied_mask, WALL_EDGE_MASK, WALL_TOUCH_MASKS};
-use crate::path::masks::DirMasks;
-use crate::path::parallel::{bff_wall_legal_with_proof, pawn_bit, wall_delta, WallGrids};
-use crate::path::BfsScratch;
+use crate::pathfinding::masks::DirMasks;
+use crate::pathfinding::bff::wall::{bff_wall_legal_with_proof, pawn_bit, wall_delta, WallGrids};
+use crate::pathfinding::BfsScratch;
 use crate::util::grid::{can_step, has_wall};
 const DIRS: [(i8, i8); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
 

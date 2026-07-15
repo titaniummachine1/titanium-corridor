@@ -315,8 +315,8 @@ impl GameState {
     }
 
     pub fn has_path(&self, player: usize) -> bool {
-        use crate::path::flood::flood_to_goal_with_depth;
-        use crate::path::masks::DirMasks;
+        use crate::pathfinding::bff::flood_to_goal_with_depth;
+        use crate::pathfinding::masks::DirMasks;
 
         let masks = DirMasks::from_ace_game(self);
         let goal = if player == 0 {
@@ -329,10 +329,10 @@ impl GameState {
 
     #[inline]
     fn both_paths_open_bitfill(&self) -> BitfillPathCheck {
-        use crate::path::flood::{
+        use crate::pathfinding::bff::{
             flood_component_with_goal_depth, flood_to_goal_seeded_with_depth,
         };
-        use crate::path::masks::DirMasks;
+        use crate::pathfinding::masks::DirMasks;
 
         let masks = DirMasks::from_ace_game(self);
         let (ok0, p0_reached, p0_goal_depth) =
@@ -504,7 +504,7 @@ impl GameState {
     // ── Distance fields ─────────────────────────────────────────────────────
 
     pub fn compute_dist(&self, player: usize, dist: &mut [u8; 81]) {
-        use crate::path::masks::DirMasks;
+        use crate::pathfinding::masks::DirMasks;
         use crate::titanium::dist::{
             fill_ace_dist_to_goal_with_masks_p0, fill_ace_dist_to_goal_with_masks_p1,
         };
@@ -519,7 +519,7 @@ impl GameState {
 
     /// Bitboard flood steps from `start` cell (255 = unreachable).
     pub fn compute_steps_from(&self, start: usize, dist: &mut [u8; 81]) {
-        use crate::path::masks::DirMasks;
+        use crate::pathfinding::masks::DirMasks;
         use crate::titanium::dist::fill_ace_dist_from_pawn_with_masks;
 
         if start < 81 {

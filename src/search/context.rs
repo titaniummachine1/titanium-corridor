@@ -6,7 +6,7 @@
 //! Engine        → see `engine.rs`
 //! ```
 
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::search::tt::TranspositionTable;
 
 /// Shared across workers — transposition table today, search metadata later.

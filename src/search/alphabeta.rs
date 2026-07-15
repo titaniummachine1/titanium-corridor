@@ -13,7 +13,7 @@ use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::search::cat_index_lmr::cat_index_lmr_reduction;
 use crate::search::lmr_profile::{
     apply_depth_feedback, build_lmr_table, compute_stage_t, EvalZoneState, LmrProfile,
@@ -361,7 +361,7 @@ fn update_lmr_profile_for_depth(
     } else {
         let mut buf = [Move::Pawn { row: 1, col: 4 }; MAX_LEGAL_MOVES];
         let n = generate_legal_moves_slice(board, &mut buf, state.bfs);
-        let cat = state.bfs.build_corridor_attention(board);
+        let cat = crate::cat::build_corridor_attention(&mut *state.bfs, board);
         let (cat_max, cat_p75) = root_cat_heat_stats(board, &buf, n, &cat);
         let stage_t = compute_stage_t(board, state.our_root_dist, opp_root_dist, cat_max, cat_p75);
         state.lmr_profile = LmrProfile::from_stage(stage_t, endgame_race, false);
@@ -619,8 +619,10 @@ pub(crate) fn eval_stm(board: &Board, stm: Player, bfs: &mut BfsScratch) -> i32 
     let our_walls = board.walls_remaining[stm as usize];
     let opp_walls = board.walls_remaining[opp as usize];
     let corridor_flex_score = if our_walls <= 2 || opp_walls <= 2 {
-        let our_bottlenecks = i32::from(bfs.corridor_bottleneck_count(board, stm));
-        let opp_bottlenecks = i32::from(bfs.corridor_bottleneck_count(board, opp));
+        let our_bottlenecks =
+            i32::from(crate::cat::corridor_bottleneck_count(bfs, board, stm));
+        let opp_bottlenecks =
+            i32::from(crate::cat::corridor_bottleneck_count(bfs, board, opp));
         let own_risk = if our_walls <= 2 && opp_walls > our_walls {
             our_bottlenecks * LOW_WALL_TRAP_CM
         } else {
@@ -1014,7 +1016,7 @@ fn negamax_inner(
     // CAT (multi-route corridor heat) only above the leaf layer: depth-1 nodes
     // dominate the tree and only need witness-path tactics, not breadth.
     let cat = if depth >= 2 {
-        state.bfs.build_corridor_attention(board)
+        crate::cat::build_corridor_attention(&mut *state.bfs, board)
     } else {
         crate::cat::CorridorAttention::default()
     };

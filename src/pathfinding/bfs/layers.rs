@@ -1,8 +1,9 @@
-//! BFS distance fields used by CAT build and path queries.
+//! Exact BFS wavefront layers, distance fields, and Lee path reconstruction.
 
+// Exact BFS wavefront layers and Lee path reconstruction.
 use crate::core::board::Player;
-use crate::path::flood::expand_frontier;
-use crate::path::masks::DirMasks;
+use crate::pathfinding::bff::expand_frontier;
+use crate::pathfinding::masks::DirMasks;
 use crate::util::grid::{flood_bit_sq, goal_row, square_index, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
 
 /// Max BFS layers we record — board diameter is bounded by the 81 playable cells.
@@ -45,6 +46,83 @@ impl DistLayers {
             }
         }
     }
+
+    /// Fill one deterministic next-step map from these inverse BFS layers.
+    ///
+    /// A square in layer `d` points to an adjacent square in layer `d - 1`.
+    /// Layer zero is the BFS seed (normally a goal row) and has no next step.
+    /// This is standard Lee wavefront backtracking without a parent queue.
+    pub fn fill_bfs_next_steps(&self, masks: DirMasks, next_out: &mut [u8; 81]) {
+        next_out.fill(u8::MAX);
+
+        for depth in 1..self.depth {
+            let previous = self.masks[depth - 1];
+            let mut current_layer = self.masks[depth] & FLOOD_PLAYABLE;
+            while current_layer != 0 {
+                let current_bit_index = current_layer.trailing_zeros();
+                let current = 1u128 << current_bit_index;
+                current_layer &= current_layer - 1;
+
+                let candidates = expand_frontier(current, masks) & previous;
+                debug_assert_ne!(candidates, 0, "BFS layer has no predecessor");
+                if candidates == 0 {
+                    continue;
+                }
+
+                let previous_bit_index = candidates.trailing_zeros();
+                let current_sq = FLOOD_SQ_BY_BIT[current_bit_index as usize];
+                let previous_sq = FLOOD_SQ_BY_BIT[previous_bit_index as usize];
+                next_out[current_sq as usize] = previous_sq;
+            }
+        }
+    }
+
+    /// Destructively reconstruct one shortest path to `target`.
+    ///
+    /// The layers must have been stopped at the first BFS wavefront that touches
+    /// `target`. Starting at that target, each pop exposes the immediately
+    /// preceding Lee BFS wavefront. The chosen adjacent bit is therefore always
+    /// one step closer to the seed. Consumed layers are cleared as we walk back.
+    pub fn pop_shortest_path_to(
+        &mut self,
+        target: u128,
+        masks: DirMasks,
+        path_out: &mut [u8; 81],
+    ) -> Option<usize> {
+        if self.depth == 0 {
+            return None;
+        }
+
+        let path_len = self.depth;
+        let mut candidates = self.masks[self.depth - 1] & target;
+        if candidates == 0 {
+            return None;
+        }
+
+        let mut current = candidates & candidates.wrapping_neg();
+        let current_bit_index = current.trailing_zeros();
+        path_out[path_len - 1] = FLOOD_SQ_BY_BIT[current_bit_index as usize];
+
+        while self.depth > 1 {
+            self.depth -= 1;
+            self.masks[self.depth] = 0;
+
+            candidates = expand_frontier(current, masks) & self.masks[self.depth - 1];
+            debug_assert_ne!(candidates, 0, "BFS layer has no predecessor");
+            if candidates == 0 {
+                self.depth = 0;
+                return None;
+            }
+
+            current = candidates & candidates.wrapping_neg();
+            let bit_index = current.trailing_zeros();
+            path_out[self.depth - 1] = FLOOD_SQ_BY_BIT[bit_index as usize];
+        }
+
+        self.masks[0] = 0;
+        self.depth = 0;
+        Some(path_len)
+    }
 }
 
 /// Parallel binary flood that records each wavefront as a layer mask (no per-cell
@@ -68,9 +146,56 @@ fn flood_layers(seed: u128, masks: DirMasks, out: &mut DistLayers) {
     out.depth = depth;
 }
 
+/// Binary Flood Fill (BFF) recorded as exact BFS wavefront layers. Stops at the
+/// first layer touching `target`, which is sufficient for shortest-path recovery.
+fn flood_layers_until_target(
+    seed: u128,
+    target: u128,
+    masks: DirMasks,
+    out: &mut DistLayers,
+) -> bool {
+    let mut reached = seed & FLOOD_PLAYABLE;
+    let mut frontier = reached;
+    out.masks[0] = frontier;
+    let mut depth = 1usize;
+
+    if frontier & target != 0 {
+        out.depth = depth;
+        return true;
+    }
+
+    while frontier != 0 && depth < MAX_DIST_LAYERS {
+        frontier = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        if frontier == 0 {
+            break;
+        }
+        out.masks[depth] = frontier;
+        depth += 1;
+        reached |= frontier;
+        if frontier & target != 0 {
+            out.depth = depth;
+            return true;
+        }
+    }
+
+    out.depth = depth;
+    false
+}
+
 /// Forward flood: layer masks of distance from `start`.
 pub fn fill_dist_layers_from_sq(start: u8, masks: DirMasks, out: &mut DistLayers) {
     flood_layers(flood_bit_sq(start), masks, out);
+}
+
+/// Forward BFS from `start`, retaining only the exact wavefronts needed to reach
+/// `player`'s goal row. Returns false when the goal is unreachable.
+pub fn fill_bfs_layers_until_goal(
+    start: u8,
+    player: Player,
+    masks: DirMasks,
+    out: &mut DistLayers,
+) -> bool {
+    flood_layers_until_target(flood_bit_sq(start), goal_mask(player), masks, out)
 }
 
 /// Inverse flood: layer masks of distance to any goal-row cell for `player`.
@@ -81,6 +206,16 @@ pub fn fill_dist_layers_to_goal_row(player: Player, masks: DirMasks, out: &mut D
         seed |= flood_bit_sq(square_index(grow, c));
     }
     flood_layers(seed, masks, out);
+}
+
+#[inline]
+fn goal_mask(player: Player) -> u128 {
+    let row = goal_row(player);
+    let mut mask = 0u128;
+    for col in 0..9u8 {
+        mask |= flood_bit_sq(square_index(row, col));
+    }
+    mask
 }
 
 /// Fill `dist_from[sq]` with BFS distance from `start`. Unreachable → `u8::MAX`.

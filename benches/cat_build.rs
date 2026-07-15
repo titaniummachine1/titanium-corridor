@@ -20,7 +20,12 @@ fn bench_cat_startpos(c: &mut Criterion) {
     let board = Board::new();
     let mut bfs = BfsScratch::new();
     c.bench_function("cat_build_startpos", |b| {
-        b.iter(|| black_box(bfs.build_corridor_attention(black_box(&board))));
+        b.iter(|| {
+            black_box(titanium::cat::build_corridor_attention(
+                &mut bfs,
+                black_box(&board),
+            ))
+        });
     });
 }
 
@@ -28,7 +33,12 @@ fn bench_cat_midgame(c: &mut Criterion) {
     let board = midgame_board();
     let mut bfs = BfsScratch::new();
     c.bench_function("cat_build_midgame", |b| {
-        b.iter(|| black_box(bfs.build_corridor_attention(black_box(&board))));
+        b.iter(|| {
+            black_box(titanium::cat::build_corridor_attention(
+                &mut bfs,
+                black_box(&board),
+            ))
+        });
     });
 }
 

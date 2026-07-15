@@ -4,9 +4,9 @@
 //! (per-player max corridor heat). Search uses the same max-merge in `build_corridor_attention`.
 
 use crate::core::board::{Board, Player};
-use crate::path::distance::fill_dist_from_sq;
-use crate::path::masks::DirMasks;
-use crate::path::BfsScratch;
+use crate::pathfinding::bfs::layers::fill_dist_from_sq;
+use crate::pathfinding::masks::DirMasks;
+use crate::pathfinding::BfsScratch;
 use crate::util::grid::square_index;
 
 /// Fixed scale for UI overlays: two players × 100 cm at dist 0.

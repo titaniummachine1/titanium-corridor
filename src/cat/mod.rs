@@ -14,6 +14,7 @@ pub mod viz;
 pub mod viz_build;
 
 pub use attention::CorridorAttention;
+pub use build::{build_corridor_attention, corridor_bottleneck_count};
 pub use constants::{CAT_COLD_CM, CAT_CORRIDOR_CM, CAT_HOT_CM, DIST_PENALTY};
 pub use prune::{
     best_pawn_cat_heats, cat_v16_lmr_ceiling_from_env, cat_v16_lmr_fringe_pct_for_worker,

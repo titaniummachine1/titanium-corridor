@@ -8,12 +8,12 @@ use crate::cat::constants::{
     MAX_IMPACT_HEAT_DELTA, MAX_RELEVANT_CORRIDOR_DELTA,
 };
 use crate::core::board::{Board, Player};
-use crate::path::distance::{
+use crate::pathfinding::bfs::layers::{
     fill_dist_from_sq, fill_dist_layers_from_sq, fill_dist_layers_to_goal_row,
     fill_dist_to_goal_row, DistLayers,
 };
-use crate::path::masks::DirMasks;
-use crate::path::BfsScratch;
+use crate::pathfinding::masks::DirMasks;
+use crate::pathfinding::BfsScratch;
 use crate::util::grid::{flood_bit_sq, square_index, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
 
 fn corridor_heat(delta: u16) -> u16 {

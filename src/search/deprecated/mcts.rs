@@ -14,7 +14,7 @@ use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move, Player};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::opening::book::BookHint;
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 use crate::util::grid::{is_goal, pawn_geometrically_advances, square_index};
 use crate::util::perft::format_move;
 
@@ -611,7 +611,7 @@ pub fn search_mcts(board: &mut Board, config: MctsConfig) -> Option<MctsReport> 
     // Using root attention throughout is a slight approximation (walls change it),
     // but in the early game with few walls the drift is minimal.
     let root_cat: Option<CorridorAttention> = if config.use_cat_guidance {
-        Some(bfs.build_corridor_attention(board))
+        Some(crate::cat::build_corridor_attention(&mut bfs, board))
     } else {
         None
     };

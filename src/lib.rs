@@ -20,7 +20,7 @@ pub mod friend_perft;
 pub mod movegen;
 pub mod opening;
 pub mod oracle;
-pub mod path;
+pub mod pathfinding;
 pub mod search;
 pub mod titanium;
 pub mod util;
@@ -46,7 +46,7 @@ pub use movegen::{
     generate_legal_moves_slice_mode, PawnGenMode, MAX_LEGAL_MOVES,
 };
 pub use opening::{ply_number, BOOK_MAX_PLY};
-pub use path::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
+pub use pathfinding::{both_players_reach_goals, can_reach_goal, shortest_distance, BfsScratch};
 pub use search::greedy::choose_greedy_move;
 #[allow(deprecated)]
 pub use search::lmr_viz::lmr_snapshot_json;

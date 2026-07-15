@@ -38,9 +38,9 @@ use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation
 use crate::movegen::{
     generate_legal_moves_slice_cached, GeometricWallCache, GeometricWallCacheStats, MAX_LEGAL_MOVES,
 };
-use crate::path::flood::expand_frontier;
-use crate::path::masks::DirMasks;
-use crate::path::BfsScratch;
+use crate::pathfinding::bff::expand_frontier;
+use crate::pathfinding::masks::DirMasks;
+use crate::pathfinding::BfsScratch;
 use crate::search::cat_index_lmr::apply_lmr_path_correction;
 use crate::search::v16_lmr::{
     plan_v16_pawn_lmr, plan_v16_wall_lmr, V16HardOverride, ACE_LMR_AFTER_MOVE, ACE_LMR_MIN_DEPTH,
@@ -4881,7 +4881,7 @@ impl TitaniumSearch {
 
         let bridge = self.bridge.as_mut().expect("cat bridge");
         let cat = if depth >= 2 {
-            bridge.bfs.build_corridor_attention(&bridge.board)
+            crate::cat::build_corridor_attention(&mut bridge.bfs, &bridge.board)
         } else {
             CorridorAttention::default()
         };

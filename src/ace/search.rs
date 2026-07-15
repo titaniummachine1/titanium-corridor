@@ -29,7 +29,7 @@ use crate::cat::prune::{gap_play_zone_mask, get_shortest_path, wall_should_searc
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
-use crate::path::BfsScratch;
+use crate::pathfinding::BfsScratch;
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
@@ -883,7 +883,7 @@ impl AceSearch {
 
         let bridge = self.bridge.as_mut().expect("cat bridge");
         let cat = if depth >= 2 {
-            bridge.bfs.build_corridor_attention(&bridge.board)
+            crate::cat::build_corridor_attention(&mut bridge.bfs, &bridge.board)
         } else {
             CorridorAttention::default()
         };
