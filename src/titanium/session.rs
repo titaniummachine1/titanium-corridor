@@ -113,7 +113,6 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
         || engine_flag == "titanium-v17-race1w"
         || engine_flag == "titanium-v17-race2w"
         || engine_flag == "titanium-v17-race2pv"
-        || engine_flag == "titanium-v17-rfp-tc-d4"
     {
         search.enable_lazy_topn();
     }
@@ -129,6 +128,7 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
     }
     if engine_flag == "titanium-v17"
         || engine_flag == "titanium-v17-rfp-ace"
+        || engine_flag == "titanium-v17-rfp-tc-d4"
         || engine_flag == "titanium-v17-race1w"
         || engine_flag == "titanium-v17-race2w"
         || engine_flag == "titanium-v17-race2pv"
