@@ -42,6 +42,7 @@ fn is_v16_graft(engine_flag: &str) -> bool {
             | "titanium-v17-race1w"
             | "titanium-v17-race2w"
             | "titanium-v17-race2pv"
+            | "titanium-v17-race1pv"
     )
 }
 
@@ -62,6 +63,7 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
             | "titanium-v17-race1w"
             | "titanium-v17-race2w"
             | "titanium-v17-race2pv"
+            | "titanium-v17-race1pv"
     );
     let enable_sf_history = matches!(
         engine_flag,
@@ -113,6 +115,7 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
         || engine_flag == "titanium-v17-race1w"
         || engine_flag == "titanium-v17-race2w"
         || engine_flag == "titanium-v17-race2pv"
+        || engine_flag == "titanium-v17-race1pv"
     {
         search.enable_lazy_topn();
     }
@@ -122,6 +125,7 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
         || engine_flag == "titanium-v17-race1w"
         || engine_flag == "titanium-v17-race2w"
         || engine_flag == "titanium-v17-race2pv"
+        || engine_flag == "titanium-v17-race1pv"
         || engine_flag == "titanium-v17-rfp-tc-d4"
     {
         search.set_ace_lmp(true);
@@ -132,6 +136,7 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
         || engine_flag == "titanium-v17-race1w"
         || engine_flag == "titanium-v17-race2w"
         || engine_flag == "titanium-v17-race2pv"
+        || engine_flag == "titanium-v17-race1pv"
     {
         search.set_ace_rfp(true);
     }
@@ -161,9 +166,13 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
     } else if engine_flag == "titanium-v17"
         || engine_flag == "titanium-v17-race2pv"
         || engine_flag == "titanium-v17-rfp-tc-d4"
+        || engine_flag == "titanium-v17-race1pv"
     {
         search.set_remaining_wall_race_layers(true, true);
         search.set_two_wall_race_pv_only(true);
+    }
+    if engine_flag == "titanium-v17-race1pv" {
+        search.set_one_wall_race_pv_only(true);
     }
 }
 
@@ -432,6 +441,7 @@ mod session_tests {
         let both = build_search("titanium-v17-race2w", GameState::new());
         let pv_only = build_search("titanium-v17-race2pv", GameState::new());
         let rfp_tc = build_search("titanium-v17-rfp-tc-d4", GameState::new());
+        let race1_pv = build_search("titanium-v17-race1pv", GameState::new());
         for search in [&one, &both] {
             assert!(search.sf_history_enabled());
             assert!(search.q_search_enabled());
@@ -452,5 +462,8 @@ mod session_tests {
         assert!(rfp_tc.rfp_tc_adaptive_enabled());
         assert_eq!(rfp_tc.remaining_wall_race_layers(), (true, true));
         assert!(rfp_tc.two_wall_race_pv_only());
+        assert!(race1_pv.one_wall_race_pv_only());
+        assert!(race1_pv.two_wall_race_pv_only());
+        assert_eq!(race1_pv.remaining_wall_race_layers(), (true, true));
     }
 }

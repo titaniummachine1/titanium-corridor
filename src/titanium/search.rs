@@ -2374,6 +2374,8 @@ pub struct TitaniumSearch {
     wall_ignore_cert_resolved: Option<bool>,
     /// Cached `TITANIUM_RACE_ONE_WALL` decision.
     one_wall_race_resolved: Option<bool>,
+    /// Restrict the one-wall proof to PV/full-window nodes.
+    one_wall_race_pv_only: bool,
     /// Cached `TITANIUM_RACE_TWO_WALL` decision. The experiment is deliberately
     /// default-off until its proof audit and strength gate both pass.
     two_wall_race_resolved: Option<bool>,
@@ -2658,6 +2660,7 @@ impl TitaniumSearch {
             wall_ignore_cert_override: None,
             wall_ignore_cert_resolved: None,
             one_wall_race_resolved: None,
+            one_wall_race_pv_only: false,
             two_wall_race_resolved: None,
             two_wall_race_pv_only: false,
             eme: false,
@@ -2842,6 +2845,10 @@ impl TitaniumSearch {
         self.two_wall_race_pv_only = on;
     }
 
+    pub fn set_one_wall_race_pv_only(&mut self, on: bool) {
+        self.one_wall_race_pv_only = on;
+    }
+
     #[cfg(test)]
     pub fn remaining_wall_race_layers(&self) -> (bool, bool) {
         (
@@ -2853,6 +2860,11 @@ impl TitaniumSearch {
     #[cfg(test)]
     pub fn two_wall_race_pv_only(&self) -> bool {
         self.two_wall_race_pv_only
+    }
+
+    #[cfg(test)]
+    pub fn one_wall_race_pv_only(&self) -> bool {
+        self.one_wall_race_pv_only
     }
 
     pub fn ace_rfp_enabled(&self) -> bool {
@@ -3518,6 +3530,7 @@ impl TitaniumSearch {
         worker.cert_eval_leaves_only = self.cert_eval_leaves_only;
         worker.wall_ignore_cert_override = self.wall_ignore_cert_override;
         worker.one_wall_race_resolved = self.one_wall_race_resolved;
+        worker.one_wall_race_pv_only = self.one_wall_race_pv_only;
         worker.two_wall_race_resolved = self.two_wall_race_resolved;
         worker.two_wall_race_pv_only = self.two_wall_race_pv_only;
         worker.eme = self.eme;
@@ -6050,7 +6063,8 @@ impl TitaniumSearch {
         let ndm_lo = self.dir_masks_key_lo;
         let ndm_hi = self.dir_masks_key_hi;
         let ndm_cache = self.dir_masks_cache;
-        if self.g.wl[0] + self.g.wl[1] == 1 {
+        let pv_node = beta > alpha.saturating_add(1);
+        if self.g.wl[0] + self.g.wl[1] == 1 && (!self.one_wall_race_pv_only || pv_node) {
             match self.one_wall_race_bound() {
                 RaceBound::Lower(value) if value >= beta => return Ok(beta),
                 RaceBound::Upper(value) if value <= alpha => return Ok(alpha),
@@ -6060,7 +6074,6 @@ impl TitaniumSearch {
                 | RaceBound::Unknown => {}
             }
         }
-        let pv_node = beta > alpha.saturating_add(1);
         if self.g.wl[0] + self.g.wl[1] == 2 && (!self.two_wall_race_pv_only || pv_node) {
             match self.two_wall_monopoly_race_bound() {
                 RaceBound::Lower(value) if value >= beta => return Ok(beta),
