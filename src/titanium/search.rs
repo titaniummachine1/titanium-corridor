@@ -2382,6 +2382,10 @@ pub struct TitaniumSearch {
     /// Restrict the optional two-wall proof to PV/full-window nodes. Race1
     /// remains available throughout the tree.
     two_wall_race_pv_only: bool,
+    /// Experimental strict immutable-route oracle. It is deliberately opt-in
+    /// and PV-only: a result is exact only after timing and pawn-interaction
+    /// checks prove the selected path cannot be delayed.
+    immutable_path_oracle: bool,
     /// Early Move Extensions on the first ordered wall moves (mirror of graduated LMR).
     eme: bool,
     pub nodes: u64,
@@ -2663,6 +2667,7 @@ impl TitaniumSearch {
             one_wall_race_pv_only: false,
             two_wall_race_resolved: None,
             two_wall_race_pv_only: false,
+            immutable_path_oracle: false,
             eme: false,
             nodes: 0,
             deadline: Instant::now(),
@@ -2847,6 +2852,15 @@ impl TitaniumSearch {
 
     pub fn set_one_wall_race_pv_only(&mut self, on: bool) {
         self.one_wall_race_pv_only = on;
+    }
+
+    pub fn set_immutable_path_oracle(&mut self, on: bool) {
+        self.immutable_path_oracle = on;
+    }
+
+    #[cfg(test)]
+    pub fn immutable_path_oracle_enabled(&self) -> bool {
+        self.immutable_path_oracle
     }
 
     #[cfg(test)]
@@ -3533,6 +3547,7 @@ impl TitaniumSearch {
         worker.one_wall_race_pv_only = self.one_wall_race_pv_only;
         worker.two_wall_race_resolved = self.two_wall_race_resolved;
         worker.two_wall_race_pv_only = self.two_wall_race_pv_only;
+        worker.immutable_path_oracle = self.immutable_path_oracle;
         worker.eme = self.eme;
         worker.use_partial_iter = self.use_partial_iter;
         worker.pure_mode = self.pure_mode;
@@ -4660,6 +4675,33 @@ impl TitaniumSearch {
         } else {
             RaceBound::Upper(-RACE_WIN_FLOOR)
         }
+    }
+
+    /// Exact score from the strict immutable-route projection. This remains a
+    /// separate path from the old wall-ignore bound: it runs only at PV nodes,
+    /// preserves real wall inventories, and declines unless it proves both
+    /// timing and non-interaction for the chosen route.
+    fn immutable_path_race_score(&mut self, pv_node: bool, depth: i32) -> Option<i32> {
+        const MAX_GOAL_DISTANCE: u8 = 8;
+        const MIN_DEPTH: i32 = 3;
+        if !self.race_proof
+            || !self.immutable_path_oracle
+            || !pv_node
+            || depth < MIN_DEPTH
+            || self.g.wl[0] + self.g.wl[1] == 0
+        {
+            return None;
+        }
+        let d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
+        let d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
+        if d0.min(d1) > MAX_GOAL_DISTANCE {
+            return None;
+        }
+        use crate::titanium::wall_ignore_cert::{
+            exact_score_from_stm, try_strict_immutable_path_race,
+        };
+        let verdict = try_strict_immutable_path_race(&self.g, true, true)?;
+        Some(exact_score_from_stm(&verdict, self.g.turn))
     }
 
     /// Hands-empty endgame pipeline (cheap → heavy). Caller must ensure
@@ -6083,6 +6125,10 @@ impl TitaniumSearch {
                 | RaceBound::Exact(_)
                 | RaceBound::Unknown => {}
             }
+        }
+        if let Some(score) = self.immutable_path_race_score(pv_node, depth) {
+            crate::titanium::wall_ignore_cert::record_immutable_path_cutoff();
+            return Ok(score);
         }
         if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
             // Service A is a typed alpha/beta bound, not a static score.  It

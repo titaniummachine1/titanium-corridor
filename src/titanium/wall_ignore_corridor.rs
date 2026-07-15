@@ -37,6 +37,17 @@ pub struct StrictRunnerGuarantee {
     pub kind: RunnerGuaranteeKind,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StrictPathStats {
+    pub paths_reconstructed: u64,
+    pub edges_checked: u64,
+    pub unique_wall_candidates: u64,
+    pub geometric_rejects: u64,
+    pub timing_rejects: u64,
+    pub full_legality_checks: u64,
+    pub blocking_legal_walls: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerGuaranteeKind {
     ZeroDelayCorridor,
@@ -203,6 +214,14 @@ fn wall_move_index(mv: i16) -> usize {
 /// blocking wall is tested at each real opponent opportunity where it could
 /// still affect an untraversed edge.
 pub fn prove_strict_immutable_path(g: &GameState, runner: usize) -> Option<StrictRunnerGuarantee> {
+    prove_strict_immutable_path_with_stats(g, runner, &mut StrictPathStats::default())
+}
+
+pub fn prove_strict_immutable_path_with_stats(
+    g: &GameState,
+    runner: usize,
+    stats: &mut StrictPathStats,
+) -> Option<StrictRunnerGuarantee> {
     if runner > 1 || g.winner() >= 0 {
         return None;
     }
@@ -212,6 +231,8 @@ pub fn prove_strict_immutable_path(g: &GameState, runner: usize) -> Option<Stric
     let mut path = [0u8; 81];
     let path_len = reconstruct_one_shortest_path_from_goal_field(g, runner, &goal_dist, &mut path)?;
     let edge_count = path_len.checked_sub(1)?;
+    stats.paths_reconstructed += 1;
+    stats.edges_checked += edge_count as u64;
     let mut edges = [BoardEdge::EMPTY; 80];
     let mut first_affected_edge = [u8::MAX; 128];
     let mut last_affected_edge = [u8::MAX; 128];
@@ -235,8 +256,15 @@ pub fn prove_strict_immutable_path(g: &GameState, runner: usize) -> Option<Stric
     let opponent = 1 - runner;
     if g.wl[opponent] > 0 {
         let first_opportunity = usize::from(g.turn == runner);
+        stats.unique_wall_candidates += last_affected_edge
+            .iter()
+            .filter(|&&edge| edge != u8::MAX)
+            .count() as u64;
         for (index, &last_edge) in last_affected_edge.iter().enumerate() {
             if last_edge == u8::MAX || first_opportunity > last_edge as usize {
+                if last_edge != u8::MAX {
+                    stats.timing_rejects += 1;
+                }
                 continue;
             }
             debug_assert!(first_affected_edge[index] <= last_edge);
@@ -257,7 +285,13 @@ pub fn prove_strict_immutable_path(g: &GameState, runner: usize) -> Option<Stric
                 let mut sim = g.clone();
                 sim.pawn[runner] = path[path_index] as usize;
                 sim.turn = opponent;
+                if !sim.wall_fits(wall_type, slot) {
+                    stats.geometric_rejects += 1;
+                    continue;
+                }
+                stats.full_legality_checks += 1;
                 if sim.wall_legal(wall_type, slot) {
+                    stats.blocking_legal_walls += 1;
                     return None;
                 }
             }
@@ -626,5 +660,27 @@ mod tests {
         assert_eq!(guarantee.base_own_moves_to_goal, 4);
         assert_eq!(guarantee.max_own_moves_to_goal, 4);
         assert_eq!(guarantee.protected_edge_count, 4);
+    }
+
+    #[test]
+    fn provided_immutable_path_regressions() {
+        // First supplied position: Black still has a legal, timely route
+        // interceptor, so White's visual straight path is not immutable.
+        let blocked = apply_moves(&[
+            "d1", "d9", "d2", "d8", "d3", "d7", "d4", "d6", "d5", "d4", "d6", "d6v", "d8v", "b8v",
+            "b6v", "c6v", "d5", "d3", "c5", "d2", "d5", "c2", "d4v", "b4v", "c4v", "b2", "d4",
+            "b3", "d3", "d2v", "b2v", "c1h",
+        ]);
+        assert!(prove_strict_immutable_path(&blocked, 0).is_none());
+
+        // The supplied continuation is also deliberately non-immutable: a
+        // different timely wall still reaches an unpassed White route edge.
+        let still_interceptable = apply_moves(&[
+            "d1", "d9", "d2", "d8", "d3", "d7", "d4", "d6", "d5", "d4", "d6", "d6v", "d8v", "b8v",
+            "b6v", "c6v", "d5", "d3", "c5", "d2", "d5", "c2", "d4v", "b4v", "c4v", "b2", "d4",
+            "b3", "d3", "d2v", "b2v", "c1h", "c3", "b4", "d3", "b5", "c3", "b6", "d3", "b7", "c3",
+            "b8", "d3", "b9", "c3", "a9", "c2", "b9", "c3", "c2h",
+        ]);
+        assert!(prove_strict_immutable_path(&still_interceptable, 0).is_none());
     }
 }

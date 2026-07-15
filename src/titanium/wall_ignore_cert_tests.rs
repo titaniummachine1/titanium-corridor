@@ -7,7 +7,8 @@ mod extended {
     use crate::titanium::cert_bridge::titanium_game_from_board;
     use crate::titanium::game::GameState;
     use crate::titanium::wall_ignore_cert::{
-        try_wall_ignorance_loss_cert, try_wall_ignore_cert_board, CertScratch, WALL_IGNORE_STATS,
+        try_strict_immutable_path_race, try_wall_ignorance_loss_cert, try_wall_ignore_cert_board,
+        CertScratch, IMMUTABLE_PATH_STATS, WALL_IGNORE_STATS,
     };
     use crate::titanium::wall_ignore_corridor::{
         build_column_four_corridor_fixture, detect_zero_delay_corridor, shortest_distance,
@@ -198,6 +199,115 @@ mod extended {
             WALL_IGNORE_STATS.snapshot()
         );
         assert_eq!(false_count, 0, "must have zero false certificates");
+    }
+
+    #[test]
+    fn canta_and_random_immutable_projection_matches_exact_zero_wall_oracle() {
+        use crate::oracle::canta::board_after_canta_game;
+        use crate::titanium::race::{race_exact_dtm_on_demand, RaceScratch, RACE_STATES};
+
+        IMMUTABLE_PATH_STATS.reset();
+        let mut checked = 0usize;
+        let mut candidates = Vec::new();
+        for game in 0..15 {
+            candidates.push(board_after_canta_game(game));
+        }
+
+        // Add deterministic opening/middlegame/endgame continuations to the
+        // Canta corpus. The immutable detector may decline often; every result
+        // it does emit must agree with the independent exact fixed-topology
+        // race oracle after walls are removed only in this test reference.
+        let mut seed = 0x1_11ab_1e_u64;
+        for _ in 0..90 {
+            let mut board = Board::new();
+            let plies = 6 + (seed as usize % 34);
+            for _ in 0..plies {
+                if board.is_terminal().is_some() {
+                    break;
+                }
+                let moves = generate_legal_moves(&board);
+                if moves.is_empty() {
+                    break;
+                }
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                let index = (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) as usize) % moves.len();
+                board.apply_move(moves[index]);
+            }
+            candidates.push(board);
+        }
+
+        for board in candidates {
+            let g = titanium_game_from_board(&board);
+            let Some(verdict) = try_strict_immutable_path_race(&g, true, true) else {
+                continue;
+            };
+            let mut reference = g.clone();
+            reference.wl = [0, 0];
+            let mut scratch = RaceScratch::new();
+            let mut table = vec![0i16; RACE_STATES];
+            let dtm = race_exact_dtm_on_demand(&mut reference, &mut scratch, &mut table)
+                .expect("strict temporal separation must resolve zero-wall race");
+            let oracle_winner = if dtm > 0 {
+                reference.turn
+            } else {
+                1 - reference.turn
+            };
+            assert_eq!(
+                verdict.winner, oracle_winner,
+                "immutable projection disagreed on a Canta/random position"
+            );
+            checked += 1;
+        }
+
+        // Guaranteed positive control: ensures this counter-oracle test also
+        // exercises the emitted-exact-score path when the corpus itself has no
+        // eligible near-goal immutable position.
+        let mut positive = GameState::new();
+        positive.pawn = [13, 63];
+        positive.turn = 0;
+        positive.wl = [10, 10];
+        let verdict = try_strict_immutable_path_race(&positive, true, true)
+            .expect("positive immutable projection");
+        let mut reference = positive.clone();
+        reference.wl = [0, 0];
+        let mut scratch = RaceScratch::new();
+        let mut table = vec![0i16; RACE_STATES];
+        let dtm = race_exact_dtm_on_demand(&mut reference, &mut scratch, &mut table)
+            .expect("positive control exact race");
+        let oracle_winner = if dtm > 0 {
+            reference.turn
+        } else {
+            1 - reference.turn
+        };
+        assert_eq!(verdict.winner, oracle_winner);
+        checked += 1;
+
+        eprintln!(
+            "immutable Canta/random counter-oracle: checked={checked} stats={:?}",
+            IMMUTABLE_PATH_STATS.snapshot()
+        );
+    }
+
+    #[test]
+    fn strict_immutable_short_race_matches_full_wall_minimax() {
+        // This has one wall per side.  Unlike the zero-wall reference above,
+        // the exhaustive search must consider legal wall choices as well as
+        // pawn moves.  The corridor fixture makes the runner path immutable,
+        // so the strict projection may return an exact terminal ply.
+        let g = corridor_game(1, 1, 0);
+        let verdict = try_strict_immutable_path_race(&g, true, true)
+            .expect("corridor must produce a strict immutable projection");
+        assert!(
+            verdict.winner_terminal_ply <= 8,
+            "fixture must stay bounded"
+        );
+        assert_eq!(
+            exhaustive_winner(&mut g.clone(), verdict.winner_terminal_ply as u32),
+            Some(verdict.winner),
+            "strict projection must agree with complete minimax including walls"
+        );
     }
 
     fn exhaustive_winner(g: &mut GameState, max_depth: u32) -> Option<usize> {

@@ -2017,6 +2017,7 @@ fn session_engine_flag(args: &[String]) -> Option<&str> {
         "titanium-v17-race2w",
         "titanium-v17-race2pv",
         "titanium-v17-race1pv",
+        "titanium-v17-immutable-pv",
     ];
     args.windows(2)
         .find(|pair| {
@@ -2088,6 +2089,7 @@ fn uses_titanium_module(flag: &str) -> bool {
         || flag == "titanium-v17-race2w"
         || flag == "titanium-v17-race2pv"
         || flag == "titanium-v17-race1pv"
+        || flag == "titanium-v17-immutable-pv"
         || flag == "titanium-v15-medium"
         || flag == "titanium-v15-frozen"
         || flag == "titanium-v15-no-raceproof"
