@@ -17,7 +17,6 @@ use crate::util::grid::{pack_flood_mask, square_index};
 /// Reused BFS workspace — pass through perft and move-generation hot loops.
 #[derive(Clone)]
 pub struct BfsScratch {
-    bfs_layers: DistLayers,
     dist_from_pawn: [u8; 81],
     dist_to_goal: [u8; 81],
     /// Cached `DirMasks` for the current board hash — one build per movegen node.
@@ -34,7 +33,6 @@ impl Default for BfsScratch {
 impl BfsScratch {
     pub fn new() -> Self {
         Self {
-            bfs_layers: DistLayers::default(),
             dist_from_pawn: [0; 81],
             dist_to_goal: [0; 81],
             masks_hash: 0,
@@ -112,13 +110,13 @@ impl BfsScratch {
         let masks = self.dir_masks(board);
         let (row, col) = board.pawn(player);
         let start = square_index(row, col);
+        let mut layers = DistLayers::default();
 
-        if !fill_bfs_layers_until_goal(start, player, masks, &mut self.bfs_layers) {
+        if !fill_bfs_layers_until_goal(start, player, masks, &mut layers) {
             return None;
         }
 
-        self.bfs_layers
-            .pop_shortest_path_to(goal_square_mask(player), masks, path_out)
+        layers.pop_shortest_path_to(goal_square_mask(player), masks, path_out)
     }
 
     pub fn fill_next_toward_goal(
@@ -128,8 +126,9 @@ impl BfsScratch {
         next_out: &mut [u8; 81],
     ) {
         let masks = self.dir_masks(board);
-        fill_dist_layers_to_goal_row(player, masks, &mut self.bfs_layers);
-        self.bfs_layers.fill_bfs_next_steps(masks, next_out);
+        let mut layers = DistLayers::default();
+        fill_dist_layers_to_goal_row(player, masks, &mut layers);
+        layers.fill_bfs_next_steps(masks, next_out);
     }
 }
 
