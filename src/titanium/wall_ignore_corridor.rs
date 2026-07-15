@@ -12,6 +12,8 @@ pub struct BoardEdge {
 }
 
 impl BoardEdge {
+    pub const EMPTY: Self = Self { a: 0, b: 0 };
+
     #[inline]
     pub fn new(a: usize, b: usize) -> Self {
         if a <= b {
@@ -23,8 +25,22 @@ impl BoardEdge {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrictRunnerGuarantee {
+    pub side: usize,
+    pub base_own_moves_to_goal: u8,
+    pub max_own_moves_to_goal: u8,
+    pub exact_own_moves_to_goal: Option<u8>,
+    pub path: [u8; 81],
+    pub path_len: u8,
+    pub protected_edges: [BoardEdge; 80],
+    pub protected_edge_count: u8,
+    pub kind: RunnerGuaranteeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerGuaranteeKind {
     ZeroDelayCorridor,
+    StrictImmutablePath,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +109,173 @@ fn topology_neighbors(g: &GameState, cell: usize, out: &mut [usize; 4]) -> usize
         n += 1;
     }
     n
+}
+
+/// Reconstruct one deterministic Lee-wave shortest path by descending the
+/// already-computed goal-distance field. No queue, parent map, or heap is used.
+pub fn reconstruct_one_shortest_path_from_goal_field(
+    g: &GameState,
+    side: usize,
+    goal_dist: &[u8; 81],
+    out: &mut [u8; 81],
+) -> Option<usize> {
+    let mut cell = g.pawn[side];
+    let distance = goal_dist[cell];
+    if distance == u8::MAX {
+        return None;
+    }
+    out[0] = cell as u8;
+    let mut len = 1usize;
+    while !is_goal_cell(side, cell) {
+        let next_distance = goal_dist[cell].checked_sub(1)?;
+        let mut neighbors = [0usize; 4];
+        let count = topology_neighbors(g, cell, &mut neighbors);
+        let next = neighbors[..count]
+            .iter()
+            .copied()
+            .find(|&candidate| goal_dist[candidate] == next_distance)?;
+        out[len] = next as u8;
+        len += 1;
+        cell = next;
+    }
+    debug_assert_eq!(len - 1, distance as usize);
+    Some(len)
+}
+
+/// Fixed-array form of [`walls_that_block_edge`].
+pub fn wall_moves_blocking_edge(edge: BoardEdge, out: &mut [i16; 2]) -> usize {
+    let a = edge.a;
+    let b = edge.b;
+    let ar = a / 9;
+    let ac = a % 9;
+    let br = b / 9;
+    let bc = b % 9;
+    let mut count = 0usize;
+
+    if ac == bc {
+        let north = a.min(b);
+        let row = north / 9;
+        let col = north % 9;
+        if row < 8 && col < 8 {
+            out[count] = 100 + (row * 8 + col) as i16;
+            count += 1;
+        }
+        if row < 8 && col > 0 {
+            out[count] = 100 + (row * 8 + col - 1) as i16;
+            count += 1;
+        }
+    } else if ar == br {
+        let west = a.min(b);
+        let row = west / 9;
+        let col = west % 9;
+        if row < 8 && col < 8 {
+            out[count] = 200 + (row * 8 + col) as i16;
+            count += 1;
+        }
+        if row > 0 && col < 8 {
+            out[count] = 200 + ((row - 1) * 8 + col) as i16;
+            count += 1;
+        }
+    }
+    count
+}
+
+#[inline]
+pub fn opponent_can_place_before_edge(
+    root_side_to_move: usize,
+    runner: usize,
+    edge_index: usize,
+) -> bool {
+    root_side_to_move != runner || edge_index > 0
+}
+
+#[inline]
+fn wall_move_index(mv: i16) -> usize {
+    if mv < 200 {
+        (mv - 100) as usize
+    } else {
+        64 + (mv - 200) as usize
+    }
+}
+
+/// Prove that one concrete shortest path cannot be blocked by any future legal
+/// opponent wall before the runner passes the affected edge. Every distinct
+/// blocking wall is tested at each real opponent opportunity where it could
+/// still affect an untraversed edge.
+pub fn prove_strict_immutable_path(g: &GameState, runner: usize) -> Option<StrictRunnerGuarantee> {
+    if runner > 1 || g.winner() >= 0 {
+        return None;
+    }
+
+    let mut goal_dist = [u8::MAX; 81];
+    g.compute_dist(runner, &mut goal_dist);
+    let mut path = [0u8; 81];
+    let path_len = reconstruct_one_shortest_path_from_goal_field(g, runner, &goal_dist, &mut path)?;
+    let edge_count = path_len.checked_sub(1)?;
+    let mut edges = [BoardEdge::EMPTY; 80];
+    let mut first_affected_edge = [u8::MAX; 128];
+    let mut last_affected_edge = [u8::MAX; 128];
+
+    for edge_index in 0..edge_count {
+        let edge = BoardEdge::new(path[edge_index] as usize, path[edge_index + 1] as usize);
+        edges[edge_index] = edge;
+        let mut blocking = [0i16; 2];
+        let blocking_count = wall_moves_blocking_edge(edge, &mut blocking);
+        for &mv in &blocking[..blocking_count] {
+            let index = wall_move_index(mv);
+            first_affected_edge[index] = first_affected_edge[index].min(edge_index as u8);
+            last_affected_edge[index] = if last_affected_edge[index] == u8::MAX {
+                edge_index as u8
+            } else {
+                last_affected_edge[index].max(edge_index as u8)
+            };
+        }
+    }
+
+    let opponent = 1 - runner;
+    if g.wl[opponent] > 0 {
+        let first_opportunity = usize::from(g.turn == runner);
+        for (index, &last_edge) in last_affected_edge.iter().enumerate() {
+            if last_edge == u8::MAX || first_opportunity > last_edge as usize {
+                continue;
+            }
+            debug_assert!(first_affected_edge[index] <= last_edge);
+            let (wall_type, slot) = if index < 64 {
+                (0, index)
+            } else {
+                (1, index - 64)
+            };
+
+            // A wall may be legal at an earlier runner square but illegal at
+            // the last one (for example, once that square becomes enclosed).
+            // Therefore latest-only testing is not a sound monotonic shortcut.
+            // Check every real opponent opportunity until the last path edge
+            // this wall can still block. The candidate set itself remains
+            // deduplicated, and the search state is never mutated.
+            for path_index in first_opportunity..=last_edge as usize {
+                debug_assert!(opponent_can_place_before_edge(g.turn, runner, path_index));
+                let mut sim = g.clone();
+                sim.pawn[runner] = path[path_index] as usize;
+                sim.turn = opponent;
+                if sim.wall_legal(wall_type, slot) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let distance = edge_count as u8;
+    Some(StrictRunnerGuarantee {
+        side: runner,
+        base_own_moves_to_goal: distance,
+        max_own_moves_to_goal: distance,
+        exact_own_moves_to_goal: None,
+        path,
+        path_len: path_len as u8,
+        protected_edges: edges,
+        protected_edge_count: edge_count as u8,
+        kind: RunnerGuaranteeKind::StrictImmutablePath,
+    })
 }
 
 pub fn reconstruct_shortest_goal_path(
@@ -213,38 +396,9 @@ pub fn detect_zero_delay_corridor(
 
 /// Debug/test helper: wall move ids (100+ / 200+) geometrically capable of blocking `edge`.
 pub fn walls_that_block_edge(edge: BoardEdge) -> Vec<i16> {
-    let a = edge.a;
-    let b = edge.b;
-    let mut out = Vec::with_capacity(2);
-    let ar = a / 9;
-    let ac = a % 9;
-    let br = b / 9;
-    let bc = b % 9;
-
-    if ac == bc {
-        // N-S adjacency
-        let north = a.min(b);
-        let row = north / 9;
-        let col = north % 9;
-        if row < 8 && col < 8 {
-            out.push(100 + (row * 8 + col) as i16);
-        }
-        if row < 8 && col > 0 {
-            out.push(100 + (row * 8 + (col - 1)) as i16);
-        }
-    } else if ar == br {
-        // E-W adjacency
-        let west = a.min(b);
-        let row = west / 9;
-        let col = west % 9;
-        if row < 8 && col < 8 {
-            out.push(200 + (row * 8 + col) as i16);
-        }
-        if row > 0 && col < 8 {
-            out.push(200 + ((row - 1) * 8 + col) as i16);
-        }
-    }
-    out
+    let mut fixed = [0i16; 2];
+    let count = wall_moves_blocking_edge(edge, &mut fixed);
+    fixed[..count].to_vec()
 }
 
 /// Test/manually-built position: white column-4 zero-delay corridor, black separated.
@@ -396,5 +550,81 @@ mod tests {
             detect_zero_delay_corridor(&g, 0, &mut scratch).is_none(),
             "longer bypass must prevent zero-delay certificate"
         );
+    }
+
+    #[test]
+    fn lee_wave_reconstruction_matches_goal_distance() {
+        let g = apply_moves(&["e2", "e8", "e3", "e7", "d3h", "f6h", "e4h"]);
+        for side in 0..2 {
+            let mut dist = [u8::MAX; 81];
+            g.compute_dist(side, &mut dist);
+            let mut path = [0u8; 81];
+            let len = reconstruct_one_shortest_path_from_goal_field(&g, side, &dist, &mut path)
+                .expect("reachable goal");
+            assert_eq!(len - 1, dist[g.pawn[side]] as usize);
+            assert_eq!(path[0] as usize, g.pawn[side]);
+            assert!(is_goal_cell(side, path[len - 1] as usize));
+            for pair in path[..len].windows(2) {
+                let a = pair[0] as usize;
+                let b = pair[1] as usize;
+                assert_eq!(dist[b] + 1, dist[a]);
+                let mut neighbors = [0usize; 4];
+                let count = topology_neighbors(&g, a, &mut neighbors);
+                assert!(neighbors[..count].contains(&b));
+            }
+        }
+    }
+
+    fn near_goal_runner(turn: usize, runner_distance: usize) -> GameState {
+        let mut g = GameState::new();
+        g.pawn = [4 + runner_distance * 9, 68];
+        g.turn = turn;
+        g.wl = [10, 10];
+        g
+    }
+
+    #[test]
+    fn runner_crosses_edge_zero_before_opponent_can_wall() {
+        let g = near_goal_runner(0, 1);
+        let guarantee = prove_strict_immutable_path(&g, 0).expect("edge zero is too late");
+        assert_eq!(guarantee.kind, RunnerGuaranteeKind::StrictImmutablePath);
+        assert_eq!(guarantee.max_own_moves_to_goal, 1);
+    }
+
+    #[test]
+    fn opponent_to_move_can_block_edge_zero() {
+        let g = near_goal_runner(1, 1);
+        assert!(prove_strict_immutable_path(&g, 0).is_none());
+    }
+
+    #[test]
+    fn later_legal_wall_rejects_strict_path() {
+        let g = near_goal_runner(0, 2);
+        assert!(prove_strict_immutable_path(&g, 0).is_none());
+    }
+
+    #[test]
+    fn detector_never_mutates_real_position_or_inventory() {
+        let g = near_goal_runner(0, 1);
+        let original = g.clone();
+        let _ = prove_strict_immutable_path(&g, 0);
+        assert_eq!(g.wl, original.wl);
+        assert_eq!(g.hash_lo, original.hash_lo);
+        assert_eq!(g.hash_hi, original.hash_hi);
+        assert_eq!(g.pawn, original.pawn);
+        assert_eq!(g.blocked, original.blocked);
+        assert_eq!(g.hw, original.hw);
+        assert_eq!(g.vw, original.vw);
+        assert_eq!(g.turn, original.turn);
+    }
+
+    #[test]
+    fn no_opponent_walls_proves_selected_shortest_path() {
+        let mut g = near_goal_runner(1, 4);
+        g.wl[1] = 0;
+        let guarantee = prove_strict_immutable_path(&g, 0).expect("no blocking inventory");
+        assert_eq!(guarantee.base_own_moves_to_goal, 4);
+        assert_eq!(guarantee.max_own_moves_to_goal, 4);
+        assert_eq!(guarantee.protected_edge_count, 4);
     }
 }
