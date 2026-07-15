@@ -147,9 +147,9 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
     }
     if engine_flag == "titanium-v17-race1w" {
         search.set_remaining_wall_race_layers(true, false);
-    } else if engine_flag == "titanium-v17" || engine_flag == "titanium-v17-race2w" {
+    } else if engine_flag == "titanium-v17-race2w" {
         search.set_remaining_wall_race_layers(true, true);
-    } else if engine_flag == "titanium-v17-race2pv" {
+    } else if engine_flag == "titanium-v17" || engine_flag == "titanium-v17-race2pv" {
         search.set_remaining_wall_race_layers(true, true);
         search.set_two_wall_race_pv_only(true);
     }
@@ -432,6 +432,8 @@ mod session_tests {
         assert_eq!(one.remaining_wall_race_layers(), (true, false));
         assert_eq!(both.remaining_wall_race_layers(), (true, true));
         assert_eq!(pv_only.remaining_wall_race_layers(), (true, true));
+        assert!(default.two_wall_race_pv_only());
+        assert!(!both.two_wall_race_pv_only());
         assert!(pv_only.two_wall_race_pv_only());
     }
 }

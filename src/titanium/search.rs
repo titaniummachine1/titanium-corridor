@@ -2804,8 +2804,7 @@ impl TitaniumSearch {
         self.ace_rfp = on;
     }
 
-    /// Experiment-only race layers. They remain off unless an explicit engine
-    /// variant selects them; production `titanium-v17` is unchanged.
+    /// Select the proven remaining-wall race layers used by an engine variant.
     pub fn set_remaining_wall_race_layers(&mut self, one_wall: bool, two_wall: bool) {
         self.one_wall_race_resolved = Some(one_wall);
         self.two_wall_race_resolved = Some(two_wall);
