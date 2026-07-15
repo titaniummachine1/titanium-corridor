@@ -219,7 +219,7 @@ fn goal_mask(player: Player) -> u128 {
 }
 
 /// Fill `dist_from[sq]` with BFS distance from `start`. Unreachable → `u8::MAX`.
-pub fn fill_dist_from_sq(start: u8, masks: DirMasks, dist_from: &mut [u8; 81]) {
+pub fn fill_dist_from_sq(start: u8, masks: DirMasks, dist_from: &mut [u8; 81]) -> u128 {
     dist_from.fill(u8::MAX);
     dist_from[start as usize] = 0;
     let mut reached = flood_bit_sq(start);
@@ -241,6 +241,7 @@ pub fn fill_dist_from_sq(start: u8, masks: DirMasks, dist_from: &mut [u8; 81]) {
         reached |= new;
         frontier = new;
     }
+    reached
 }
 
 /// Fill `dist_to[sq]` with BFS distance to any goal-row cell for `player`.

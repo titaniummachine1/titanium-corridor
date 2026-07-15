@@ -4880,15 +4880,24 @@ impl TitaniumSearch {
         let opp_player = if me == 0 { Player::Two } else { Player::One };
 
         let bridge = self.bridge.as_mut().expect("cat bridge");
-        let cat = if depth >= 2 {
-            crate::cat::build_corridor_attention(&mut bridge.bfs, &bridge.board)
+        let (cat, opp_path, opp_path_len, reachable) = if depth >= 2 {
+            let data = crate::cat::build::build_corridor_search_data(
+                &mut bridge.bfs,
+                &bridge.board,
+            );
+            (
+                data.attention,
+                data.opponent_path,
+                data.opponent_path_len,
+                data.reachable,
+            )
         } else {
-            CorridorAttention::default()
+            let mut path = [0u8; 81];
+            let path_len =
+                get_shortest_path(&bridge.board, opp_player, &mut bridge.bfs, &mut path);
+            let reachable = bridge.bfs.both_reachable_mask(&bridge.board);
+            (CorridorAttention::default(), path, path_len, reachable)
         };
-        let mut opp_path = [0u8; 81];
-        let opp_path_len =
-            get_shortest_path(&bridge.board, opp_player, &mut bridge.bfs, &mut opp_path);
-        let reachable = bridge.bfs.both_reachable_mask(&bridge.board);
         let gap_zone = gap_play_zone_mask(reachable);
         let mut wall_candidates = [BoardMove::Pawn { row: 0, col: 0 }; 128];
         let mut wall_direct_heats = [0i32; 128];

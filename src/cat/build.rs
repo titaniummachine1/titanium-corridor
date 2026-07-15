@@ -14,7 +14,9 @@ use crate::pathfinding::bfs::layers::{
 };
 use crate::pathfinding::masks::DirMasks;
 use crate::pathfinding::BfsScratch;
-use crate::util::grid::{flood_bit_sq, square_index, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
+use crate::util::grid::{
+    flood_bit_sq, pack_flood_mask, square_index, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT,
+};
 
 fn corridor_heat(delta: u16) -> u16 {
     if delta > MAX_RELEVANT_CORRIDOR_DELTA {
@@ -127,11 +129,11 @@ fn add_player_corridor_attention(
     out: &mut CorridorAttention,
     dist_from_pawn: &mut [u8; 81],
     dist_to_goal: &mut [u8; 81],
-) {
+) -> u128 {
     let (sr, sc) = board.pawn(player);
     let start = square_index(sr, sc);
 
-    fill_dist_from_sq(start, masks, dist_from_pawn);
+    let reachable = fill_dist_from_sq(start, masks, dist_from_pawn);
     fill_dist_to_goal_row(player, masks, dist_to_goal);
 
     let shortest_to_goal = dist_to_goal[start as usize];
@@ -168,6 +170,7 @@ fn add_player_corridor_attention(
             out.bottleneck_heat[idx] = out.bottleneck_heat[idx].saturating_add(BOTTLENECK_BONUS_CM);
         }
     }
+    reachable
 }
 
 pub fn build_player_corridor_attention(
@@ -175,7 +178,7 @@ pub fn build_player_corridor_attention(
     board: &Board,
     player: Player,
 ) -> CorridorAttention {
-    let masks = DirMasks::from_board(board);
+    let masks = scratch.dir_masks(board);
     let mut out = CorridorAttention::default();
     let (dist_from, dist_to) = scratch.dist_scratch_mut();
     add_player_corridor_attention(board, player, masks, &mut out, dist_from, dist_to);
@@ -201,12 +204,96 @@ fn merge_corridor_max(a: &mut CorridorAttention, b: &CorridorAttention) {
     }
 }
 
+/// CAT output plus pathfinding facts already available while building it.
+/// Reusing these fields avoids a separate opponent-path flood and two more
+/// reachability floods in wall generation.
+pub(crate) struct CorridorSearchData {
+    pub attention: CorridorAttention,
+    pub opponent_path: [u8; 81],
+    pub opponent_path_len: usize,
+    pub reachable: u128,
+}
+
+fn recover_shortest_path_from_goal_distances(
+    board: &Board,
+    player: Player,
+    masks: DirMasks,
+    dist_to_goal: &[u8; 81],
+    path_out: &mut [u8; 81],
+) -> usize {
+    let (row, col) = board.pawn(player);
+    let mut current = square_index(row, col);
+    let mut len = 0usize;
+    loop {
+        path_out[len] = current;
+        len += 1;
+        if len == path_out.len() || dist_to_goal[current as usize] == 0 {
+            return len;
+        }
+        let current_distance = dist_to_goal[current as usize];
+        if current_distance == u8::MAX {
+            return len;
+        }
+        let mut neighbors = [0u8; 4];
+        let count = neighbor_squares(current, masks, &mut neighbors);
+        let Some(next) = neighbors[..count]
+            .iter()
+            .copied()
+            .filter(|&sq| dist_to_goal[sq as usize].saturating_add(1) == current_distance)
+            .min()
+        else {
+            return len;
+        };
+        current = next;
+    }
+}
+
+/// Build CAT and retain the opponent path/reachability from the same four BFFs.
+pub(crate) fn build_corridor_search_data(
+    scratch: &mut BfsScratch,
+    board: &Board,
+) -> CorridorSearchData {
+    let masks = scratch.dir_masks(board);
+    let opponent = board.side().opposite();
+    let mut white = CorridorAttention::default();
+    let mut black = CorridorAttention::default();
+    let mut opponent_path = [0u8; 81];
+    let mut opponent_path_len = 0usize;
+    let mut reachable_flood = 0u128;
+
+    for (player, attention) in [
+        (Player::One, &mut white),
+        (Player::Two, &mut black),
+    ] {
+        let (dist_from, dist_to) = scratch.dist_scratch_mut();
+        reachable_flood |=
+            add_player_corridor_attention(board, player, masks, attention, dist_from, dist_to);
+        if player == opponent {
+            opponent_path_len = recover_shortest_path_from_goal_distances(
+                board,
+                player,
+                masks,
+                dist_to,
+                &mut opponent_path,
+            );
+        }
+    }
+
+    merge_corridor_max(&mut white, &black);
+    CorridorSearchData {
+        attention: white,
+        opponent_path,
+        opponent_path_len,
+        reachable: pack_flood_mask(reachable_flood),
+    }
+}
+
 /// Build combined two-player corridor attention for search ordering.
 ///
 /// Uses per-square **max** of each player's heat (same as the web overlay), not sum —
 /// summing both races doubled fringe heat and qualified ~40 walls per node in open games.
 pub fn build_corridor_attention(scratch: &mut BfsScratch, board: &Board) -> CorridorAttention {
-    let masks = DirMasks::from_board(board);
+    let masks = scratch.dir_masks(board);
     let mut white = CorridorAttention::default();
     let mut black = CorridorAttention::default();
     {
@@ -224,7 +311,7 @@ pub fn build_corridor_attention(scratch: &mut BfsScratch, board: &Board) -> Corr
 
 /// Count low-flex squares on exact/near-shortest corridors (caging heuristic).
 pub fn corridor_bottleneck_count(scratch: &mut BfsScratch, board: &Board, player: Player) -> u8 {
-    let masks = DirMasks::from_board(board);
+    let masks = scratch.dir_masks(board);
     let (sr, sc) = board.pawn(player);
     let start = square_index(sr, sc);
     let (dist_from, dist_to) = scratch.dist_scratch_mut();
@@ -388,6 +475,9 @@ fn add_player_impact_heat(board: &Board, player: Player, masks: DirMasks, heat: 
     add_player_impact_heat_with_bias(board, player, masks, heat, bias_bp);
 }
 
+/// STM-specific policy filter applied after both player planes are combined.
+/// The raw per-player layer builder already excludes that player's own rear;
+/// this additionally removes combined heat behind the side-to-move pawn.
 fn zero_pawn_entry_and_rear(heat: &mut [u16; 81], board: &Board, player: Player, masks: DirMasks) {
     let (sr, sc) = board.pawn(player);
     let pawn_sq = square_index(sr, sc);
@@ -409,19 +499,17 @@ fn zero_pawn_entry_and_rear(heat: &mut [u16; 81], board: &Board, player: Player,
 
 /// Fast bitmask impact heatmap for v16 LMR ordering and web square overlay.
 ///
-/// Each player's heat is built and rear-zeroed independently before summing.
-/// Sequential add-then-zero on a shared array would let P2's rear-wipe erase
-/// P1's forward corridor when the pawns are close to their respective goals.
+/// Each player's layer intersection is limited to `to_goal <= shortest`, and
+/// excludes the pawn bit, so no separate rear-zeroing distance flood is needed.
+/// The two player planes remain separate until the final saturating sum.
 pub fn build_impact_heatmap(board: &Board) -> CorridorAttention {
     let masks = DirMasks::from_board(board);
 
     let mut h1 = [0u16; 81];
     add_player_impact_heat(board, Player::One, masks, &mut h1);
-    zero_pawn_entry_and_rear(&mut h1, board, Player::One, masks);
 
     let mut h2 = [0u16; 81];
     add_player_impact_heat(board, Player::Two, masks, &mut h2);
-    zero_pawn_entry_and_rear(&mut h2, board, Player::Two, masks);
 
     let mut out = CorridorAttention::default();
     for i in 0..81 {
