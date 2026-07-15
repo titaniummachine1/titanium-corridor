@@ -50,8 +50,8 @@ use crate::titanium::game::{GameState, ZOBRIST};
 use crate::titanium::net::{net, net_frozen, Net, MAX_NET_H, NET_BKT, NET_MIRC, NET_MIRS};
 use crate::titanium::packed_state::FEATURE_SCHEMA;
 use crate::titanium::race::{
-    race_outcome_with_dist, solve_race_config, RaceBound, RaceOutcomeStats, RaceScratch, RACE_MATE,
-    RACE_STATES,
+    race_outcome_detailed, race_outcome_with_dist, solve_race_config, PlyEstimate, RaceBound,
+    RaceOutcomeStats, RaceScratch, RACE_MATE, RACE_STATES, RACE_WIN_FLOOR,
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
 use crate::util::grid::FLOOD_PLAYABLE;
@@ -74,10 +74,6 @@ fn reverse_futility_margin(depth: i32, improving: bool, ace_rfp: bool) -> Option
         (depth <= 4).then_some((if improving { 70 } else { 90 }) * depth)
     }
 }
-
-/// Proven-outcome band for stubborn-loser tie breaks (matches `search::alphabeta`).
-const CERT_WIN_SCORE: i32 = 15_000;
-const CERT_BAND: i32 = 4_000;
 
 /// Default CAT-index LMR tuning percent:
 /// -500 = strongest CAT-shaped cuts, 100 = current/default, 150 = full depth.
@@ -579,6 +575,7 @@ mod lazy_smp_tests {
                 race_outcome_stats: RaceOutcomeStats::default(),
                 opening_book: None,
                 root_defense_diag: Vec::new(),
+                race: RaceResultInfo::from_score(depth * 10),
             }
         }
 
@@ -1194,6 +1191,53 @@ pub struct AceDepthLogEntry {
     pub pv: String,
 }
 
+/// Race semantics attached to a final result.  A proof bound and an exact DTM
+/// are deliberately different states: an approximate ETA must never enter the
+/// exact `RACE_MATE - dtm` score band.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaceResultInfo {
+    /// `1` = side to move at the root is proven to win, `-1` = proven to lose.
+    pub outcome: i8,
+    /// Cheap winner-arrival estimate.  This is metadata, never an exact score.
+    pub approximate_plies: Option<u16>,
+    /// Symmetric uncertainty of `approximate_plies`, in plies.
+    pub approximation_tolerance: u8,
+    /// Exact retrograde DTM when it was actually requested and completed.
+    pub exact_dtm: Option<u16>,
+}
+
+impl RaceResultInfo {
+    #[inline]
+    fn approximate(outcome: i8, plies: Option<u16>) -> Self {
+        Self {
+            outcome,
+            approximate_plies: plies,
+            approximation_tolerance: u8::from(plies.is_some()),
+            exact_dtm: None,
+        }
+    }
+
+    #[inline]
+    fn exact(outcome: i8, dtm: u16) -> Self {
+        Self {
+            outcome,
+            approximate_plies: None,
+            approximation_tolerance: 0,
+            exact_dtm: Some(dtm),
+        }
+    }
+
+    #[inline]
+    fn from_score(score: i32) -> Self {
+        let abs = score.abs();
+        if abs > RACE_WIN_FLOOR && abs <= RACE_MATE {
+            Self::exact(score.signum() as i8, (RACE_MATE - abs) as u16)
+        } else {
+            Self::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ThinkResult {
     pub mv: i16,
@@ -1220,6 +1264,7 @@ pub struct ThinkResult {
     pub opening_book: Option<crate::titanium::opening_book::OpeningBookDiagnostics>,
     /// Last lost-position root defense pass (one entry per legal root move searched).
     pub root_defense_diag: Vec<RootDefenseDiag>,
+    pub race: RaceResultInfo,
 }
 
 /// One complete late-move pipeline observation. These records are emitted only
@@ -1271,13 +1316,17 @@ pub fn score_label(score: i32) -> String {
         } else {
             format!("mated in {}", plies.max(0))
         }
-    } else if abs >= RACE_MATE - 1_000 && abs <= RACE_MATE {
+    } else if abs > RACE_WIN_FLOOR && abs <= RACE_MATE {
         let plies = RACE_MATE - abs;
         if score > 0 {
             format!("race win in {}", plies.max(0))
         } else {
             format!("race loss in {}", plies.max(0))
         }
+    } else if score == RACE_WIN_FLOOR {
+        "proven race win".to_owned()
+    } else if score == -RACE_WIN_FLOOR {
+        "proven race loss".to_owned()
     } else {
         format!("cp {score}")
     }
@@ -1291,6 +1340,64 @@ mod score_label_tests {
     fn labels_race_scores_as_forced_races() {
         assert_eq!(score_label(RACE_MATE - 30), "race win in 30");
         assert_eq!(score_label(-(RACE_MATE - 17)), "race loss in 17");
+    }
+
+    #[test]
+    fn bound_is_proven_but_never_decoded_as_exact_dtm() {
+        assert_eq!(score_label(RACE_WIN_FLOOR), "proven race win");
+        assert_eq!(score_label(-RACE_WIN_FLOOR), "proven race loss");
+        assert_eq!(proven_score_dtm(RACE_WIN_FLOOR), None);
+        assert_eq!(proven_score_dtm(-RACE_WIN_FLOOR), None);
+    }
+
+    #[test]
+    fn exact_race_band_uses_the_declared_maximum_not_a_magic_thousand() {
+        let longest_exact = RACE_WIN_FLOOR + 1;
+        assert_eq!(
+            proven_score_dtm(longest_exact),
+            Some(RACE_MATE - longest_exact)
+        );
+    }
+
+    #[test]
+    fn approximate_race_tie_break_requires_disjoint_tolerance_intervals() {
+        let fast = RaceRootCandidate {
+            mv: 1,
+            root_wins: true,
+            approximate_plies: Some(5),
+            exact_dtm: None,
+        };
+        let overlaps = RaceRootCandidate {
+            mv: 2,
+            root_wins: true,
+            approximate_plies: Some(7),
+            exact_dtm: None,
+        };
+        let separated = RaceRootCandidate {
+            mv: 3,
+            root_wins: true,
+            approximate_plies: Some(8),
+            exact_dtm: None,
+        };
+        assert!(!race_candidate_definitely_best(fast, &[fast, overlaps]));
+        assert!(race_candidate_definitely_best(fast, &[fast, separated]));
+
+        let slow_loss = RaceRootCandidate {
+            mv: 4,
+            root_wins: false,
+            approximate_plies: Some(12),
+            exact_dtm: None,
+        };
+        let quick_loss = RaceRootCandidate {
+            mv: 5,
+            root_wins: false,
+            approximate_plies: Some(9),
+            exact_dtm: None,
+        };
+        assert!(race_candidate_definitely_best(
+            slow_loss,
+            &[slow_loss, quick_loss]
+        ));
     }
 
     #[test]
@@ -1483,7 +1590,7 @@ pub fn is_proven_loss_score(score: i32) -> bool {
         return false;
     }
     let abs = score.abs();
-    abs >= MATE - 1_000 || (abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500)
+    abs >= MATE - 1_000 || (abs > RACE_WIN_FLOOR && abs <= RACE_MATE)
 }
 
 /// Pack a 0/1 wall-slot byte array into a u64 bitboard (bit s = slot s occupied).
@@ -1509,7 +1616,7 @@ fn wall_slot_bits(slots: &[u8; 64]) -> u64 {
 #[inline]
 pub fn is_proven_win_score(score: i32) -> bool {
     let abs = score.abs();
-    (abs >= MATE - 1_000 || (abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500)) && score > 0
+    (abs >= MATE - 1_000 || (abs > RACE_WIN_FLOOR && abs <= RACE_MATE)) && score > 0
 }
 
 /// Distance-to-mate plies encoded in a proven race/mate score.
@@ -1518,7 +1625,7 @@ pub fn proven_score_dtm(score: i32) -> Option<i32> {
     let abs = score.abs();
     if abs >= MATE - 1_000 {
         Some(MATE - abs)
-    } else if abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500 {
+    } else if abs > RACE_WIN_FLOOR && abs <= RACE_MATE {
         Some(RACE_MATE - abs)
     } else {
         None
@@ -1716,7 +1823,7 @@ pub fn format_root_defense_diag_json(entries: &[RootDefenseDiag]) -> String {
 }
 
 pub fn think_result_progress_json(engine_label: &str, result: &ThinkResult) -> String {
-    ace_progress_json(
+    let json = ace_progress_json(
         engine_label,
         &result.depth_log,
         result.depth,
@@ -1728,7 +1835,32 @@ pub fn think_result_progress_json(engine_label: &str, result: &ThinkResult) -> S
         result.white_dist,
         result.black_dist,
         result.ms,
-    )
+    );
+    append_race_result_json(json, result.race)
+}
+
+fn append_race_result_json(mut json: String, race: RaceResultInfo) -> String {
+    let _ = json.pop();
+    let kind = if race.exact_dtm.is_some() {
+        "race_dtm"
+    } else if race.outcome != 0 {
+        "race_bound"
+    } else {
+        "score"
+    };
+    let approx = race
+        .approximate_plies
+        .map_or_else(|| "null".to_owned(), |v| v.to_string());
+    let dtm = race
+        .exact_dtm
+        .map_or_else(|| "null".to_owned(), |v| v.to_string());
+    json.push_str(&format!(
+        r#","scoreKind":"{kind}","scoreProven":{},"raceOutcome":{},"estimatedPlies":{approx},"estimateTolerancePlies":{},"dtm":{dtm}}}"#,
+        race.outcome != 0,
+        race.outcome,
+        race.approximation_tolerance,
+    ));
+    json
 }
 
 fn ace_progress_json(
@@ -1779,21 +1911,25 @@ fn emit_ace_progress(
     white_dist: u8,
     black_dist: u8,
     elapsed_ms: u64,
+    race: RaceResultInfo,
     #[cfg(feature = "wasm")] wasm_progress: Option<&mut Vec<String>>,
     #[cfg(feature = "wasm")] wasm_cb: Option<&js_sys::Function>,
 ) {
-    let json = ace_progress_json(
-        engine_label,
-        depth_log,
-        search_depth,
-        nodes,
-        nodes,
-        &[],
-        nodes,
-        root_score,
-        white_dist,
-        black_dist,
-        elapsed_ms,
+    let json = append_race_result_json(
+        ace_progress_json(
+            engine_label,
+            depth_log,
+            search_depth,
+            nodes,
+            nodes,
+            &[],
+            nodes,
+            root_score,
+            white_dist,
+            black_dist,
+            elapsed_ms,
+        ),
+        race,
     );
     #[cfg(feature = "wasm")]
     {
@@ -2152,7 +2288,56 @@ const STREAM_EMIT_MIN_INTERVAL_MS: u64 = 100;
 
 enum HandsEmptyPipelineOutcome {
     Score(i32),
-    LossFloor,
+}
+
+const RACE_APPROX_TOLERANCE_PLIES: u16 = 1;
+
+#[derive(Clone, Copy)]
+struct RaceRootCandidate {
+    mv: i16,
+    root_wins: bool,
+    approximate_plies: Option<u16>,
+    exact_dtm: Option<u16>,
+}
+
+struct RaceRootSolution {
+    mv: i16,
+    score: i32,
+    info: RaceResultInfo,
+    exact: bool,
+    legal_moves: usize,
+}
+
+#[inline]
+fn race_estimate_interval(plies: u16) -> (u16, u16) {
+    (
+        plies.saturating_sub(RACE_APPROX_TOLERANCE_PLIES),
+        plies.saturating_add(RACE_APPROX_TOLERANCE_PLIES),
+    )
+}
+
+fn race_candidate_definitely_best(
+    candidate: RaceRootCandidate,
+    peers: &[RaceRootCandidate],
+) -> bool {
+    let Some(estimate) = candidate.approximate_plies else {
+        return false;
+    };
+    let (lo, hi) = race_estimate_interval(estimate);
+    peers.iter().all(|peer| {
+        if peer.mv == candidate.mv {
+            return true;
+        }
+        let Some(peer_estimate) = peer.approximate_plies else {
+            return false;
+        };
+        let (peer_lo, peer_hi) = race_estimate_interval(peer_estimate);
+        if candidate.root_wins {
+            hi < peer_lo
+        } else {
+            lo > peer_hi
+        }
+    })
 }
 
 impl TitaniumSearch {
@@ -3530,6 +3715,7 @@ impl TitaniumSearch {
             white_dist,
             black_dist,
             elapsed_ms,
+            RaceResultInfo::from_score(self.stream_root_score),
             #[cfg(feature = "wasm")]
             Some(&mut self.wasm_progress),
             #[cfg(feature = "wasm")]
@@ -4170,16 +4356,47 @@ impl TitaniumSearch {
         self.score_from_race_slot(slot)
     }
 
+    /// Optional walls-remaining certificate as a typed alpha/beta bound.
+    /// Its terminal-ply fields are guarantees, not exact DTM.
+    fn wall_ignore_race_bound(&mut self) -> RaceBound {
+        if !self.race_proof || self.g.wl[0] + self.g.wl[1] == 0 {
+            return RaceBound::Unknown;
+        }
+        use crate::titanium::wall_ignore_cert::{
+            try_wall_ignorance_loss_cert, wall_ignore_loss_cert_enabled, CertScratch,
+        };
+        let enabled = match self.wall_ignore_cert_resolved {
+            Some(v) => v,
+            None => {
+                let v = self.wall_ignore_cert_override.unwrap_or(false)
+                    || wall_ignore_loss_cert_enabled();
+                self.wall_ignore_cert_resolved = Some(v);
+                v
+            }
+        };
+        if !enabled {
+            return RaceBound::Unknown;
+        }
+        let mut scratch = CertScratch::new();
+        let Some(verdict) = try_wall_ignorance_loss_cert(&mut self.g, &mut scratch, true) else {
+            return RaceBound::Unknown;
+        };
+        if verdict.winner == self.g.turn {
+            RaceBound::Lower(RACE_WIN_FLOOR)
+        } else {
+            RaceBound::Upper(-RACE_WIN_FLOOR)
+        }
+    }
+
     /// Hands-empty endgame pipeline (cheap → heavy). Caller must ensure
     /// `wl[0] == 0 && wl[1] == 0` and leaf eligibility.
     ///
-    /// 1. `race_tbl` LRU probe (memo hit with decisive retrograde value)
-    /// 2. Cached `d0`/`d1` Gate 1 (`cheap_cert` only)
-    /// 3. `race_tbl(false)` on Gate 1 `Unknown` (LRU probe → budget-gated build)
-    /// 4. Distance heuristic (unproven)
+    /// 1. `race_tbl` LRU probe (memo hit with exact retrograde value)
+    /// 2. `race_tbl(false)` budget-gated exact build
+    /// 3. Distance heuristic (unproven)
     ///
-    /// Stage 4 (`cert_win`) and stage 5 (NNUE / alpha-beta) run in `evaluate()`
-    /// after this returns `LossFloor` or when walls remain.
+    /// Bound-only deductions run in `ab()`, where the search window exists.
+    /// Static evaluation never promotes a lower/upper bound to exact.
     fn try_hands_empty_endgame(&mut self, d_me_i: i32, d_opp_i: i32) -> HandsEmptyPipelineOutcome {
         // Stage 1: existing `race_tbl` LRU memo (probe only, no build).
         if self.race_proof {
@@ -4193,25 +4410,9 @@ impl TitaniumSearch {
         }
 
         // Stage 2: cached-distance Gate 1 (Service A).
-        if self.cheap_cert {
-            let d0 = &self.d0[self.dist0_idx];
-            let d1 = &self.d1[self.dist1_idx];
-            let bound = crate::bench_instr::record(
-                |b| &mut b.eval_race_bound,
-                || race_outcome_with_dist(&self.g, d0, d1, &mut self.race_outcome_stats),
-            );
-            match bound {
-                RaceBound::Lower(_) => {
-                    self.race_outcome_stats.resolved_gate1 += 1;
-                    return HandsEmptyPipelineOutcome::Score(RACE_MATE - d_me_i.max(1));
-                }
-                RaceBound::Upper(_) => {
-                    self.race_outcome_stats.resolved_gate1_loss += 1;
-                    return HandsEmptyPipelineOutcome::LossFloor;
-                }
-                RaceBound::Exact(_) | RaceBound::Unknown => {}
-            }
-        }
+        // Cheap proof bounds are consumed in `ab()`, where the real search
+        // window is available. Static evaluation must not invent an exact
+        // value from a lower or upper bound.
 
         // Stage 3: `race_tbl(false)` — LRU probe then budget-gated build.
         if self.race_proof {
@@ -4454,11 +4655,9 @@ impl TitaniumSearch {
         let w_opp_i = self.g.wl[opp];
         let d_me_i = d_me_u as i32;
         let d_opp_i = d_opp_u as i32;
-        let mut hands_empty_loss_floor = false;
         if w_me_i == 0 && w_opp_i == 0 && (!self.cert_eval_leaves_only || depth <= 0) {
             match self.try_hands_empty_endgame(d_me_i, d_opp_i) {
                 HandsEmptyPipelineOutcome::Score(s) => return s,
-                HandsEmptyPipelineOutcome::LossFloor => hands_empty_loss_floor = true,
             }
         }
         if self.race_proof
@@ -4478,16 +4677,7 @@ impl TitaniumSearch {
             if e.key == hash64 && e.meta == ec_meta {
                 let out = e.val;
                 crate::bench_instr::bump(|b| &mut b.eval_cache_hit);
-                return self.evaluate_tail(
-                    out,
-                    depth,
-                    me,
-                    d_me_i,
-                    d_opp_i,
-                    w_me_i,
-                    w_opp_i,
-                    hands_empty_loss_floor,
-                );
+                return self.evaluate_tail(out, depth, me, d_me_i, d_opp_i, w_me_i, w_opp_i);
             }
         }
         crate::bench_instr::bump(|b| &mut b.eval_cache_miss);
@@ -4629,16 +4819,7 @@ impl TitaniumSearch {
             val: out,
             meta: ec_meta,
         };
-        self.evaluate_tail(
-            out,
-            depth,
-            me,
-            d_me_i,
-            d_opp_i,
-            w_me_i,
-            w_opp_i,
-            hands_empty_loss_floor,
-        )
+        self.evaluate_tail(out, depth, me, d_me_i, d_opp_i, w_me_i, w_opp_i)
     }
 
     /// Cert/race floors applied on top of the cached pure static eval `out`.
@@ -4654,37 +4835,10 @@ impl TitaniumSearch {
         d_opp_i: i32,
         w_me_i: i32,
         w_opp_i: i32,
-        hands_empty_loss_floor: bool,
     ) -> i32 {
         let _tail_timer = crate::bench_instr::OpTimer::start(|b| &mut b.eval_tail);
         // Integer centipawns (JS `out | 0` / halfpw `int(out)`).
         let mut ret = out as i32;
-        // pathfix/RaceProof(c): certified-win floor (sound; lazy; memoized;
-        // capped per think; plausibility filter dMe <= dOpp+1). Stage 4 of the
-        // endgame pipeline — only when walls remain (or legacy non-leaf cert).
-        if self.race_proof && w_me_i + w_opp_i > 0 {
-            use crate::titanium::wall_ignore_cert::{
-                cert_score_from_stm, try_wall_ignorance_loss_cert, wall_ignore_loss_cert_enabled,
-                CertScratch,
-            };
-            let force = match self.wall_ignore_cert_resolved {
-                Some(v) => v,
-                None => {
-                    let v = self.wall_ignore_cert_override.unwrap_or(false)
-                        || wall_ignore_loss_cert_enabled();
-                    self.wall_ignore_cert_resolved = Some(v);
-                    v
-                }
-            };
-            if force {
-                let mut wi_scratch = CertScratch::new();
-                if let Some(verdict) =
-                    try_wall_ignorance_loss_cert(&mut self.g, &mut wi_scratch, true)
-                {
-                    return cert_score_from_stm(&verdict, me);
-                }
-            }
-        }
         let cert_ok = if self.cert_eval_leaves_only {
             depth <= 0 && w_me_i == 0 && w_opp_i == 0
         } else {
@@ -4709,10 +4863,6 @@ impl TitaniumSearch {
             {
                 ret = 2500;
             }
-        }
-        if hands_empty_loss_floor {
-            let band = ret.clamp(-CERT_BAND, CERT_BAND);
-            return -CERT_WIN_SCORE + band;
         }
         // Correction history: apply the learned per-wall-structure eval bias.
         // Net-eval band only — the cert_win 2500 above and every early return
@@ -4787,6 +4937,148 @@ impl TitaniumSearch {
         } else {
             None
         }
+    }
+
+    /// Resolve a hands-empty root without conflating outcome and distance.
+    ///
+    /// The theorem/attractor tier first proves each candidate's outcome and
+    /// supplies a walking ETA.  ETA intervals use a conservative +/-1 ply
+    /// tolerance.  They select a move only when one interval is strictly best;
+    /// overlapping finalists trigger the exact fixed-topology retrograde.  No
+    /// ordinary alpha-beta simulation is used by this shortcut.
+    fn semi_terminal_race_root(&mut self) -> Option<RaceRootSolution> {
+        if !self.cheap_cert
+            || self.g.wl[0] != 0
+            || self.g.wl[1] != 0
+            || self.g.pawn[0] < 9
+            || self.g.pawn[1] >= 72
+        {
+            return None;
+        }
+
+        let root_side = self.g.turn;
+        let mut moves = [0i16; 16];
+        let move_count = self.g.gen_pawn_moves(&mut moves, 0);
+        let mut candidates = Vec::with_capacity(move_count);
+        let mut unresolved = 0usize;
+
+        if self.race_scratch.is_none() {
+            self.race_scratch = Some(Box::new(RaceScratch::new()));
+        }
+
+        for &mv in &moves[..move_count] {
+            self.g.make_move(mv);
+            let immediate =
+                (root_side == 0 && self.g.pawn[0] < 9) || (root_side == 1 && self.g.pawn[1] >= 72);
+
+            let candidate = if immediate {
+                Some(RaceRootCandidate {
+                    mv,
+                    root_wins: true,
+                    approximate_plies: Some(1),
+                    exact_dtm: Some(1),
+                })
+            } else {
+                let deduction = race_outcome_detailed(
+                    &mut self.g,
+                    self.race_scratch.as_mut().expect("race scratch"),
+                );
+                let root_wins = match deduction.bound {
+                    RaceBound::Upper(_) => Some(true),
+                    RaceBound::Lower(_) => Some(false),
+                    RaceBound::Exact(v) => Some(v < 0),
+                    RaceBound::Unknown => None,
+                };
+                root_wins.map(|root_wins| RaceRootCandidate {
+                    mv,
+                    root_wins,
+                    approximate_plies: match deduction.estimated_plies {
+                        PlyEstimate::Approx(v) => Some(v.saturating_add(1)),
+                        PlyEstimate::Unknown => None,
+                    },
+                    exact_dtm: None,
+                })
+            };
+
+            self.g.unmake_move();
+            self.cached_stamp = -1;
+            if let Some(candidate) = candidate {
+                candidates.push(candidate);
+            } else {
+                unresolved += 1;
+            }
+        }
+
+        // A direct goal is an exact one-ply result and cannot be beaten.
+        if let Some(candidate) = candidates.iter().find(|c| c.exact_dtm == Some(1)) {
+            return Some(RaceRootSolution {
+                mv: candidate.mv,
+                score: RACE_MATE - 1,
+                info: RaceResultInfo::exact(1, 1),
+                exact: true,
+                legal_moves: move_count,
+            });
+        }
+
+        let root_has_proven_win = candidates.iter().any(|c| c.root_wins);
+        if !root_has_proven_win && unresolved != 0 {
+            // A root loss requires every legal reply to be covered. Unknown is
+            // a mandatory ordinary-search fallback, never an assumed loss.
+            return None;
+        }
+        let finalists: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|c| c.root_wins == root_has_proven_win)
+            .collect();
+        if finalists.is_empty() {
+            return None;
+        }
+
+        let unique_by_interval = if finalists.len() == 1 {
+            Some(finalists[0])
+        } else {
+            let mut definite = finalists
+                .iter()
+                .copied()
+                .filter(|candidate| race_candidate_definitely_best(*candidate, &finalists));
+            let first = definite.next();
+            if definite.next().is_none() {
+                first
+            } else {
+                None
+            }
+        };
+
+        if let Some(candidate) = unique_by_interval {
+            let outcome = if candidate.root_wins { 1 } else { -1 };
+            return Some(RaceRootSolution {
+                mv: candidate.mv,
+                score: outcome as i32 * RACE_WIN_FLOOR,
+                info: RaceResultInfo::approximate(outcome, candidate.approximate_plies),
+                exact: false,
+                legal_moves: move_count,
+            });
+        }
+
+        // The +/-1 intervals overlap, so the approximate ETA cannot honestly
+        // break the tie. Refine with the dedicated retrograde table, not the
+        // general search. The table is exact for this immutable topology.
+        let slot = self.race_tbl(true)?;
+        let root_value = self.race_value(slot) as i32;
+        let (mv, exact_dtm, _) = self.race_root_pick(slot, root_value)?;
+        let outcome = root_value.signum() as i8;
+        Some(RaceRootSolution {
+            mv,
+            score: if outcome > 0 {
+                RACE_MATE - exact_dtm.abs()
+            } else {
+                -(RACE_MATE - exact_dtm.abs())
+            },
+            info: RaceResultInfo::exact(outcome, exact_dtm.unsigned_abs() as u16),
+            exact: true,
+            legal_moves: move_count,
+        })
     }
 
     fn gen_moves(&mut self, ply: usize, depth: i32, tt_move: i16, out: &mut [i16; 160]) -> usize {
@@ -4881,10 +5173,8 @@ impl TitaniumSearch {
 
         let bridge = self.bridge.as_mut().expect("cat bridge");
         let (cat, opp_path, opp_path_len, reachable) = if depth >= 2 {
-            let data = crate::cat::build::build_corridor_search_data(
-                &mut bridge.bfs,
-                &bridge.board,
-            );
+            let data =
+                crate::cat::build::build_corridor_search_data(&mut bridge.bfs, &bridge.board);
             (
                 data.attention,
                 data.opponent_path,
@@ -4893,8 +5183,7 @@ impl TitaniumSearch {
             )
         } else {
             let mut path = [0u8; 81];
-            let path_len =
-                get_shortest_path(&bridge.board, opp_player, &mut bridge.bfs, &mut path);
+            let path_len = get_shortest_path(&bridge.board, opp_player, &mut bridge.bfs, &mut path);
             let reachable = bridge.bfs.both_reachable_mask(&bridge.board);
             (CorridorAttention::default(), path, path_len, reachable)
         };
@@ -5258,10 +5547,45 @@ impl TitaniumSearch {
         let ndm_lo = self.dir_masks_key_lo;
         let ndm_hi = self.dir_masks_key_hi;
         let ndm_cache = self.dir_masks_cache;
-        if let Some(score) = self.exact_hands_empty_score(false) {
-            return Ok(score);
+        if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
+            // Service A is a typed alpha/beta bound, not a static score.  It
+            // may cut only when it crosses the current window.  A PV/wide
+            // window falls through to the exact retrograde or ordinary search.
+            if self.cheap_cert {
+                let d0 = &self.d0[self.dist0_idx];
+                let d1 = &self.d1[self.dist1_idx];
+                let bound = crate::bench_instr::record(
+                    |b| &mut b.eval_race_bound,
+                    || race_outcome_with_dist(&self.g, d0, d1, &mut self.race_outcome_stats),
+                );
+                match bound {
+                    RaceBound::Lower(v) if v >= beta => {
+                        self.race_outcome_stats.resolved_gate1 += 1;
+                        return Ok(beta);
+                    }
+                    RaceBound::Upper(v) if v <= alpha => {
+                        self.race_outcome_stats.resolved_gate1_loss += 1;
+                        return Ok(alpha);
+                    }
+                    RaceBound::Lower(_)
+                    | RaceBound::Upper(_)
+                    | RaceBound::Exact(_)
+                    | RaceBound::Unknown => {}
+                }
+            }
+            if let Some(score) = self.exact_hands_empty_score(false) {
+                return Ok(score);
+            }
         }
         if depth <= 0 {
+            match self.wall_ignore_race_bound() {
+                RaceBound::Lower(v) if v >= beta => return Ok(beta),
+                RaceBound::Upper(v) if v <= alpha => return Ok(alpha),
+                RaceBound::Lower(_)
+                | RaceBound::Upper(_)
+                | RaceBound::Exact(_)
+                | RaceBound::Unknown => {}
+            }
             let static_ev = self.evaluate(depth);
             if self.q_search
                 && q_left > 0
@@ -5349,6 +5673,15 @@ impl TitaniumSearch {
                     self.refused_cuts += 1;
                 }
             }
+        }
+
+        match self.wall_ignore_race_bound() {
+            RaceBound::Lower(v) if v >= beta => return Ok(beta),
+            RaceBound::Upper(v) if v <= alpha => return Ok(alpha),
+            RaceBound::Lower(_)
+            | RaceBound::Upper(_)
+            | RaceBound::Exact(_)
+            | RaceBound::Unknown => {}
         }
 
         // Static eval once per node (the internal eval cache absorbs
@@ -6493,94 +6826,25 @@ impl TitaniumSearch {
                 race_outcome_stats: self.race_outcome_stats,
                 opening_book: self.pending_opening_book_diag.take(),
                 root_defense_diag: Vec::new(),
+                race: RaceResultInfo::default(),
             };
         }
-        if self.cheap_cert
-            && !self.race_proof
-            && self.g.wl[0] == 0
-            && self.g.wl[1] == 0
-            && self.g.pawn[0] >= 9
-            && self.g.pawn[1] < 72
-        {
+        if self.cheap_cert {
             let rt0 = Instant::now();
-            let me = self.g.turn;
-            let mut buf = [0i16; 16];
-            let nm = self.g.gen_pawn_moves(&mut buf, 0);
-            let mut best_m: i16 = -1;
-            let mut best_v: i32 = i32::MIN;
-            let mut best_key = i32::MIN;
-            let mut best_eval = i32::MIN;
-
-            for &m in &buf[..nm] {
-                self.g.make_move(m);
-                let moved = 1 - self.g.turn;
-                let immediate_win =
-                    (moved == 0 && self.g.pawn[0] < 9) || (moved == 1 && self.g.pawn[1] >= 72);
-
-                let my_v = if immediate_win {
-                    1
-                } else {
-                    use crate::titanium::cert_bridge::hands_empty_race_stm_wins;
-                    let child_stm_wins = hands_empty_race_stm_wins(&mut self.g).unwrap_or(false);
-                    let mut d_me = [255u8; 81];
-                    let mut d_opp = [255u8; 81];
-                    self.g.compute_dist(me, &mut d_me);
-                    self.g.compute_dist(1 - me, &mut d_opp);
-                    if child_stm_wins {
-                        -(1 + d_opp[self.g.pawn[1 - me]] as i32)
-                    } else {
-                        1 + d_me[self.g.pawn[me]] as i32
-                    }
-                };
-                self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_CHEAP_CERT);
-                let d_me_i = if me == 0 {
-                    self.d0[self.dist0_idx][self.g.pawn[0]] as i32
-                } else {
-                    self.d1[self.dist1_idx][self.g.pawn[1]] as i32
-                };
-                let d_opp_i = if me == 0 {
-                    self.d1[self.dist1_idx][self.g.pawn[1]] as i32
-                } else {
-                    self.d0[self.dist0_idx][self.g.pawn[0]] as i32
-                };
-                let tie_eval = d_opp_i - d_me_i;
-                self.g.unmake_move();
-                self.cached_stamp = -1;
-
-                // Prefer any forced win over any forced loss; among wins, take
-                // the fastest race. Among losses, delay as long as possible.
-                let key = if my_v > 0 {
-                    1_000_000 - my_v
-                } else {
-                    -1_000_000 - my_v
-                };
-                if key > best_key || (key == best_key && tie_eval > best_eval) {
-                    best_key = key;
-                    best_eval = tie_eval;
-                    best_m = m;
-                    best_v = my_v;
-                }
-            }
-
-            if best_m >= 0 {
+            if let Some(solution) = self.semi_terminal_race_root() {
                 self.rp_root_solves += 1;
                 self.refresh_dist_site(0, crate::bench_instr::REFRESH_SITE_CHEAP_CERT);
-                let rk = best_v.abs();
-                let score = if best_v > 0 {
-                    RACE_MATE - rk
-                } else {
-                    -(RACE_MATE - rk)
-                };
                 if log {
                     emit_ace_progress(
                         engine_label,
                         &[],
                         99,
-                        nm as u64,
-                        score,
+                        solution.legal_moves as u64,
+                        solution.score,
                         self.d0[self.dist0_idx][self.g.pawn[0]],
                         self.d1[self.dist1_idx][self.g.pawn[1]],
                         rt0.elapsed().as_millis() as u64,
+                        solution.info,
                         #[cfg(feature = "wasm")]
                         Some(&mut self.wasm_progress),
                         #[cfg(feature = "wasm")]
@@ -6588,13 +6852,13 @@ impl TitaniumSearch {
                     );
                 }
                 return ThinkResult {
-                    mv: best_m,
-                    score,
+                    mv: solution.mv,
+                    score: solution.score,
                     depth: 99,
-                    nodes: nm as u64,
-                    main_thread_nodes: nm as u64,
+                    nodes: solution.legal_moves as u64,
+                    main_thread_nodes: solution.legal_moves as u64,
                     helper_nodes: Vec::new(),
-                    total_nodes: nm as u64,
+                    total_nodes: solution.legal_moves as u64,
                     main_completed_depth: 99,
                     helper_completed_depths: Vec::new(),
                     root_widths: Vec::new(),
@@ -6604,10 +6868,15 @@ impl TitaniumSearch {
                     white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
                     black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
                     depth_log: Vec::new(),
-                    stop_reason: "cheap_cert_root_race",
+                    stop_reason: if solution.exact {
+                        "semi_terminal_race_exact"
+                    } else {
+                        "semi_terminal_race_bound"
+                    },
                     race_outcome_stats: self.race_outcome_stats,
                     opening_book: None,
                     root_defense_diag: Vec::new(),
+                    race: solution.info,
                 };
             }
         }
@@ -6653,6 +6922,7 @@ impl TitaniumSearch {
                         race_outcome_stats: self.race_outcome_stats,
                         opening_book: None,
                         root_defense_diag: Vec::new(),
+                        race: RaceResultInfo::exact(rv.signum() as i8, rk as u16),
                     };
                 }
             }
@@ -6746,6 +7016,7 @@ impl TitaniumSearch {
                 race_outcome_stats: self.race_outcome_stats,
                 opening_book: self.pending_opening_book_diag.take(),
                 root_defense_diag: Vec::new(),
+                race: RaceResultInfo::default(),
             };
         }
 
@@ -7483,6 +7754,7 @@ impl TitaniumSearch {
             race_outcome_stats: self.race_outcome_stats,
             opening_book: self.pending_opening_book_diag.take(),
             root_defense_diag: self.root_defense_diag.clone(),
+            race: RaceResultInfo::from_score(last_score),
         }
     }
 }

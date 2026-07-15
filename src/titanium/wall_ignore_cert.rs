@@ -5,7 +5,7 @@
 use crate::core::board::{Board, Player};
 use crate::titanium::cert_bridge::{paths_overlap, titanium_game_from_board};
 use crate::titanium::game::GameState;
-use crate::titanium::search::MATE;
+use crate::titanium::race::RACE_WIN_FLOOR;
 use crate::titanium::wall_ignore_corridor::{
     detect_zero_delay_corridor, shortest_distance, CorridorScratch, RunnerGuarantee,
 };
@@ -279,13 +279,16 @@ pub fn try_wall_ignore_cert_board(board: &Board, force_enable: bool) -> Option<W
     try_wall_ignorance_loss_cert(&mut g, &mut scratch, force_enable)
 }
 
-/// Score from side-to-move perspective using the engine mate encoding.
+/// Proven-outcome bound from the side-to-move perspective.
+///
+/// `winner_terminal_ply` is a guaranteed arrival estimate, not exact DTM, so
+/// this must stay outside both the mate and exact-race score bands.
 #[inline]
 pub fn cert_score_from_stm(verdict: &WallIgnoreVerdict, stm: usize) -> i32 {
     if verdict.winner == stm {
-        MATE - verdict.winner_terminal_ply as i32
+        RACE_WIN_FLOOR
     } else {
-        -MATE + verdict.winner_terminal_ply as i32
+        -RACE_WIN_FLOOR
     }
 }
 
@@ -425,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_score_respects_mate_ordering() {
+    fn cert_score_is_a_bound_and_does_not_fake_dtm_ordering() {
         let fast = WallIgnoreVerdict {
             winner: 0,
             winner_terminal_ply: 2,
@@ -442,9 +445,9 @@ mod tests {
             interaction: RaceInteraction::NonInteracting,
             race_minimax_used: false,
         };
-        assert!(
-            cert_score_from_stm(&fast, 0) > cert_score_from_stm(&slow, 0),
-            "Win in 2 > Win in 5"
-        );
+        assert_eq!(cert_score_from_stm(&fast, 0), RACE_WIN_FLOOR);
+        assert_eq!(cert_score_from_stm(&slow, 0), RACE_WIN_FLOOR);
+        assert_eq!(cert_score_from_stm(&fast, 1), -RACE_WIN_FLOOR);
+        assert!(fast.winner_terminal_ply < slow.winner_terminal_ply);
     }
 }
