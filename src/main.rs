@@ -2007,6 +2007,7 @@ fn session_engine_flag(args: &[String]) -> Option<&str> {
         "titanium-v17-route-touch-qsearch",
         "titanium-v17-lazy-topn",
         "titanium-v17-rfp-ace",
+        "titanium-v17-rfp-tc-d4",
         "titanium-v17-probcut",
         "titanium-v17-lmp-ace",
         "titanium-v17-no-partial-iter",
@@ -2076,6 +2077,7 @@ fn uses_titanium_module(flag: &str) -> bool {
         || flag == "titanium-v17-route-touch-qsearch"
         || flag == "titanium-v17-lazy-topn"
         || flag == "titanium-v17-rfp-ace"
+        || flag == "titanium-v17-rfp-tc-d4"
         || flag == "titanium-v17-probcut"
         || flag == "titanium-v17-lmp-ace"
         || flag == "titanium-v17-no-partial-iter"

@@ -67,11 +67,25 @@ pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
 
 #[inline]
-fn reverse_futility_margin(depth: i32, improving: bool, ace_rfp: bool) -> Option<i32> {
+fn reverse_futility_margin(
+    depth: i32,
+    improving: bool,
+    ace_rfp: bool,
+    ace_rfp_max_depth: i32,
+) -> Option<i32> {
     if ace_rfp {
-        (depth <= 3).then_some(100 * depth)
+        (depth <= ace_rfp_max_depth).then_some(100 * depth)
     } else {
         (depth <= 4).then_some((if improving { 70 } else { 90 }) * depth)
+    }
+}
+
+#[inline]
+fn rfp_depth_for_budget(tc_adaptive: bool, allotted_ms: u64) -> i32 {
+    if tc_adaptive && allotted_ms <= 200 {
+        4
+    } else {
+        3
     }
 }
 
@@ -747,10 +761,14 @@ mod route_touch_tests {
 
     #[test]
     fn rfp_margin_preserves_v17_and_uses_ace_candidate_only_when_enabled() {
-        assert_eq!(reverse_futility_margin(3, true, false), Some(210));
-        assert_eq!(reverse_futility_margin(4, false, false), Some(360));
-        assert_eq!(reverse_futility_margin(4, true, true), None);
-        assert_eq!(reverse_futility_margin(3, false, true), Some(300));
+        assert_eq!(reverse_futility_margin(3, true, false, 3), Some(210));
+        assert_eq!(reverse_futility_margin(4, false, false, 3), Some(360));
+        assert_eq!(reverse_futility_margin(4, true, true, 3), None);
+        assert_eq!(reverse_futility_margin(3, false, true, 3), Some(300));
+        assert_eq!(reverse_futility_margin(4, true, true, 4), Some(400));
+        assert_eq!(rfp_depth_for_budget(true, 200), 4);
+        assert_eq!(rfp_depth_for_budget(true, 201), 3);
+        assert_eq!(rfp_depth_for_budget(false, 100), 3);
     }
 }
 
@@ -2325,6 +2343,10 @@ pub struct TitaniumSearch {
     /// Opt-in ACE-style reverse futility pruning candidate. When enabled, RFP
     /// is limited to depth <= 3 with a fixed 100 cp/depth margin.
     ace_rfp: bool,
+    /// At roots allotted at most 200 ms, allow the ACE RFP rule at depth four
+    /// on null-window nodes. Fixed-depth and longer searches remain depth three.
+    rfp_tc_adaptive: bool,
+    ace_rfp_max_depth: i32,
     /// SOUND dead-zone wall prune at inner nodes (requires `bridge`): drop only
     /// walls in an unreachable void / sealed interior — provably irrelevant (they
     /// change no path and only burn inventory, never the best move). NPS-only;
@@ -2628,6 +2650,8 @@ impl TitaniumSearch {
             ace_lmp: false,
             use_predict_stop: true,
             ace_rfp: false,
+            rfp_tc_adaptive: false,
+            ace_rfp_max_depth: 3,
             dead_zone_prune: false,
             cheap_cert: false,
             cert_eval_leaves_only: false,
@@ -2804,6 +2828,10 @@ impl TitaniumSearch {
         self.ace_rfp = on;
     }
 
+    pub fn set_rfp_tc_adaptive(&mut self, on: bool) {
+        self.rfp_tc_adaptive = on;
+    }
+
     /// Select the proven remaining-wall race layers used by an engine variant.
     pub fn set_remaining_wall_race_layers(&mut self, one_wall: bool, two_wall: bool) {
         self.one_wall_race_resolved = Some(one_wall);
@@ -2829,6 +2857,11 @@ impl TitaniumSearch {
 
     pub fn ace_rfp_enabled(&self) -> bool {
         self.ace_rfp
+    }
+
+    #[cfg(test)]
+    pub fn rfp_tc_adaptive_enabled(&self) -> bool {
+        self.rfp_tc_adaptive
     }
 
     pub fn set_opening_book(
@@ -3478,6 +3511,8 @@ impl TitaniumSearch {
         worker.ace_lmp = self.ace_lmp;
         worker.use_predict_stop = self.use_predict_stop;
         worker.ace_rfp = self.ace_rfp;
+        worker.rfp_tc_adaptive = self.rfp_tc_adaptive;
+        worker.ace_rfp_max_depth = self.ace_rfp_max_depth;
         worker.dead_zone_prune = self.dead_zone_prune;
         worker.cheap_cert = self.cheap_cert;
         worker.cert_eval_leaves_only = self.cert_eval_leaves_only;
@@ -6026,9 +6061,7 @@ impl TitaniumSearch {
             }
         }
         let pv_node = beta > alpha.saturating_add(1);
-        if self.g.wl[0] + self.g.wl[1] == 2
-            && (!self.two_wall_race_pv_only || pv_node)
-        {
+        if self.g.wl[0] + self.g.wl[1] == 2 && (!self.two_wall_race_pv_only || pv_node) {
             match self.two_wall_monopoly_race_bound() {
                 RaceBound::Lower(value) if value >= beta => return Ok(beta),
                 RaceBound::Upper(value) if value <= alpha => return Ok(alpha),
@@ -6189,8 +6222,12 @@ impl TitaniumSearch {
         // reverse futility: hopeless to fall below beta at shallow depth.
         // The ACE candidate is deliberately a single-axis change: it narrows
         // the depth gate and uses a fixed 100 cp/depth margin.
-        if let Some(margin) = reverse_futility_margin(depth, improving, self.ace_rfp) {
-            if beta > -2000 && beta < 2000 && static_ev - margin >= beta {
+        if let Some(margin) =
+            reverse_futility_margin(depth, improving, self.ace_rfp, self.ace_rfp_max_depth)
+        {
+            let adaptive_depth_four = depth == 4 && self.ace_rfp_max_depth == 4;
+            let admissible_window = !adaptive_depth_four || beta == alpha.saturating_add(1);
+            if admissible_window && beta > -2000 && beta < 2000 && static_ev - margin >= beta {
                 return Ok(static_ev);
             }
         }
@@ -7760,6 +7797,7 @@ impl TitaniumSearch {
     ) -> ThinkResult {
         let t0 = Instant::now();
         crate::bench_instr::begin_search();
+        self.ace_rfp_max_depth = rfp_depth_for_budget(self.rfp_tc_adaptive, time_ms);
         let rc_hits_at_start = self.rc_hits;
         let rc_solves_at_start = self.rc_solves;
         // pathfix/RaceProof(b): reserve the commitment gate's worst-case cost
