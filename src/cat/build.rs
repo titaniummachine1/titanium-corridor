@@ -8,6 +8,7 @@ use crate::cat::constants::{
     MAX_IMPACT_HEAT_DELTA, MAX_RELEVANT_CORRIDOR_DELTA,
 };
 use crate::core::board::{Board, Player};
+use crate::pathfinding::bff::{expand_frontier, goal_square_mask};
 use crate::pathfinding::bfs::layers::{
     fill_dist_from_sq, fill_dist_layers_from_sq, fill_dist_layers_to_goal_row,
     fill_dist_to_goal_row, DistLayers,
@@ -497,28 +498,208 @@ fn zero_pawn_entry_and_rear(heat: &mut [u16; 81], board: &Board, player: Player,
     }
 }
 
-/// Fast bitmask impact heatmap for v16 LMR ordering and web square overlay.
-///
-/// Each player's layer intersection is limited to `to_goal <= shortest`, and
-/// excludes the pawn bit, so no separate rear-zeroing distance flood is needed.
-/// The two player planes remain separate until the final saturating sum.
-pub fn build_impact_heatmap(board: &Board) -> CorridorAttention {
+const CAT_V5_WITNESS_PATHS: usize = 4;
+const CAT_V5_WITNESS_HEAT: [u8; CAT_V5_WITNESS_PATHS] = [4, 3, 2, 1];
+
+/// One Lee/BFF shortest path constrained to `allowed` squares.
+fn shortest_allowed_path(
+    start: u8,
+    target: u128,
+    allowed: u128,
+    masks: DirMasks,
+    path_out: &mut [u8; 81],
+) -> Option<usize> {
+    let start_bit = flood_bit_sq(start);
+    let mut layers = DistLayers::default();
+    let mut reached = start_bit;
+    let mut frontier = start_bit;
+    layers.masks[0] = start_bit;
+    layers.depth = 1;
+
+    while frontier & target == 0 && layers.depth < layers.masks.len() {
+        frontier = expand_frontier(frontier, masks) & allowed & !reached;
+        if frontier == 0 {
+            return None;
+        }
+        layers.masks[layers.depth] = frontier;
+        layers.depth += 1;
+        reached |= frontier;
+    }
+
+    layers.pop_shortest_path_to(target, masks, path_out)
+}
+
+/// Up to four deterministic shortest paths. Paths may share the pawn's current
+/// square and first ply; squares from the second ply onward, including the
+/// selected goal square, are unavailable to subsequent Lee waves.
+fn catv5_witness_paths(
+    board: &Board,
+    player: Player,
+    masks: DirMasks,
+) -> ([u128; CAT_V5_WITNESS_PATHS], usize) {
+    let (row, col) = board.pawn(player);
+    let start = square_index(row, col);
+    let start_bit = flood_bit_sq(start);
+    let mut blocked = 0u128;
+    let mut paths = [0u128; CAT_V5_WITNESS_PATHS];
+    let mut count = 0usize;
+    let mut path = [u8::MAX; 81];
+
+    while count < CAT_V5_WITNESS_PATHS {
+        let allowed = (FLOOD_PLAYABLE & !blocked) | start_bit;
+        let targets = goal_square_mask(player) & allowed;
+        if targets == 0 {
+            break;
+        }
+        let Some(path_len) = shortest_allowed_path(start, targets, allowed, masks, &mut path)
+        else {
+            break;
+        };
+
+        let mut path_bits = 0u128;
+        for &sq in &path[1..path_len] {
+            path_bits |= flood_bit_sq(sq);
+        }
+        if path_bits == 0 {
+            break;
+        }
+        paths[count] = path_bits;
+        count += 1;
+
+        let mut newly_blocked = 0u128;
+        for &sq in &path[2..path_len] {
+            newly_blocked |= flood_bit_sq(sq);
+        }
+        if newly_blocked == 0 {
+            break;
+        }
+        blocked |= newly_blocked;
+    }
+
+    (paths, count)
+}
+
+fn add_catv5_witness_heat(
+    paths: &[u128; CAT_V5_WITNESS_PATHS],
+    count: usize,
+    heat: &mut [u8; 81],
+) {
+    for rank in 0..count {
+        let mut bits = paths[rank];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let sq = FLOOD_SQ_BY_BIT[bit];
+            if sq != u8::MAX {
+                heat[sq as usize] = heat[sq as usize].max(CAT_V5_WITNESS_HEAT[rank]);
+            }
+        }
+    }
+}
+
+fn add_catv5_propagated_heat(
+    board: &Board,
+    player: Player,
+    masks: DirMasks,
+    paths: &[u128; CAT_V5_WITNESS_PATHS],
+    count: usize,
+    heat: &mut [u16; 81],
+) {
+    let bias_bp = cat_distance_bias_bp();
+    let (row, col) = board.pawn(player);
+    let start = square_index(row, col);
+    let start_bit = flood_bit_sq(start);
+    let mut to_goal = DistLayers::default();
+    fill_dist_layers_to_goal_row(player, masks, &mut to_goal);
+    let Some(shortest) = (0..to_goal.depth).find(|&d| to_goal.masks[d] & start_bit != 0)
+    else {
+        return;
+    };
+    let mut forward = 0u128;
+    for j in 0..=shortest {
+        forward |= to_goal.masks[j];
+    }
+    for rank in 0..count {
+        let mut reached = paths[rank] & forward;
+        let mut frontier = reached;
+        let max_wave = MAX_IMPACT_HEAT_DELTA.saturating_sub(rank);
+        for wave in 0..=max_wave {
+            let base = impact_heat(rank + wave);
+            for j in 0..=shortest {
+                let cells = frontier & to_goal.masks[j] & !start_bit;
+                if cells == 0 {
+                    continue;
+                }
+                let mult = distance_bias_mult(j, shortest, bias_bp);
+                let weighted = (u32::from(base) * u32::from(mult) / 100) as u16;
+                let mut bits = cells;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let sq = FLOOD_SQ_BY_BIT[bit];
+                    if sq != u8::MAX {
+                        heat[sq as usize] = heat[sq as usize].max(weighted);
+                    }
+                }
+            }
+            if wave == max_wave {
+                break;
+            }
+            frontier = expand_frontier(frontier, masks) & forward & !reached & FLOOD_PLAYABLE;
+            if frontier == 0 {
+                break;
+            }
+            reached |= frontier;
+        }
+    }
+}
+
+/// CATv5 NN fields: raw per-player precise witnesses plus the existing
+/// propagated CATv5 combined heatmap. The raw sum is intentionally omitted:
+/// it is an exact linear combination of the two raw inputs.
+pub struct CatV5Heatmaps {
+    pub witness_p0: [u8; 81],
+    pub witness_p1: [u8; 81],
+    pub propagated: [u16; 81],
+}
+
+pub fn build_catv5_heatmaps(board: &Board) -> CatV5Heatmaps {
     let masks = DirMasks::from_board(board);
+    let (paths0, count0) = catv5_witness_paths(board, Player::One, masks);
+    let (paths1, count1) = catv5_witness_paths(board, Player::Two, masks);
+    let mut witness_p0 = [0u8; 81];
+    let mut witness_p1 = [0u8; 81];
+    add_catv5_witness_heat(&paths0, count0, &mut witness_p0);
+    add_catv5_witness_heat(&paths1, count1, &mut witness_p1);
 
+    let mut h0 = [0u16; 81];
     let mut h1 = [0u16; 81];
-    add_player_impact_heat(board, Player::One, masks, &mut h1);
-
-    let mut h2 = [0u16; 81];
-    add_player_impact_heat(board, Player::Two, masks, &mut h2);
-
-    let mut out = CorridorAttention::default();
+    add_catv5_propagated_heat(board, Player::One, masks, &paths0, count0, &mut h0);
+    add_catv5_propagated_heat(board, Player::Two, masks, &paths1, count1, &mut h1);
+    let mut propagated = [0u16; 81];
     for i in 0..81 {
-        out.square_heat[i] = h1[i].saturating_add(h2[i]);
+        propagated[i] = h0[i].saturating_add(h1[i]);
     }
     for player in [Player::One, Player::Two] {
         let (r, c) = board.pawn(player);
-        out.square_heat[square_index(r, c) as usize] = 0;
+        let sq = square_index(r, c) as usize;
+        witness_p0[sq] = 0;
+        witness_p1[sq] = 0;
+        propagated[sq] = 0;
     }
+    CatV5Heatmaps {
+        witness_p0,
+        witness_p1,
+        propagated,
+    }
+}
+
+/// CATv5 precise-witness impact: four node-disjoint shortest paths seed the
+/// unchanged CATv5 Lee-wave propagation and heat falloff.
+pub fn build_impact_heatmap(board: &Board) -> CorridorAttention {
+    let maps = build_catv5_heatmaps(board);
+    let mut out = CorridorAttention::default();
+    out.square_heat = maps.propagated;
     out
 }
 
@@ -542,6 +723,53 @@ mod tests {
     use super::*;
     use crate::core::board::WallOrientation;
     use crate::util::grid::set_wall;
+
+    #[test]
+    fn precise_witness_paths_are_deterministic_and_only_share_first_ply() {
+        let board = Board::new();
+        let masks = DirMasks::from_board(&board);
+        for player in [Player::One, Player::Two] {
+            let (paths, count) = catv5_witness_paths(&board, player, masks);
+            let (again, again_count) = catv5_witness_paths(&board, player, masks);
+            assert_eq!(count, again_count);
+            assert_eq!(paths, again);
+            assert!((1..=CAT_V5_WITNESS_PATHS).contains(&count));
+
+            let (row, col) = board.pawn(player);
+            let start_bit = flood_bit_sq(square_index(row, col));
+            let first_ply = expand_frontier(start_bit, masks);
+            let mut used = 0u128;
+            for &path in &paths[..count] {
+                assert_ne!(path, 0);
+                assert_eq!(path & start_bit, 0, "pawn entry is not CAT heat");
+                assert_eq!(
+                    path & used & !first_ply,
+                    0,
+                    "paths may overlap only on the first ply"
+                );
+                assert_ne!(path & goal_square_mask(player), 0, "path reaches goal");
+                used |= path;
+            }
+        }
+    }
+
+    #[test]
+    fn precise_witnesses_keep_catv5_heat_propagation() {
+        let board = Board::new();
+        let masks = DirMasks::from_board(&board);
+        let (paths, count) = catv5_witness_paths(&board, Player::One, masks);
+        let path_cells = paths[..count]
+            .iter()
+            .fold(0u128, |all, path| all | *path)
+            .count_ones() as usize;
+        let maps = build_catv5_heatmaps(&board);
+        let painted = maps.propagated.iter().filter(|&&heat| heat != 0).count();
+        assert!(
+            painted > path_cells,
+            "precise witnesses must seed CATv5 propagation, not make a sparse path-only map"
+        );
+        assert!(maps.witness_p0.iter().any(|&h| h == 4));
+    }
 
     #[test]
     fn impact_heatmap_hot_on_shared_corridor_cold_in_corner() {

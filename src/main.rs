@@ -71,6 +71,7 @@ fn main() {
         "eval" => run_eval(&args),
         "eval-batch" => run_eval_batch(),
         "eval-packed-batch" => run_eval_packed_batch(),
+        "cat-packed-batch" => run_cat_packed_batch(),
         "score-out" => run_score_out(&args),
         "reduction-probe" => run_reduction_probe(&args),
         "reduction-shadow" => run_reduction_shadow(&args),
@@ -120,6 +121,9 @@ fn print_usage() {
     println!("  titanium eval [moves...] [--json]     — HalfPW net eval dump (trainer parity)");
     println!(
         "  titanium eval-packed-batch            — stdin: u32 row + 24-byte packed state records"
+    );
+    println!(
+        "  titanium cat-packed-batch             — stdin: u32 row + 24-byte packed state records"
     );
     println!(
         "  titanium score-out --nodes N (--packed HEX | --moves MOVE...) — bounded AB score JSON"
@@ -807,35 +811,79 @@ fn json_escape(s: &str) -> String {
 }
 
 /// Batch eval from canonical packed states — stdin records: u32 LE row index + 24-byte packed state.
-fn run_eval_packed_batch() {
+fn read_packed_batch(command: &str) -> Vec<(u32, [u8; titanium::PACKED_STATE_LEN])> {
     use std::io::Read;
-    use titanium::{titanium_game_from_packed, TitaniumSearch, PACKED_STATE_LEN};
+    use titanium::PACKED_STATE_LEN;
 
-    let mut stdin = std::io::stdin().lock();
-    let mut record = [0u8; 4 + PACKED_STATE_LEN];
-    loop {
-        match stdin.read_exact(&mut record) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                eprintln!("eval-packed-batch read error: {e}");
-                std::process::exit(1);
-            }
-        }
-        let row = u32::from_le_bytes(record[0..4].try_into().unwrap());
-        let packed = &record[4..4 + PACKED_STATE_LEN];
-        match titanium_game_from_packed(packed) {
+    let mut payload = Vec::new();
+    if let Err(err) = std::io::stdin().lock().read_to_end(&mut payload) {
+        eprintln!("{command} read error: {err}");
+        std::process::exit(1);
+    }
+    const ROW_BYTES: usize = 4;
+    let record_len = ROW_BYTES + PACKED_STATE_LEN;
+    if payload.len() % record_len != 0 {
+        eprintln!("{command} read error: partial packed record");
+        std::process::exit(1);
+    }
+    payload
+        .chunks_exact(record_len)
+        .map(|record| {
+            let row = u32::from_le_bytes(record[..ROW_BYTES].try_into().unwrap());
+            let packed = record[ROW_BYTES..].try_into().unwrap();
+            (row, packed)
+        })
+        .collect()
+}
+
+fn run_eval_packed_batch() {
+    use rayon::prelude::*;
+    use titanium::{titanium_game_from_packed, TitaniumSearch};
+
+    // Database training sends bounded chunks (normally 4,096 positions). The
+    // positions are independent, so preserve input order while fanning their
+    // feature extraction across Rayon’s local CPU worker pool.
+    let rows = read_packed_batch("eval-packed-batch");
+    let lines: Vec<String> = rows
+        .par_iter()
+        .map(|(row, packed)| match titanium_game_from_packed(packed) {
             Ok(g) => {
                 let mut s = TitaniumSearch::grafted(g, None);
-                println!("{}", s.eval_dump_json_packed(row));
+                s.eval_dump_json_packed(*row)
             }
-            Err(err) => {
-                println!(
-                    "{{\"row\":{row},\"ok\":false,\"protocol\":\"eval-packed-v1\",\"error\":\"{}\"}}",
-                    json_escape(&err)
-                );
+            Err(err) => format!(
+                "{{\"row\":{row},\"ok\":false,\"protocol\":\"eval-packed-v1\",\"error\":\"{}\"}}",
+                json_escape(&err)
+            ),
+        })
+        .collect();
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// CAT-only batch extraction from canonical packed states. This avoids the
+/// full net trace, scalar evaluation, distance fields, and large eval JSON when
+/// the database already stores every non-CAT feature.
+fn run_cat_packed_batch() {
+    use rayon::prelude::*;
+    use titanium::{titanium_game_from_packed, TitaniumSearch};
+    let rows = read_packed_batch("cat-packed-batch");
+    let lines: Vec<String> = rows
+        .par_iter()
+        .map(|(row, packed)| match titanium_game_from_packed(packed) {
+            Ok(g) => {
+                let s = TitaniumSearch::grafted(g, None);
+                s.cat_dump_json_packed(*row)
             }
-        }
+            Err(err) => format!(
+                "{{\"row\":{row},\"ok\":false,\"protocol\":\"cat-packed-v1\",\"error\":\"{}\"}}",
+                json_escape(&err)
+            ),
+        })
+        .collect();
+    for line in lines {
+        println!("{line}");
     }
 }
 
