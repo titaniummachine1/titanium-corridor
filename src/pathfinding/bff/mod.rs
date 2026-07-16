@@ -7,7 +7,9 @@ use crate::core::board::Player;
 use crate::pathfinding::masks::DirMasks;
 #[cfg(test)]
 use crate::util::grid::pack_flood_mask;
-use crate::util::grid::{flood_bit_sq, goal_row, square_index, FLOOD_PLAYABLE, FLOOD_STRIDE};
+use crate::util::grid::{
+    flood_bit_sq, goal_row, square_index, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT, FLOOD_STRIDE,
+};
 
 #[inline]
 pub fn goal_square_mask(player: Player) -> u128 {
@@ -27,6 +29,37 @@ pub fn expand_frontier(frontier: u128, masks: DirMasks) -> u128 {
     let east = (frontier & masks.east) << 1;
     let west = (frontier & masks.west) >> 1;
     north | south | east | west
+}
+
+/// Exact Lee-wave distance field from an arbitrary bitset seed.
+///
+/// Every iteration expands one bit-parallel frontier. `out[sq]` is the first
+/// wave that reaches `sq` (`u8::MAX` when unreachable), so all dense distance
+/// consumers share the same BFF implementation instead of maintaining private
+/// scalar queue BFS copies.
+pub fn flood_distance_field(seed: u128, masks: DirMasks, out: &mut [u8; 81]) -> u128 {
+    out.fill(u8::MAX);
+    let mut reached = seed & FLOOD_PLAYABLE;
+    let mut frontier = reached;
+    let mut depth = 0u8;
+
+    while frontier != 0 {
+        let mut bits = frontier;
+        while bits != 0 {
+            let bit_index = bits.trailing_zeros();
+            bits &= bits - 1;
+            let sq = FLOOD_SQ_BY_BIT[bit_index as usize];
+            debug_assert_ne!(sq, u8::MAX);
+            if sq != u8::MAX {
+                out[sq as usize] = depth;
+            }
+        }
+
+        frontier = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        reached |= frontier;
+        depth = depth.saturating_add(1);
+    }
+    reached
 }
 
 #[inline]

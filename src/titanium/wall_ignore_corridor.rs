@@ -1,8 +1,10 @@
 //! Zero-delay wall-immune corridor detection for the experimental wall-ignorance
 //! forced-loss certificate (Titanium v15 experimental).
 
+use crate::pathfinding::bff::flood_to_goal;
+use crate::pathfinding::masks::DirMasks;
+use crate::titanium::dist::ace_goal_bits_for_player;
 use crate::titanium::game::{GameState, BORDER, DELTA, DIRBIT};
-use std::collections::VecDeque;
 
 /// Undirected board edge in ACE cell indices (canonical: lower index first).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -53,11 +55,7 @@ pub struct RunnerGuarantee {
     pub kind: RunnerGuaranteeKind,
 }
 
-pub struct CorridorScratch {
-    queue: VecDeque<usize>,
-    visited: [bool; 81],
-    parent: [Option<usize>; 81],
-}
+pub struct CorridorScratch;
 
 impl Default for CorridorScratch {
     fn default() -> Self {
@@ -67,22 +65,7 @@ impl Default for CorridorScratch {
 
 impl CorridorScratch {
     pub fn new() -> Self {
-        Self {
-            queue: VecDeque::with_capacity(81),
-            visited: [false; 81],
-            parent: [None; 81],
-        }
-    }
-
-    fn reset_path_search(&mut self) {
-        self.queue.clear();
-        self.visited = [false; 81];
-        self.parent = [None; 81];
-    }
-
-    fn reset_reachability(&mut self) {
-        self.queue.clear();
-        self.visited = [false; 81];
+        Self
     }
 }
 
@@ -281,46 +264,18 @@ pub fn prove_strict_immutable_path(g: &GameState, runner: usize) -> Option<Stric
 pub fn reconstruct_shortest_goal_path(
     g: &GameState,
     side: usize,
-    scratch: &mut CorridorScratch,
+    _scratch: &mut CorridorScratch,
 ) -> Option<Vec<usize>> {
-    scratch.reset_path_search();
-    let start = g.pawn[side];
-    scratch.visited[start] = true;
-    scratch.parent[start] = None;
-    scratch.queue.push_back(start);
-
-    let mut found_goal = None;
-    while let Some(current) = scratch.queue.pop_front() {
-        if is_goal_cell(side, current) {
-            found_goal = Some(current);
-            break;
-        }
-        let mut nb = [0usize; 4];
-        let nn = topology_neighbors(g, current, &mut nb);
-        for i in 0..nn {
-            let next = nb[i];
-            if scratch.visited[next] {
-                continue;
-            }
-            scratch.visited[next] = true;
-            scratch.parent[next] = Some(current);
-            scratch.queue.push_back(next);
-        }
-    }
-
-    let goal = found_goal?;
-    let mut reversed = vec![goal];
-    let mut cursor = goal;
-    while cursor != start {
-        cursor = scratch.parent[cursor]?;
-        reversed.push(cursor);
-    }
-    reversed.reverse();
-    debug_assert_eq!(
-        reversed.len().checked_sub(1),
-        Some(shortest_distance(g, side) as usize)
-    );
-    Some(reversed)
+    let mut goal_dist = [u8::MAX; 81];
+    g.compute_dist(side, &mut goal_dist);
+    let mut fixed_path = [0u8; 81];
+    let len = reconstruct_one_shortest_path_from_goal_field(g, side, &goal_dist, &mut fixed_path)?;
+    Some(
+        fixed_path[..len]
+            .iter()
+            .map(|&cell| cell as usize)
+            .collect(),
+    )
 }
 
 pub fn any_goal_reachable_without_edge(
@@ -328,31 +283,13 @@ pub fn any_goal_reachable_without_edge(
     side: usize,
     start: usize,
     removed: BoardEdge,
-    scratch: &mut CorridorScratch,
+    _scratch: &mut CorridorScratch,
 ) -> bool {
-    scratch.reset_reachability();
-    scratch.visited[start] = true;
-    scratch.queue.push_back(start);
-
-    while let Some(current) = scratch.queue.pop_front() {
-        if is_goal_cell(side, current) {
-            return true;
-        }
-        let mut nb = [0usize; 4];
-        let nn = topology_neighbors(g, current, &mut nb);
-        for i in 0..nn {
-            let next = nb[i];
-            if BoardEdge::new(current, next) == removed {
-                continue;
-            }
-            if scratch.visited[next] {
-                continue;
-            }
-            scratch.visited[next] = true;
-            scratch.queue.push_back(next);
-        }
+    if side > 1 || start >= 81 {
+        return false;
     }
-    false
+    let masks = DirMasks::from_ace_game(g).without_ace_edge(removed.a, removed.b);
+    flood_to_goal(start as u8, masks, ace_goal_bits_for_player(side)).0
 }
 
 pub fn detect_zero_delay_corridor(

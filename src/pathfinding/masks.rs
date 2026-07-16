@@ -41,15 +41,18 @@ impl DirMasks {
     pub fn from_ace_game(g: &GameState) -> Self {
         crate::bench_instr::record(
             |b| &mut b.dir_masks_from_ace,
-            || Self::from_ace_game_inner(g),
+            || Self::from_ace_blocked(&g.blocked),
         )
     }
 
-    fn from_ace_game_inner(g: &GameState) -> Self {
+    /// Build masks from ACE/Titanium's row-major blocked-direction table.
+    /// This keeps the legacy ACE reference and production Titanium engines on
+    /// exactly the same BFF topology adapter.
+    pub fn from_ace_blocked(blocked_table: &[u8; 81]) -> Self {
         let mut m = Self::default();
         for sq in 0..81usize {
             let bit = FLOOD_BIT_BY_SQ[sq];
-            let blocked = g.blocked[sq] | BORDER[sq];
+            let blocked = blocked_table[sq] | BORDER[sq];
             // ACE `can_step`: 0=N(-9), 1=S(+9), 2=W(-1), 3=E(+1)
             if blocked & 1 == 0 {
                 m.north |= bit;
@@ -65,6 +68,29 @@ impl DirMasks {
             }
         }
         m
+    }
+
+    /// Remove one undirected ACE-grid edge from an existing topology.
+    /// Used by corridor proofs that ask whether a selected edge is a bridge.
+    #[inline]
+    pub fn without_ace_edge(mut self, a: usize, b: usize) -> Self {
+        if a >= 81 || b >= 81 {
+            debug_assert!(false, "ACE edge endpoint out of range");
+            return self;
+        }
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        match hi - lo {
+            1 if lo / 9 == hi / 9 => {
+                self.east &= !FLOOD_BIT_BY_SQ[lo];
+                self.west &= !FLOOD_BIT_BY_SQ[hi];
+            }
+            9 => {
+                self.south &= !FLOOD_BIT_BY_SQ[lo];
+                self.north &= !FLOOD_BIT_BY_SQ[hi];
+            }
+            _ => debug_assert!(false, "ACE edge endpoints are not adjacent"),
+        }
+        self
     }
 
     #[inline]

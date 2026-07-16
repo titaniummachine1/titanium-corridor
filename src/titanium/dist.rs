@@ -4,7 +4,7 @@
 //! — no Titanium `Board` rebuild and no row-flip remap. Each layer is one
 //! `expand_frontier` u128 step (same binary / bitboard flood family as CAT / movegen `bff_*`).
 
-use crate::pathfinding::bff::expand_frontier;
+use crate::pathfinding::bff::{expand_frontier, flood_distance_field};
 use crate::pathfinding::masks::DirMasks;
 use crate::titanium::game::GameState;
 use crate::util::grid::{flood_bit_sq, FLOOD_BIT_BY_SQ, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
@@ -26,7 +26,7 @@ const ACE_P0_GOAL_BITS: u128 = ace_goal_bits(0);
 const ACE_P1_GOAL_BITS: u128 = ace_goal_bits(8);
 
 #[inline]
-fn ace_goal_bits_for_player(player: usize) -> u128 {
+pub fn ace_goal_bits_for_player(player: usize) -> u128 {
     if player == 0 {
         ACE_P0_GOAL_BITS
     } else {
@@ -43,37 +43,7 @@ fn flood_scatter(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
 }
 
 fn flood_scatter_inner(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
-    out.fill(255);
-    let mut reached = seed & FLOOD_PLAYABLE;
-    let mut frontier = reached;
-    let mut layer = 0u8;
-    let mut bits = reached;
-    while bits != 0 {
-        let fb = bits.trailing_zeros();
-        bits &= bits - 1;
-        let sq = FLOOD_SQ_BY_BIT[fb as usize];
-        if sq != u8::MAX {
-            out[sq as usize] = layer;
-        }
-    }
-    while frontier != 0 {
-        layer += 1;
-        let new = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
-        if new == 0 {
-            break;
-        }
-        bits = new;
-        while bits != 0 {
-            let fb = bits.trailing_zeros();
-            bits &= bits - 1;
-            let sq = FLOOD_SQ_BY_BIT[fb as usize];
-            if sq != u8::MAX {
-                out[sq as usize] = layer;
-            }
-        }
-        reached |= new;
-        frontier = new;
-    }
+    flood_distance_field(seed, masks, out);
 }
 
 /// Layer-native BFS flood: records each `expand_frontier` wavefront as a `u128`
@@ -562,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn ace_flood_matches_queue_bfs() {
+    fn ace_flood_matches_public_distance_api() {
         for g in [
             GameState::new(),
             pos(&["e2", "e8", "e3", "e7", "d3h", "f5v"]),
@@ -570,13 +540,13 @@ mod tests {
         ] {
             for player in [0usize, 1] {
                 let mut flood = [0u8; 81];
-                let mut queue = [0u8; 81];
+                let mut public_api = [0u8; 81];
                 fill_ace_dist_to_goal(&g, player, &mut flood);
-                g.compute_dist(player, &mut queue);
-                assert_eq!(flood, queue, "goal field player {player}");
+                g.compute_dist(player, &mut public_api);
+                assert_eq!(flood, public_api, "goal field player {player}");
                 fill_ace_dist_from_pawn(&g, g.pawn[player], &mut flood);
-                g.compute_steps_from(g.pawn[player], &mut queue);
-                assert_eq!(flood, queue, "pawn field player {player}");
+                g.compute_steps_from(g.pawn[player], &mut public_api);
+                assert_eq!(flood, public_api, "pawn field player {player}");
             }
         }
     }

@@ -15,8 +15,10 @@
 //!   turn hash term present iff side-to-move == 1 (ACE base hash is turn-0)
 
 use crate::core::board::{Board, Player};
+use crate::pathfinding::masks::DirMasks;
 use crate::titanium::certify::{certify, CertifyOpts};
-use crate::titanium::game::{GameState, BORDER, DELTA, DIRBIT, ZOBRIST};
+use crate::titanium::dist::fill_ace_dist_from_pawn_with_masks;
+use crate::titanium::game::{GameState, ZOBRIST};
 use crate::util::clock::{Duration, Instant};
 
 /// Titanium pawn `(row, col)` → ACE cell index (0..80).
@@ -72,7 +74,8 @@ pub fn titanium_game_from_board(board: &Board) -> GameState {
     g.hash_hi = hh;
     g.hw_bits = GameState::board_wall_bits_to_ace(board.horizontal_walls);
     g.vw_bits = GameState::board_wall_bits_to_ace(board.vertical_walls);
-    g.wall_stamp = board.horizontal_walls.count_ones() as i32 + board.vertical_walls.count_ones() as i32;
+    g.wall_stamp =
+        board.horizontal_walls.count_ones() as i32 + board.vertical_walls.count_ones() as i32;
     g
 }
 
@@ -338,33 +341,10 @@ fn race_rec(g: &mut GameState, resolver: &mut RaceResolver) -> RaceProof {
 
 // ── Path-aware hands-empty race classifier (jump-mechanics short-circuit) ─────
 
-/// Walls-only BFS distance from `src` to every cell (255 = unreachable).
-/// Mirror of `compute_dist` but seeded from an arbitrary cell.
-fn bfs_from_cell(g: &GameState, src: usize) -> [u8; 81] {
+/// Walls-only Lee/BFF distance from `src` to every cell (255 = unreachable).
+fn dist_from_cell(src: usize, masks: DirMasks) -> [u8; 81] {
     let mut out = [255u8; 81];
-    out[src] = 0;
-    let mut queue = [0i16; 81];
-    let mut head = 0usize;
-    let mut tail = 0usize;
-    queue[tail] = src as i16;
-    tail += 1;
-    while head < tail {
-        let u = queue[head] as usize;
-        head += 1;
-        let du = out[u] + 1;
-        let bm = g.blocked[u] | BORDER[u];
-        for d in 0..4 {
-            if bm & DIRBIT[d] != 0 {
-                continue;
-            }
-            let v = (u as i16 + DELTA[d]) as usize;
-            if out[v] > du {
-                out[v] = du;
-                queue[tail] = v as i16;
-                tail += 1;
-            }
-        }
-    }
+    fill_ace_dist_from_pawn_with_masks(src, masks, &mut out);
     out
 }
 
@@ -374,8 +354,9 @@ fn bfs_from_cell(g: &GameState, src: usize) -> [u8; 81] {
 /// the race is a pure parallel tempo race. `d_goal{0,1}` are `compute_dist`
 /// fields (cell→goal); `D{0,1}` are the players' shortest distances.
 pub fn paths_overlap(g: &GameState, d_goal0: &[u8; 81], d_goal1: &[u8; 81]) -> bool {
-    let s0 = bfs_from_cell(g, g.pawn[0]);
-    let s1 = bfs_from_cell(g, g.pawn[1]);
+    let masks = DirMasks::from_ace_game(g);
+    let s0 = dist_from_cell(g.pawn[0], masks);
+    let s1 = dist_from_cell(g.pawn[1], masks);
     let big0 = d_goal0[g.pawn[0]] as u16;
     let big1 = d_goal1[g.pawn[1]] as u16;
     for c in 0..81 {

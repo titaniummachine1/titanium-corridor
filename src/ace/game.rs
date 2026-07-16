@@ -111,7 +111,6 @@ pub struct AceGame {
     pub last_wall_ply: usize,
     /// Bumped on every wall make/unmake; dist fields depend only on walls.
     pub wall_stamp: i32,
-    seen: [u8; 81],
 }
 
 impl Default for AceGame {
@@ -139,7 +138,6 @@ impl AceGame {
             hist_len: 0,
             last_wall_ply: 0,
             wall_stamp: 0,
-            seen: [0; 81],
         }
     }
 
@@ -271,39 +269,13 @@ impl AceGame {
     }
 
     pub fn has_path(&mut self, player: usize) -> bool {
-        let goal = if player == 0 { 0 } else { 8 };
+        use crate::pathfinding::bff::flood_to_goal;
+        use crate::pathfinding::masks::DirMasks;
+        use crate::titanium::dist::ace_goal_bits_for_player;
+
         let start = self.pawn[player];
-        if start / 9 == goal {
-            return true;
-        }
-        self.seen.fill(0);
-        let mut queue = [0i16; 81];
-        let mut head = 0;
-        let mut tail = 0;
-        queue[tail] = start as i16;
-        tail += 1;
-        self.seen[start] = 1;
-        while head < tail {
-            let u = queue[head] as usize;
-            head += 1;
-            let bm = self.blocked[u] | BORDER[u];
-            for d in 0..4 {
-                if bm & DIRBIT[d] != 0 {
-                    continue;
-                }
-                let v = (u as i16 + DELTA[d]) as usize;
-                if self.seen[v] != 0 {
-                    continue;
-                }
-                if v / 9 == goal {
-                    return true;
-                }
-                self.seen[v] = 1;
-                queue[tail] = v as i16;
-                tail += 1;
-            }
-        }
-        false
+        let masks = DirMasks::from_ace_blocked(&self.blocked);
+        flood_to_goal(start as u8, masks, ace_goal_bits_for_player(player)).0
     }
 
     // gen11: `wallCanBlockTopology` and the Titanium path oracle are GONE —
@@ -451,33 +423,14 @@ impl AceGame {
     // ── Distance fields ─────────────────────────────────────────────────────
 
     pub fn compute_dist(&self, player: usize, dist: &mut [u8; 81]) {
-        dist.fill(255);
-        let goal = if player == 0 { 0 } else { 8 };
-        let mut queue = [0i16; 81];
-        let mut head = 0;
-        let mut tail = 0;
-        for c in 0..9 {
-            let cell = goal * 9 + c;
-            dist[cell] = 0;
-            queue[tail] = cell as i16;
-            tail += 1;
-        }
-        while head < tail {
-            let u = queue[head] as usize;
-            head += 1;
-            let du = dist[u] + 1;
-            let bm = self.blocked[u] | BORDER[u];
-            for d in 0..4 {
-                if bm & DIRBIT[d] != 0 {
-                    continue;
-                }
-                let v = (u as i16 + DELTA[d]) as usize;
-                if dist[v] > du {
-                    dist[v] = du;
-                    queue[tail] = v as i16;
-                    tail += 1;
-                }
-            }
-        }
+        use crate::pathfinding::bff::flood_distance_field;
+        use crate::pathfinding::masks::DirMasks;
+        use crate::titanium::dist::ace_goal_bits_for_player;
+
+        flood_distance_field(
+            ace_goal_bits_for_player(player),
+            DirMasks::from_ace_blocked(&self.blocked),
+            dist,
+        );
     }
 }

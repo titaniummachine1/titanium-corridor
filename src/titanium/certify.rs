@@ -14,7 +14,8 @@
 //! Rust port (mirroring the browser's `RP_CERT === null`) omitted it. This is
 //! the file that makes the v13 port faithful.
 
-use crate::titanium::game::{GameState, BORDER, DELTA, DIRBIT};
+use crate::titanium::dist::fill_ace_dist_from_pawn;
+use crate::titanium::game::GameState;
 use crate::util::clock::Instant;
 
 /// Budget / deadline abort. Mirrors the JS `BUDGET_EX` throw: it unwinds
@@ -65,36 +66,7 @@ pub struct CertifyReport {
     pub nodes: u64,
 }
 
-// ── helpers (engine-internal-free; bounds via BORDER, walls via g.blocked) ───
-
-/// Walls-only distance field from `src` (pawn-blind, like `compute_dist`).
-/// Matches the JS certify-local `bfsFromCell` (`out.fill(32000)`).
-fn bfs_from_cell(g: &GameState, src: usize, out: &mut [i16; 81]) {
-    out.fill(32000);
-    out[src] = 0;
-    let mut queue = [0i16; 81];
-    let mut head = 0usize;
-    let mut tail = 0usize;
-    queue[tail] = src as i16;
-    tail += 1;
-    while head < tail {
-        let u = queue[head] as usize;
-        head += 1;
-        let du = out[u] + 1;
-        let bm = g.blocked[u] | BORDER[u];
-        for d in 0..4 {
-            if bm & DIRBIT[d] != 0 {
-                continue;
-            }
-            let v = (u as i16 + DELTA[d]) as usize;
-            if out[v] > du {
-                out[v] = du;
-                queue[tail] = v as i16;
-                tail += 1;
-            }
-        }
-    }
-}
+// ── helpers ─────────────────────────────────────────────────────────────────
 
 /// Engine race convention: side to move wins iff `dMe <= dOpp`.
 fn race_winner_stm(turn: usize, d0: u8, d1: u8) -> usize {
@@ -260,8 +232,8 @@ impl<'a> Solver<'a> {
                 // wall moves: classify against S's shortest-path corridor
                 let mut d_s2 = [0u8; 81];
                 self.g.compute_dist(s, &mut d_s2);
-                let mut dp = [0i16; 81];
-                bfs_from_cell(self.g, self.g.pawn[s], &mut dp);
+                let mut dp = [u8::MAX; 81];
+                fill_ace_dist_from_pawn(self.g, self.g.pawn[s], &mut dp);
                 let total = d_s2[self.g.pawn[s]] as i32;
                 let p_s = self.g.pawn[s];
                 let p_o = self.g.pawn[o];
