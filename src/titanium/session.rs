@@ -1,11 +1,6 @@
-//! ACE v13 reference-engine session REPL (ace-v13-*, ace-v13-ti-pure, …).
-//!
-//! Wire protocol: `reset` / `position [MOVES]` / `makemove MOVE` /
-//! `go TIME_SEC` / `quit`.  Holds one warm `TitaniumSearch` per process so the
-//! TT, killers, history, and countermove tables persist between plies.
-//!
-//! `titanium-v15` uses this session (grafted build).  `session_v15` infinite
-//! search exists but is not routed — see main.rs.
+//! Titanium session wire protocol: `reset` / `position [MOVES]` /
+//! `makemove MOVE` / `go TIME_SEC` / `quit`. Holds one warm search per process
+//! so its TT and ordering tables persist between plies.
 
 use std::io::{self, BufRead, Write};
 
@@ -21,7 +16,7 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
     let _ = stdout.flush();
 }
 
-fn is_v16_graft(engine_flag: &str) -> bool {
+fn is_grafted_engine(engine_flag: &str) -> bool {
     matches!(
         engine_flag,
         "titanium-v16"
@@ -52,6 +47,10 @@ pub fn apply_session_experiment_flags(search: &mut TitaniumSearch, engine_flag: 
 }
 
 fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str) {
+    let engine_flag = match engine_flag {
+        "titanium-v16" | "titanium-v16-sfhist" => "titanium-v17",
+        other => other,
+    };
     let is_v17 = matches!(
         engine_flag,
         "titanium-v17"
@@ -177,13 +176,12 @@ fn configure_session_experiments(search: &mut TitaniumSearch, engine_flag: &str)
 }
 
 fn build_search(engine_flag: &str, g: GameState) -> Box<TitaniumSearch> {
-    // titanium-v15 = production grafted build. ace-v13-ti-pure = JS baseline yardstick.
     let mut search = match engine_flag {
         "ace-v13-pure" => TitaniumSearch::new(g),
         "ace-v13-ti-pure" => TitaniumSearch::with_ti_movegen_pure(g),
         "titanium-v15-medium" => TitaniumSearch::grafted_medium(g, None),
         "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
-        flag if is_v16_graft(flag) => TitaniumSearch::grafted_v16(g, None),
+        flag if is_grafted_engine(flag) => TitaniumSearch::grafted_v17(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
             TitaniumSearch::grafted_no_raceproof(g, None)
         }

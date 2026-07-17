@@ -220,7 +220,7 @@ pub fn titanium_genmove(
     }
     let mut search = match engine_label {
         "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => TitaniumSearch::grafted(g, None),
-        "titanium-v16" => TitaniumSearch::grafted_v16(g, None),
+        "titanium-v16" | "titanium-v17" => TitaniumSearch::grafted_v17(g, None),
         "titanium-v15-medium" => TitaniumSearch::grafted_medium(g, None),
         "titanium-v15-frozen" => TitaniumSearch::grafted_frozen(g, None),
         "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {

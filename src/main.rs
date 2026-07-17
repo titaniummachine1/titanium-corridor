@@ -2035,7 +2035,7 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             | "ace-v13-ti-pure"
             // Titanium production engines (use titanium search core)
             | "titanium-v14" | "titanium-v15" | "titanium-v15-medium" | "titanium-v15-frozen"
-            | "titanium-v16"
+            | "titanium-v16" | "titanium-v17"
             | "titanium-v15-no-raceproof" => Some(w[1].as_str()),
             _ => None,
         }

@@ -1,23 +1,6 @@
-//! ACE v11 search — 1:1 port of the JS `Search` object (quoridor_5.html,
-//! pathfix gen11_ghi).
-//!
-//! Iterative-deepening αβ with aspiration windows, typed TT, killers/history/
-//! countermoves, null move, graduated LMR / EME, frontier LMP, reverse futility,
-//! lazy wall legality, repetition detection, wall-stamp dist caching,
-//! easy-move early stop, HalfPW net eval. Mirrors the JS node-for-node.
-//!
-//! gen11 additions over the v10 base:
-//! - ZeroFence-A GHI guard (PLAIN variant, `ghiAnchor` shipped false): TT
-//!   entries whose subtree leaned on a path-dependent repetition-zero are
-//!   stored flag-demoted or tainted; tainted entries never give score cutoffs.
-//! - RaceProof (`raceProof = true`, SPRT-passed): exact race-endgame tables
-//!   when both hands are empty (eval verdicts, root solve, last-wall
-//!   commitment gate with the budget reserve).
-//! - ThreatPrice / WallSense ship FALSE in the JS (falsifier/SPRT-killed) and
-//!   no-op cleanly when false — their machinery is intentionally NOT ported.
-//! - RaceProof(c) certificates (`certify_win.js`) are node-only; the browser
-//!   build runs with `RP_CERT === null`, which this port mirrors (the
-//!   commitment gate keeps the wall when no certifier exists).
+//! Titanium αβ search with iterative deepening, transposition tables, LMR/EME,
+//! RaceProof, repetition-safe TT handling, and the supporting move-ordering,
+//! evaluation, and timing heuristics used by the native engine.
 
 use crate::titanium::dist::{
     fill_ace_dist_from_pawn, fill_ace_dist_layers_to_goal_p0, fill_ace_dist_layers_to_goal_p1,
@@ -348,7 +331,7 @@ mod lazy_smp_tests {
 
     /// Regression guard for the diagnostics-only cleanup: retained counts for
     /// this exact 20-ply position were captured via CLI trace (`titanium
-    /// genmove --engine titanium-v16 --time 10 --threads 8`) as
+    /// genmove --engine titanium-v17 --time 10 --threads 8`) as
     /// [16,14,9,9,9,9,9,9]. `root_moves_before_filter` is 79 here -- that is
     /// `root_moves_raw.len()` from `ordered_root_moves_snapshot` (already
     /// past dead-zone/CAT-corridor root pruning upstream), NOT the naive
@@ -369,7 +352,7 @@ mod lazy_smp_tests {
             g.make_move(crate::titanium::algebraic_to_move_id(mv));
         }
         let mut search = TitaniumSearch::grafted(g, Some(18));
-        let result = search.think_with_threads(1_000, 1, true, false, "titanium-v16", 8);
+        let result = search.think_with_threads(1_000, 1, true, false, "titanium-v17", 8);
 
         assert_eq!(result.root_widths.len(), 8);
         let counts: Vec<usize> = result
@@ -506,7 +489,7 @@ mod lazy_smp_tests {
 
     #[test]
     fn cat_v16_worker_profiles_raise_fringe_threshold() {
-        let mut search = *TitaniumSearch::grafted_v16(GameState::new(), Some(18));
+        let mut search = *TitaniumSearch::grafted_v17(GameState::new(), Some(18));
         search.set_cat_lmr_worker_profile(0);
         assert_eq!(search.cat_lmr_fringe_pct, 5);
         search.set_cat_lmr_worker_profile(1);
@@ -752,7 +735,7 @@ mod route_touch_tests {
 
     #[test]
     fn enable_q_search_propagates_to_workers() {
-        let mut search = TitaniumSearch::grafted_v16(GameState::new(), None);
+        let mut search = TitaniumSearch::grafted_v17(GameState::new(), None);
         search.enable_q_search();
         let worker = search.fork_lazy_worker(&search.g);
         assert!(worker.q_search);
@@ -761,7 +744,7 @@ mod route_touch_tests {
 
     #[test]
     fn ace_rfp_defaults_off_and_propagates_to_workers() {
-        let mut search = TitaniumSearch::grafted_v16(GameState::new(), None);
+        let mut search = TitaniumSearch::grafted_v17(GameState::new(), None);
         assert!(!search.ace_rfp_enabled());
         search.set_ace_rfp(true);
         assert!(search.ace_rfp_enabled());
@@ -771,7 +754,7 @@ mod route_touch_tests {
 
     #[test]
     fn v17_ab_controls_default_on_and_propagate_to_workers() {
-        let search = TitaniumSearch::grafted_v16(GameState::new(), None);
+        let search = TitaniumSearch::grafted_v17(GameState::new(), None);
         assert!(search.partial_iter_enabled());
         assert!(search.predict_stop_enabled());
         let worker = search.fork_lazy_worker(&search.g);
@@ -781,7 +764,7 @@ mod route_touch_tests {
 
     #[test]
     fn v17_ab_controls_can_be_disabled_independently() {
-        let mut search = TitaniumSearch::grafted_v16(GameState::new(), None);
+        let mut search = TitaniumSearch::grafted_v17(GameState::new(), None);
         search.set_partial_iter(false);
         assert!(!search.partial_iter_enabled());
         assert!(search.predict_stop_enabled());
@@ -1924,8 +1907,8 @@ mod score_label_tests {
             g.make_move(algebraic_to_move_id(m));
         }
 
-        let mut search = TitaniumSearch::grafted_v16(g, Some(18));
-        let result = search.think(60_000, 12, true, false, "titanium-v16");
+        let mut search = TitaniumSearch::grafted_v17(g, Some(18));
+        let result = search.think(60_000, 12, true, false, "titanium-v17");
 
         assert!(
             !result.root_defense_diag.is_empty(),
@@ -2608,7 +2591,7 @@ pub struct TitaniumSearch {
     ti_movegen: bool,
     /// CAT-filter walls at inner nodes (requires `bridge`).
     cat_walls: bool,
-    /// Titanium v16: CAT-scaled LMR with ceiling normalization (500/800/1000 cm).
+    /// Historical field name for the production v17 CAT-graduated LMR.
     cat_lmr_v16: bool,
     cat_lmr_ceiling: u16,
     cat_lmr_fringe_pct: u16,
@@ -2698,13 +2681,6 @@ pub struct TitaniumSearch {
     // ---------- pathfix feature flags (gen11 shipping config) ----------
     /// Exact k=0 race endgame + last-wall gate (JS `raceProof`, ships true).
     race_proof: bool,
-    // ZeroFence diagnostics (parity-debug counters, match JS fields)
-    refused_cuts: u64,
-    rb1_stores: u64,
-    dg_el: u64,
-    dg_eu: u64,
-    rep_path_c: u64,
-    rep_game_c: u64,
     // RaceProof: race-table LRU (keyed by wall-config zobrist = hash sans pawn/turn)
     rc_key_lo: [u32; RC_SLOTS],
     rc_key_hi: [u32; RC_SLOTS],
@@ -2715,8 +2691,6 @@ pub struct TitaniumSearch {
     rc_build_ms: u64,
     rc_hits: u64,
     rc_solves: u64,
-    rc_budget_miss: u64,
-    rc_solve_ms: u64,
     rc_think_solve_ms: u64,
     rc_solve_cap: f64,
     rc_blocked: bool,
@@ -2736,13 +2710,10 @@ pub struct TitaniumSearch {
     root_defense_diag: Vec<RootDefenseDiag>,
     race_scratch: Option<Box<RaceScratch>>,
     race_outcome_stats: RaceOutcomeStats,
-    // RaceProof(c): certificate memo (gen13 — `certify_win.js` inlined, so the
-    // certifier exists in node AND browser). Key = (lo, hi, side, wl0, wl1);
+    // RaceProof(c) certificate memo. Key = (lo, hi, side, wl0, wl1);
     // value = 1 proven (permanent, sound) / -work for a failure (richer retries
     // re-run; weaker-or-equal retries inherit the false).
     cw_cache: std::collections::HashMap<(u32, u32, usize, i32, i32), i32, FxBuildHasher>,
-    cw_proven: u64,
-    cw_calls: u64,
     cw_think_calls: u32,
     cw_cap: u32,
     /// Live `info json` during `think(..., log=true)` — cleared when search ends.
@@ -2974,12 +2945,6 @@ impl TitaniumSearch {
             pure_mode: false,
             is_pondering: false,
             race_proof: true,
-            refused_cuts: 0,
-            rb1_stores: 0,
-            dg_el: 0,
-            dg_eu: 0,
-            rep_path_c: 0,
-            rep_game_c: 0,
             rc_key_lo: [0; RC_SLOTS],
             rc_key_hi: [0; RC_SLOTS],
             rc_tbl: (0..RC_SLOTS).map(|_| None).collect(),
@@ -2989,8 +2954,6 @@ impl TitaniumSearch {
             rc_build_ms: 6,
             rc_hits: 0,
             rc_solves: 0,
-            rc_budget_miss: 0,
-            rc_solve_ms: 0,
             rc_think_solve_ms: 0,
             rc_solve_cap: f64::INFINITY,
             rc_blocked: false,
@@ -3008,8 +2971,6 @@ impl TitaniumSearch {
             race_scratch: None,
             race_outcome_stats: RaceOutcomeStats::default(),
             cw_cache: std::collections::HashMap::default(),
-            cw_proven: 0,
-            cw_calls: 0,
             cw_think_calls: 0,
             cw_cap: 24,
             stream_log: false,
@@ -3379,17 +3340,18 @@ impl TitaniumSearch {
         search
     }
 
-    /// **Titanium v16** — v15 graft + ACE v13 graduated LMR with two hard CAT overrides:
-    /// dead-tail walls (attention ≤ 10%) and backward moves search at child depth 1.
-    pub fn grafted_v16(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
+    /// **Titanium v17** — v15 graft + ACE v13 graduated CAT LMR with two hard
+    /// overrides: dead-tail walls (attention ≤ 10%) and backward moves search
+    /// at child depth 1. The internal `cat_lmr_v16` name is historical.
+    pub fn grafted_v17(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         let ceiling = crate::cat::cat_v16_lmr_ceiling_from_env();
         #[cfg(target_arch = "wasm32")]
         let ceiling = crate::cat::CAT_V16_LMR_CEILING_DEFAULT;
-        Self::grafted_v16_with_ceiling(g, tt_bits, ceiling)
+        Self::grafted_v17_with_ceiling(g, tt_bits, ceiling)
     }
 
-    pub fn grafted_v16_with_ceiling(
+    pub fn grafted_v17_with_ceiling(
         g: GameState,
         tt_bits: Option<usize>,
         ceiling: u16,
@@ -3405,14 +3367,41 @@ impl TitaniumSearch {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub fn grafted_v17_lazy_walls_for_bench(
+        g: GameState,
+        tt_bits: Option<usize>,
+        ceiling: u16,
+    ) -> Box<Self> {
+        let mut search = Self::grafted_v17_with_ceiling(g, tt_bits, ceiling);
+        search.ti_movegen = false;
+        search
+    }
+
+    /// Compatibility alias for the retired Titanium v16 product label.
+    #[inline]
+    pub fn grafted_v16(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
+        Self::grafted_v17(g, tt_bits)
+    }
+
+    /// Compatibility alias for the retired Titanium v16 product label.
+    #[inline]
+    pub fn grafted_v16_with_ceiling(
+        g: GameState,
+        tt_bits: Option<usize>,
+        ceiling: u16,
+    ) -> Box<Self> {
+        Self::grafted_v17_with_ceiling(g, tt_bits, ceiling)
+    }
+
+    /// Compatibility alias for the retired Titanium v16 product label.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
     pub fn grafted_v16_lazy_walls_for_bench(
         g: GameState,
         tt_bits: Option<usize>,
         ceiling: u16,
     ) -> Box<Self> {
-        let mut search = Self::grafted_v16_with_ceiling(g, tt_bits, ceiling);
-        search.ti_movegen = false;
-        search
+        Self::grafted_v17_lazy_walls_for_bench(g, tt_bits, ceiling)
     }
 
     /// gen13 net search + O1 movegen + cheap hands-empty cert, but **no CAT**.
@@ -4919,7 +4908,6 @@ impl TitaniumSearch {
             return Some(slot);
         }
         if !force && self.rc_blocked && k_lo == self.rc_miss_lo && k_hi == self.rc_miss_hi {
-            self.rc_budget_miss += 1;
             return None;
         }
         if !force {
@@ -4932,7 +4920,6 @@ impl TitaniumSearch {
                 self.rc_blocked = true;
                 self.rc_miss_lo = k_lo;
                 self.rc_miss_hi = k_hi;
-                self.rc_budget_miss += 1;
                 return None;
             }
             self.rc_think_solves += 1;
@@ -4967,7 +4954,6 @@ impl TitaniumSearch {
             },
         );
         let dt0 = t0.elapsed().as_millis() as u64;
-        self.rc_solve_ms += dt0;
         self.rc_think_solve_ms += dt0;
         let dt = dt0 + 1;
         if dt > self.rc_build_ms {
@@ -5484,7 +5470,6 @@ impl TitaniumSearch {
             }
             // richer retry: fall through and re-run
         }
-        self.cw_calls += 1;
         self.cw_think_calls += 1;
         let deadline = if deadline_ms > 0 {
             Some(Instant::now() + Duration::from_millis(deadline_ms))
@@ -5508,7 +5493,6 @@ impl TitaniumSearch {
             work = report.nodes as i64; // deadline-starved: stamp only work done
         }
         if res {
-            self.cw_proven += 1;
             self.race_outcome_stats.resolved_cert_win += 1;
         }
         if self.cw_cache.len() > 16384 {
@@ -6501,7 +6485,6 @@ impl TitaniumSearch {
             for ri in (0..ply).rev() {
                 if self.path_lo[ri] == self.g.hash_lo && self.path_hi[ri] == self.g.hash_hi {
                     // path-dependent zero: record the external dependency window
-                    self.rep_path_c += 1;
                     if (ri as i32) < self.sub_min[ply] {
                         self.sub_min[ply] = ri as i32;
                         self.sub_anc_lo[ply] = self.g.hash_lo;
@@ -6517,7 +6500,6 @@ impl TitaniumSearch {
                     && self.g.hashes_u[gi as usize + 1] == self.g.hash_hi
                 {
                     // game-history rep: path-independent, no taint
-                    self.rep_game_c += 1;
                     return Ok(0);
                 }
                 gi -= 2;
@@ -6692,7 +6674,6 @@ impl TitaniumSearch {
                     // anchor slot under-covers multi-dependency certificates),
                     // so a tainted entry never produces a score cutoff. The
                     // stored move is still used for ordering.
-                    self.refused_cuts += 1;
                 }
             }
         }
@@ -7418,22 +7399,17 @@ impl TitaniumSearch {
             if best > 0 {
                 if sf == 0 {
                     sf = 1;
-                    self.dg_el += 1;
                 } else if sf == 2 {
                     rb = 1;
                 }
             } else if best < 0 {
                 if sf == 0 {
                     sf = 2;
-                    self.dg_eu += 1;
                 } else if sf == 1 {
                     rb = 1;
                 }
             } else {
                 rb = 1;
-            }
-            if rb != 0 {
-                self.rb1_stores += 1;
             }
         }
         // Depth-preferred replacement (gen-aware when pure_mode=false).

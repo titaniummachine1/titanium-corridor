@@ -13,7 +13,7 @@ use crate::titanium::{
     algebraic_to_move_id, move_id_to_algebraic, GameState, TitaniumSearch, TITANIUM_NO_MOVE,
 };
 
-const ENGINE_VERSION: &str = "titanium-v16";
+const ENGINE_VERSION: &str = "titanium-v17";
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
@@ -332,7 +332,7 @@ impl WasmAceEngine {
     }
 }
 
-/// Warm Titanium v16 session. TT and history persist between plies.
+/// Warm Titanium v17 session. TT and history persist between plies.
 #[wasm_bindgen]
 pub struct WasmEngine {
     // Keep the large search state off the browser WASM stack. v17 added
@@ -357,11 +357,11 @@ impl WasmEngine {
             5 => 1000,
             _ => 800,
         };
-        let mut search = TitaniumSearch::grafted_v16_with_ceiling(g, None, ceiling);
+        let mut search = TitaniumSearch::grafted_v17_with_ceiling(g, None, ceiling);
         // Order: bias root move order / attention from the human DAG, but always search.
         // Play (forced book moves) is reserved for training/oracle CLIs via --book play.
         search.set_opening_book(crate::titanium::opening_book::OpeningBookMode::Order, None);
-        let engine_label = "titanium-v16".to_string();
+        let engine_label = "titanium-v17".to_string();
         WasmEngine {
             search,
             engine_label,

@@ -25,15 +25,15 @@ use titanium::titanium::session::apply_session_experiment_flags;
 use titanium::titanium::{move_id_to_algebraic, GameState, ThinkResult, TitaniumSearch};
 
 /// Reported + logged engine label. The actual search mode is selected in
-/// `fresh_search` (TITANIUM_BENCH_V16=1 → v16 CAT-LMR), so the label must
+/// `fresh_search` (TITANIUM_BENCH_V16=1 → v17 CAT-LMR), so the label must
 /// follow the same env var or profiles get misattributed.
 fn engine_mode() -> &'static str {
     let base = if let Ok(flag) = std::env::var("TITANIUM_BENCH_ENGINE") {
         flag
     } else if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
-        "titanium-v16".into()
+        "titanium-v17".into()
     } else {
-        "titanium-v15".into()
+        "titanium-v17".into()
     };
     let lazy = std::env::var("TITANIUM_BENCH_LAZY_WALLS").as_deref() == Ok("1");
     let seal_mode = std::env::var("TITANIUM_LAZY_SEAL_MODE").unwrap_or_default();
@@ -175,20 +175,20 @@ fn fresh_search(position: &str, moves: Option<&str>) -> Box<TitaniumSearch> {
     let lazy_walls = std::env::var("TITANIUM_BENCH_LAZY_WALLS").as_deref() == Ok("1");
     if let Ok(flag) = std::env::var("TITANIUM_BENCH_ENGINE") {
         let mut search = if lazy_walls {
-            TitaniumSearch::grafted_v16_lazy_walls_for_bench(g, Some(TT_BITS), 1000)
+            TitaniumSearch::grafted_v17_lazy_walls_for_bench(g, Some(TT_BITS), 1000)
         } else {
-            TitaniumSearch::grafted_v16_with_ceiling(g, Some(TT_BITS), 1000)
+            TitaniumSearch::grafted_v17_with_ceiling(g, Some(TT_BITS), 1000)
         };
         apply_session_experiment_flags(search.as_mut(), &flag);
         return search;
     }
-    // TITANIUM_BENCH_V16=1 profiles the v16 CAT-LMR engine (default ceiling 1000)
+    // TITANIUM_BENCH_V16=1 profiles the v17 CAT-LMR engine (default ceiling 1000)
     // so we can A/B the CAT cost vs the v15 baseline on identical positions.
     if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
         if lazy_walls {
-            TitaniumSearch::grafted_v16_lazy_walls_for_bench(g, Some(TT_BITS), 1000)
+            TitaniumSearch::grafted_v17_lazy_walls_for_bench(g, Some(TT_BITS), 1000)
         } else {
-            TitaniumSearch::grafted_v16_with_ceiling(g, Some(TT_BITS), 1000)
+            TitaniumSearch::grafted_v17_with_ceiling(g, Some(TT_BITS), 1000)
         }
     } else if lazy_walls {
         TitaniumSearch::grafted_lazy_walls_for_bench(g, Some(TT_BITS))

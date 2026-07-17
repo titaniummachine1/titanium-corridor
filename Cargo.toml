@@ -38,8 +38,11 @@ required-features = ["parallel"]
 
 [features]
 default = ["parallel"]
-# Per-op call counts and phase timers for search_bench (compiled out when disabled).
+# Search measurement, TT-hit profiling, and phase timers are compiled only with
+# --features bench-instrument. Default cargo build --release contains no search
+# telemetry counters. Use search-telemetry as a descriptive alias when profiling.
 bench-instrument = []
+search-telemetry = ["bench-instrument"]
 # Multi-threaded perft / Lazy SMP (rayon). Normal wasm builds leave this off;
 # browser Lazy SMP uses the explicit wasm-threads profile below.
 parallel = ["dep:rayon"]
