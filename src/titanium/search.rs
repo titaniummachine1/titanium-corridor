@@ -66,6 +66,27 @@ use std::sync::{
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
+const HIST_SPAN: usize = 256;
+
+#[inline]
+fn ace_to_hist(m: i16) -> Option<u8> {
+    match m {
+        0..=80 => Some(m as u8),
+        100..=163 => Some((m - 19) as u8),
+        200..=263 => Some((m - 55) as u8),
+        _ => None,
+    }
+}
+
+#[inline]
+fn hist_to_ace(h: u8) -> i16 {
+    match h {
+        0..=80 => h as i16,
+        81..=144 => h as i16 + 19,
+        145..=208 => h as i16 + 55,
+        _ => -1,
+    }
+}
 
 #[inline]
 fn reverse_futility_margin(
@@ -1820,6 +1841,18 @@ mod score_label_tests {
     }
 
     #[test]
+    fn dense_history_codes_round_trip_ace_move_classes() {
+        for ace in [0, 80, 100, 163, 200, 263] {
+            let hist = ace_to_hist(ace).expect("valid ACE move");
+            assert_eq!(hist_to_ace(hist), ace);
+        }
+        for invalid in [-2, 81, 99, 164, 199, 264, 511] {
+            assert_eq!(ace_to_hist(invalid), None);
+        }
+        assert_eq!(hist_to_ace(209), -1);
+    }
+
+    #[test]
     fn sf_pawn_history_tiebreak_cannot_overturn_one_step_of_progress() {
         assert_eq!(sf_pawn_history_tiebreak(SF_HIST_MAX), 499);
         assert_eq!(sf_pawn_history_tiebreak(-SF_HIST_MAX), -499);
@@ -1835,8 +1868,9 @@ mod score_label_tests {
     fn sf_history_switch_reads_pawn_destination_from_the_selected_table() {
         let mut search = TitaniumSearch::new(crate::titanium::game::GameState::new());
         let pawn_destination = 42i16;
-        search.history_tbl[pawn_destination as usize] = 17;
-        search.hist_sf[0][pawn_destination as usize] = -29;
+        let pawn_hist = ace_to_hist(pawn_destination).unwrap() as usize;
+        search.history_tbl[pawn_hist] = 17;
+        search.hist_sf[0][pawn_hist] = -29;
 
         assert_eq!(search.move_hist(0, pawn_destination), 17);
         search.set_sf_history(true);
@@ -2471,8 +2505,8 @@ pub struct TitaniumSearch {
     sub_min: [i32; MAX_PLY],
     sub_anc_lo: [u32; MAX_PLY],
     sub_anc_hi: [u32; MAX_PLY],
-    history_tbl: [i32; 512],
-    cm: [i16; 512], // countermove table
+    history_tbl: [i32; HIST_SPAN],
+    cm: [i16; HIST_SPAN], // countermove table, indexed by dense history code
     killers: [[i16; 2]; MAX_PLY],
     /// Stockfish-style history experiment (A/B flag, default off): side-split
     /// `[stm][move]` full-action history updated with the gravity formula
@@ -2487,7 +2521,7 @@ pub struct TitaniumSearch {
     /// Conservative reduced-depth fail-high verification. Off by default and
     /// exposed only as an explicit A/B experiment.
     probcut: bool,
-    hist_sf: [[i32; 512]; 2],
+    hist_sf: [[i32; HIST_SPAN]; 2],
     /// SF batch 2 (branch build, unconditional): corrected static eval per
     /// ply, for the `improving` flag (i32::MIN = never written).
     eval_stack: [i32; MAX_PLY],
@@ -2496,10 +2530,10 @@ pub struct TitaniumSearch {
     /// eval its systematic bias per wall structure, online, no training.
     /// Applied only in the net-eval band — cert/mate scores never corrected.
     corr_hist: [[i16; CORR_SIZE]; 2],
-    /// Continuation history: flat `[prev_move << 9 | move]` gravity table —
+    /// Continuation history: flat `[prev_hist * HIST_SPAN + move_hist]` gravity table —
     /// scores wall replies to the previous move (the SF conthist analog; our
     /// `cm` table keeps only the single best reply, this keeps a full score
-    /// surface). Heap Vec: 512*512*4B = 1MB.
+    /// surface). Heap Vec: HIST_SPAN*HIST_SPAN*4B = 256KiB.
     cont_hist: Vec<i32>,
     // Offline-only LMR counterfactual probe. A target ordinal receives exactly
     // one provisional extra reduction; verification always uses native depth.
@@ -2841,17 +2875,17 @@ impl TitaniumSearch {
             sub_min: [MAX_PLY as i32; MAX_PLY],
             sub_anc_lo: [0; MAX_PLY],
             sub_anc_hi: [0; MAX_PLY],
-            history_tbl: [0; 512],
-            cm: [0; 512],
+            history_tbl: [0; HIST_SPAN],
+            cm: [0; HIST_SPAN],
             // Stockfish-style history is an explicit A/B experiment. Production
             // Titanium stays on the legacy history table unless a caller enables
             // the experiment with `set_sf_history(true)`.
             sf_history: false,
             probcut: false,
-            hist_sf: [[0; 512]; 2],
+            hist_sf: [[0; HIST_SPAN]; 2],
             eval_stack: [i32::MIN; MAX_PLY],
             corr_hist: [[0; CORR_SIZE]; 2],
-            cont_hist: vec![0; 512 * 512],
+            cont_hist: vec![0; HIST_SPAN * HIST_SPAN],
             killers: [[0; 2]; MAX_PLY],
             reduction_probe_enabled: false,
             reduction_probe_target: None,
@@ -3553,10 +3587,13 @@ impl TitaniumSearch {
     /// otherwise. Pawn destinations already occupy valid move IDs.
     #[inline]
     fn move_hist(&self, stm: usize, m: i16) -> i32 {
+        let Some(h) = ace_to_hist(m) else {
+            return 0;
+        };
         if self.sf_history {
-            self.hist_sf[stm][m as usize]
+            self.hist_sf[stm][h as usize]
         } else {
-            self.history_tbl[m as usize]
+            self.history_tbl[h as usize]
         }
     }
 
@@ -3565,24 +3602,32 @@ impl TitaniumSearch {
     /// (a saturated entry that stops earning bonuses decays on every malus).
     #[inline]
     fn sf_hist_apply(&mut self, stm: usize, m: i16, bonus: i32) {
-        let h = &mut self.hist_sf[stm][m as usize];
+        let Some(m_h) = ace_to_hist(m) else {
+            return;
+        };
+        let h = &mut self.hist_sf[stm][m_h as usize];
         *h += bonus - ((*h as i64 * bonus.unsigned_abs() as i64) / SF_HIST_MAX as i64) as i32;
     }
 
     /// Same gravity formula on the continuation-history surface.
     #[inline]
     fn cont_hist_apply(&mut self, prev_move: i16, m: i16, bonus: i32) {
-        let h = &mut self.cont_hist[((prev_move as usize) << 9) | (m as usize)];
+        let (Some(prev_h), Some(m_h)) = (ace_to_hist(prev_move), ace_to_hist(m)) else {
+            return;
+        };
+        let h = &mut self.cont_hist[prev_h as usize * HIST_SPAN + m_h as usize];
         *h += bonus - ((*h as i64 * bonus.unsigned_abs() as i64) / SF_HIST_MAX as i64) as i32;
     }
 
     #[inline]
     fn cont_hist_read(&self, prev_move: i16, m: i16) -> i32 {
-        if prev_move > 0 {
-            self.cont_hist[((prev_move as usize) << 9) | (m as usize)]
-        } else {
-            0
+        if prev_move <= 0 {
+            return 0;
         }
+        let (Some(prev_h), Some(m_h)) = (ace_to_hist(prev_move), ace_to_hist(m)) else {
+            return 0;
+        };
+        self.cont_hist[prev_h as usize * HIST_SPAN + m_h as usize]
     }
 
     /// Wall-structure bucket for the correction history: the incremental
@@ -6747,7 +6792,9 @@ impl TitaniumSearch {
             return Ok(self.evaluate(depth));
         }
         let cm_move = if prev_move > 0 {
-            self.cm[prev_move as usize]
+            ace_to_hist(prev_move)
+                .map(|prev_h| self.cm[prev_h as usize])
+                .unwrap_or(0)
         } else {
             0
         };
@@ -7144,7 +7191,9 @@ impl TitaniumSearch {
                             nodes: self.nodes.saturating_sub(nodes_before),
                             hidden,
                             total_legal_moves: n,
-                            history_score: self.history_tbl[m as usize],
+                            history_score: ace_to_hist(m)
+                                .map(|m_h| self.history_tbl[m_h as usize])
+                                .unwrap_or(0),
                         });
                     }
                 }
@@ -7284,8 +7333,12 @@ impl TitaniumSearch {
                                 self.killers[ply][1] = self.killers[ply][0];
                                 self.killers[ply][0] = m;
                             }
-                            self.history_tbl[m as usize] += depth * depth;
-                            if self.history_tbl[m as usize] > 100_000_000 {
+                            if let Some(m_h) = ace_to_hist(m) {
+                                self.history_tbl[m_h as usize] += depth * depth;
+                            }
+                            if ace_to_hist(m)
+                                .is_some_and(|m_h| self.history_tbl[m_h as usize] > 100_000_000)
+                            {
                                 for h in self.history_tbl.iter_mut() {
                                     *h >>= 1;
                                 }
@@ -7328,8 +7381,8 @@ impl TitaniumSearch {
                                 }
                             }
                         }
-                        if prev_move > 0 {
-                            self.cm[prev_move as usize] = m;
+                        if let Some(prev_h) = ace_to_hist(prev_move).filter(|_| prev_move > 0) {
+                            self.cm[prev_h as usize] = m;
                         }
                         break;
                     }
