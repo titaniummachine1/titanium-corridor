@@ -294,7 +294,11 @@ impl<'a> Solver<'a> {
                         if self.mode_pruned && !near {
                             continue;
                         }
-                        wm[wn] = (if wtype == 0 { 100 } else { 200 }) + slot as i16;
+                        wm[wn] = (if wtype == 0 {
+                            crate::titanium::MOVE_HW_BASE
+                        } else {
+                            crate::titanium::MOVE_VW_BASE
+                        }) + slot as i16;
                         wk[wn] = if cuts {
                             0
                         } else if near {

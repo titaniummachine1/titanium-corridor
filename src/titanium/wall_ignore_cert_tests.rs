@@ -32,7 +32,13 @@ mod extended {
         for wtype in 0..2 {
             for slot in 0..64 {
                 if pos.wall_legal(wtype, slot) {
-                    legal_walls.push((if wtype == 0 { 100 } else { 200 }) + slot as i16);
+                    legal_walls.push(
+                        (if wtype == 0 {
+                            crate::titanium::MOVE_HW_BASE
+                        } else {
+                            crate::titanium::MOVE_VW_BASE
+                        }) + slot as i16,
+                    );
                 }
             }
         }
@@ -74,7 +80,11 @@ mod extended {
         let mut pos = g.clone();
         for wtype in 0..2 {
             for slot in 0..64 {
-                let mv = (if wtype == 0 { 100 } else { 200 }) + slot as i16;
+                let mv = (if wtype == 0 {
+                    crate::titanium::MOVE_HW_BASE
+                } else {
+                    crate::titanium::MOVE_VW_BASE
+                }) + slot as i16;
                 if !pos.wall_legal(wtype, slot) {
                     continue;
                 }
@@ -124,7 +134,13 @@ mod extended {
                         continue;
                     }
                     let mut trial = pos.clone();
-                    trial.make_move((if wtype == 0 { 100 } else { 200 }) + slot as i16);
+                    trial.make_move(
+                        (if wtype == 0 {
+                            crate::titanium::MOVE_HW_BASE
+                        } else {
+                            crate::titanium::MOVE_VW_BASE
+                        }) + slot as i16,
+                    );
                     let mut sc = CorridorScratch::new();
                     let w_g = detect_zero_delay_corridor(&trial, 0, &mut sc);
                     assert!(w_g.is_some(), "loser wall must not break winner corridor");
@@ -221,7 +237,11 @@ mod extended {
             for wtype in 0..2 {
                 for slot in 0..64 {
                     if g.wall_legal(wtype, slot) {
-                        buf[n] = (if wtype == 0 { 100 } else { 200 }) + slot as i16;
+                        buf[n] = (if wtype == 0 {
+                            crate::titanium::MOVE_HW_BASE
+                        } else {
+                            crate::titanium::MOVE_VW_BASE
+                        }) + slot as i16;
                         n += 1;
                     }
                 }

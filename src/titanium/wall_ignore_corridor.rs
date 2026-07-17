@@ -140,11 +140,11 @@ pub fn wall_moves_blocking_edge(edge: BoardEdge, out: &mut [i16; 2]) -> usize {
         let row = north / 9;
         let col = north % 9;
         if row < 8 && col < 8 {
-            out[count] = 100 + (row * 8 + col) as i16;
+            out[count] = crate::titanium::MOVE_HW_BASE + (row * 8 + col) as i16;
             count += 1;
         }
         if row < 8 && col > 0 {
-            out[count] = 100 + (row * 8 + col - 1) as i16;
+            out[count] = crate::titanium::MOVE_HW_BASE + (row * 8 + col - 1) as i16;
             count += 1;
         }
     } else if ar == br {
@@ -152,11 +152,11 @@ pub fn wall_moves_blocking_edge(edge: BoardEdge, out: &mut [i16; 2]) -> usize {
         let row = west / 9;
         let col = west % 9;
         if row < 8 && col < 8 {
-            out[count] = 200 + (row * 8 + col) as i16;
+            out[count] = crate::titanium::MOVE_VW_BASE + (row * 8 + col) as i16;
             count += 1;
         }
         if row > 0 && col < 8 {
-            out[count] = 200 + ((row - 1) * 8 + col) as i16;
+            out[count] = crate::titanium::MOVE_VW_BASE + ((row - 1) * 8 + col) as i16;
             count += 1;
         }
     }
@@ -174,10 +174,10 @@ pub fn opponent_can_place_before_edge(
 
 #[inline]
 fn wall_move_index(mv: i16) -> usize {
-    if mv < 200 {
-        (mv - 100) as usize
+    if crate::titanium::is_hwall_move(mv) {
+        crate::titanium::wall_slot(mv)
     } else {
-        64 + (mv - 200) as usize
+        64 + crate::titanium::wall_slot(mv)
     }
 }
 
@@ -331,7 +331,7 @@ pub fn detect_zero_delay_corridor(
     })
 }
 
-/// Debug/test helper: wall move ids (100+ / 200+) geometrically capable of blocking `edge`.
+/// Debug/test helper: dense wall move ids geometrically capable of blocking `edge`.
 pub fn walls_that_block_edge(edge: BoardEdge) -> Vec<i16> {
     let mut fixed = [0i16; 2];
     let count = wall_moves_blocking_edge(edge, &mut fixed);
@@ -463,12 +463,16 @@ mod tests {
         let guarantee = detect_zero_delay_corridor(&g, 0, &mut scratch).expect("corridor");
         for edge in &guarantee.protected_edges {
             for mv in walls_that_block_edge(*edge) {
-                let slot = if mv < 200 {
-                    (mv - 100) as usize
+                let slot = if crate::titanium::is_hwall_move(mv) {
+                    crate::titanium::wall_slot(mv)
                 } else {
-                    (mv - 200) as usize
+                    crate::titanium::wall_slot(mv)
                 };
-                let wtype = if mv < 200 { 0 } else { 1 };
+                let wtype = if crate::titanium::is_hwall_move(mv) {
+                    0
+                } else {
+                    1
+                };
                 assert!(
                     !g.wall_legal(wtype, slot),
                     "blocking wall {mv} on edge {:?} must be illegal",

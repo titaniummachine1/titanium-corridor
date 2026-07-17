@@ -29,11 +29,11 @@ impl GameState {
         if self.wl[self.turn] > 0 {
             for slot in 0..64 {
                 if self.wall_legal(0, slot) {
-                    out[n] = 100 + slot as i16;
+                    out[n] = crate::titanium::MOVE_HW_BASE + slot as i16;
                     n += 1;
                 }
                 if self.wall_legal(1, slot) {
-                    out[n] = 200 + slot as i16;
+                    out[n] = crate::titanium::MOVE_VW_BASE + slot as i16;
                     n += 1;
                 }
             }

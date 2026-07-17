@@ -1392,10 +1392,10 @@ mod tests {
         }
         for slot in 0..64usize {
             if g.wall_legal(0, slot) {
-                out.push(100 + slot as i16);
+                out.push(crate::titanium::MOVE_HW_BASE + slot as i16);
             }
             if g.wall_legal(1, slot) {
-                out.push(200 + slot as i16);
+                out.push(crate::titanium::MOVE_VW_BASE + slot as i16);
             }
         }
     }
@@ -1413,13 +1413,13 @@ mod tests {
     }
 
     fn wall_move_legal(g: &mut GameState, m: i16) -> bool {
-        if m < 100 || g.wl[g.turn] <= 0 {
+        if !crate::titanium::is_wall_move(m) || g.wl[g.turn] <= 0 {
             return false;
         }
-        if m < 200 {
-            g.wall_legal(0, (m - 100) as usize)
+        if crate::titanium::is_hwall_move(m) {
+            g.wall_legal(0, crate::titanium::wall_slot(m))
         } else {
-            g.wall_legal(1, (m - 200) as usize)
+            g.wall_legal(1, crate::titanium::wall_slot(m))
         }
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
                 return Err(format!("terminal before move {text}"));
             }
             let m = algebraic_to_move_id(text);
-            if m < 100 {
+            if crate::titanium::is_pawn_move(m) {
                 if !pawn_move_legal(&g, m) {
                     return Err(format!("illegal pawn move {text}"));
                 }
@@ -1453,7 +1453,7 @@ mod tests {
             let side = g.turn;
             g.make_move(m);
             seq.push(text.to_string());
-            if m >= 100 {
+            if crate::titanium::is_wall_move(m) {
                 walls_by[side] += 1;
             }
         }
@@ -1514,7 +1514,7 @@ mod tests {
                 };
 
                 let mv = pool[(lcg_next(rng) as usize) % pool.len()];
-                if mv < 100 {
+                if crate::titanium::is_pawn_move(mv) {
                     if !pawn_move_legal(&g, mv) {
                         ply_fails += 1;
                         if ply_fails > MAX_PLY_FAILS {
@@ -1533,7 +1533,7 @@ mod tests {
                 let side = g.turn;
                 g.make_move(mv);
                 moves.push(move_id_to_algebraic(mv));
-                if mv >= 100 {
+                if crate::titanium::is_wall_move(mv) {
                     walls_by[side] += 1;
                 }
                 ply_fails = 0;
@@ -2542,7 +2542,7 @@ mod tests {
             let mut g = GameState::new();
             for m in moves {
                 let mid = algebraic_to_move_id(m);
-                if mid < 100 {
+                if crate::titanium::is_pawn_move(mid) {
                     assert!(pawn_move_legal(&g, mid), "sample pawn {m}");
                 } else {
                     assert!(wall_move_legal(&mut g, mid), "sample wall {m}");
@@ -6229,13 +6229,13 @@ mod tests {
         for slot in 0..64usize {
             if hw[slot] != 0 {
                 // Alternate sides arbitrarily; only the topology matters.
-                g.make_move(100 + slot as i16);
+                g.make_move(crate::titanium::MOVE_HW_BASE + slot as i16);
                 g.turn ^= 1; // flip without advancing wl correctly
             }
         }
         for slot in 0..64usize {
             if vw[slot] != 0 {
-                g.make_move(200 + slot as i16);
+                g.make_move(crate::titanium::MOVE_VW_BASE + slot as i16);
                 g.turn ^= 1;
             }
         }

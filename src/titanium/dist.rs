@@ -139,15 +139,15 @@ pub fn width_in_layers(layers: &[u128; 81], depth: usize, d: u8) -> u32 {
     (layers[di] & FLOOD_PLAYABLE).count_ones()
 }
 
-/// Wall placement geometry for incremental edge-cut tests (ACE move ids >= 100).
+/// Wall placement geometry for incremental edge-cut tests (dense wall ids).
 #[inline]
 pub fn wall_incr_probe_squares(m: i16) -> Option<(usize, usize, usize, usize)> {
-    if m < 100 {
+    if !crate::titanium::is_wall_move(m) {
         return None;
     }
-    let slot = (m % 100) as usize;
+    let slot = crate::titanium::wall_slot(m);
     let a = (slot >> 3) * 9 + (slot & 7);
-    let (b2, c2, e2) = if m < 200 {
+    let (b2, c2, e2) = if crate::titanium::is_hwall_move(m) {
         (a + 9, a + 1, a + 10) // hw: two vertical edges
     } else {
         (a + 1, a + 9, a + 10) // vw: two horizontal edges
@@ -660,7 +660,11 @@ mod tests {
                 for wt in 0..2usize {
                     for slot in 0..64usize {
                         if g.wall_legal(wt, slot) {
-                            moves[n] = (if wt == 0 { 100 } else { 200 }) + slot as i16;
+                            moves[n] = (if wt == 0 {
+                                crate::titanium::MOVE_HW_BASE
+                            } else {
+                                crate::titanium::MOVE_VW_BASE
+                            }) + slot as i16;
                             n += 1;
                         }
                     }
@@ -683,7 +687,11 @@ mod tests {
                     if !g.wall_legal(wt, slot) {
                         continue;
                     }
-                    let m = (if wt == 0 { 100 } else { 200 }) + slot as i16;
+                    let m = (if wt == 0 {
+                        crate::titanium::MOVE_HW_BASE
+                    } else {
+                        crate::titanium::MOVE_VW_BASE
+                    }) + slot as i16;
                     wall_trials += 1;
                     let (refresh0, refresh1) = wall_incr_refresh_flags(&d0, &d1, m);
                     if refresh0 || refresh1 {

@@ -504,9 +504,9 @@ fn enc_sign(v: i32) -> i32 {
 /// "our" scheme ace.html's ka_ab/ka_engine already use, so no adapter needed
 /// beyond this arithmetic). `from_cell` is the mover's pawn cell BEFORE the move.
 pub fn move_id_to_ka_action(m: i16, from_cell: usize) -> usize {
-    if m >= 100 {
-        let is_h = m < 200;
-        let slot = (m - if is_h { 100 } else { 200 }) as i32;
+    if crate::titanium::is_wall_move(m) {
+        let is_h = crate::titanium::is_hwall_move(m);
+        let slot = crate::titanium::wall_slot(m) as i32;
         let wr = slot / 8;
         let wc = slot % 8;
         (if is_h { 0 } else { 64 } + wc * 8 + wr) as usize

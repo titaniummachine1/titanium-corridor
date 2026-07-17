@@ -2,7 +2,7 @@
 //!
 //! Coordinates are ACE-native: cell = r*9+c with r=0 the TOP row.
 //! Player 0 starts at 76 (bottom) and races to row 0; player 1 starts at 4
-//! and races to row 8. Moves: 0..80 pawn target, 100+slot hw, 200+slot vw.
+//! and races to row 8. Moves: 0..80 pawn target, 81+slot hw, 145+slot vw.
 
 pub const DELTA: [i16; 4] = [-9, 9, -1, 1];
 pub const DIRBIT: [u8; 4] = [1, 2, 4, 8];
@@ -205,9 +205,9 @@ impl GameState {
         debug_assert_eq!(self.vw_bits, Self::pack_wall_bits(&self.vw));
     }
 
-    /// Convert an ACE wall slot (0..63) to the corresponding `Board` wall bit index.
+    /// Convert a dense wall slot (0..63) to the corresponding `Board` wall bit index.
     /// Board bits are indexed by `(row * 8 + col)` with row 0 at the top;
-    /// ACE slots are `(7 - row) * 8 + col`.
+    /// Dense wall slots are `(7 - row) * 8 + col`.
     #[inline]
     pub fn ace_slot_to_board_bit(slot: usize) -> usize {
         (7 - slot / 8) * 8 + slot % 8
@@ -424,15 +424,15 @@ impl GameState {
         let hl = self.hist_len;
         self.hist_m[hl] = m;
         self.hist_lw[hl] = self.last_wall_ply as i16;
-        if m < 100 {
+        if crate::titanium::is_pawn_move(m) {
             let p = self.turn;
             let to = m as usize;
             self.hist_from[hl] = self.pawn[p] as i16;
             self.hash_lo ^= z.pawn_lo[p][self.pawn[p]] ^ z.pawn_lo[p][to];
             self.hash_hi ^= z.pawn_hi[p][self.pawn[p]] ^ z.pawn_hi[p][to];
             self.pawn[p] = to;
-        } else if m < 200 {
-            let s0 = (m - 100) as usize;
+        } else if crate::titanium::is_hwall_move(m) {
+            let s0 = crate::titanium::wall_slot(m);
             self.hw[s0] = 1;
             self.hw_bits |= 1u64 << s0;
             self.set_wall_bits(0, s0, true);
@@ -442,7 +442,7 @@ impl GameState {
             self.hash_hi ^= z.hw_hi[s0];
             self.last_wall_ply = hl + 1;
         } else {
-            let s1 = (m - 200) as usize;
+            let s1 = crate::titanium::wall_slot(m);
             self.vw[s1] = 1;
             self.vw_bits |= 1u64 << s1;
             self.set_wall_bits(1, s1, true);
@@ -471,15 +471,15 @@ impl GameState {
         self.turn ^= 1;
         self.hash_lo ^= z.turn_lo;
         self.hash_hi ^= z.turn_hi;
-        if m < 100 {
+        if crate::titanium::is_pawn_move(m) {
             let p = self.turn;
             let from = self.hist_from[hl] as usize;
             let to = m as usize;
             self.hash_lo ^= z.pawn_lo[p][from] ^ z.pawn_lo[p][to];
             self.hash_hi ^= z.pawn_hi[p][from] ^ z.pawn_hi[p][to];
             self.pawn[p] = from;
-        } else if m < 200 {
-            let s0 = (m - 100) as usize;
+        } else if crate::titanium::is_hwall_move(m) {
+            let s0 = crate::titanium::wall_slot(m);
             self.hw[s0] = 0;
             self.hw_bits &= !(1u64 << s0);
             self.set_wall_bits(0, s0, false);
@@ -488,7 +488,7 @@ impl GameState {
             self.hash_lo ^= z.hw_lo[s0];
             self.hash_hi ^= z.hw_hi[s0];
         } else {
-            let s1 = (m - 200) as usize;
+            let s1 = crate::titanium::wall_slot(m);
             self.vw[s1] = 0;
             self.vw_bits &= !(1u64 << s1);
             self.set_wall_bits(1, s1, false);
@@ -566,7 +566,7 @@ mod tests {
             let board = board_from_game(&g);
             for wall_type in [0usize, 1] {
                 for slot in 0..64usize {
-                    // ACE slot row is reflected relative to Board wall row.
+                    // Dense slot row is reflected relative to Board wall row.
                     let row = (7 - slot / 8) as u8;
                     let col = (slot % 8) as u8;
                     let horizontal = wall_type == 0;
@@ -647,7 +647,7 @@ mod tests {
         }
     }
 
-    /// Exhaustive ACE slot ↔ Board wall-bit mapping over all 128 placements.
+    /// Exhaustive dense slot ↔ Board wall-bit mapping over all 128 placements.
     #[test]
     fn ace_board_wall_bit_mapping_exhaustive() {
         for wall_type in [0usize, 1] {
@@ -680,9 +680,9 @@ mod tests {
                     continue;
                 }
                 let mid = if wall_type == 0 {
-                    100 + slot as i16
+                    crate::titanium::MOVE_HW_BASE + slot as i16
                 } else {
-                    200 + slot as i16
+                    crate::titanium::MOVE_VW_BASE + slot as i16
                 };
                 g2.make_move(mid);
                 let packed = if wall_type == 0 {

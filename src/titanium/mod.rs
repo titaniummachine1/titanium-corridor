@@ -23,7 +23,7 @@
 //!
 //! ## Coordinate mapping (ACE row 0 = top, Titanium row 0 = bottom)
 //!   pawn  m = (8 - row) * 9 + col
-//!   wall  m = base + (7 - row) * 8 + col   (base 100 = h, 200 = v)
+//!   wall  m = dense base + (7 - row) * 8 + col   (81 = h, 145 = v)
 
 pub mod cert_bridge;
 pub mod certify;
@@ -68,23 +68,56 @@ pub use session_v15::run_v15_session_stdio;
 
 /// Sentinel — pawn move id `0` is legal (cell a9); do not use `0` for "no move".
 pub const TITANIUM_NO_MOVE: i16 = -1;
+pub const MOVE_HW_BASE: i16 = 81;
+pub const MOVE_VW_BASE: i16 = 145;
+pub const MOVE_ID_MAX: i16 = 208;
+
+#[inline]
+pub fn is_pawn_move(m: i16) -> bool {
+    (0..=80).contains(&m)
+}
+
+#[inline]
+pub fn is_hwall_move(m: i16) -> bool {
+    (81..=144).contains(&m)
+}
+
+#[inline]
+pub fn is_vwall_move(m: i16) -> bool {
+    (145..=208).contains(&m)
+}
+
+#[inline]
+pub fn is_wall_move(m: i16) -> bool {
+    (81..=208).contains(&m)
+}
+
+#[inline]
+pub fn wall_slot(m: i16) -> usize {
+    debug_assert!(is_wall_move(m));
+    if is_hwall_move(m) {
+        (m - MOVE_HW_BASE) as usize
+    } else {
+        (m - MOVE_VW_BASE) as usize
+    }
+}
 
 use crate::core::board::{Move as BoardMove, WallOrientation};
 
-/// ACE move encoding → Titanium board move (row flip between coordinate systems).
+/// Dense move encoding → Titanium board move (row flip between coordinate systems).
 pub fn move_id_to_board(m: i16) -> BoardMove {
-    if m < 100 {
+    if is_pawn_move(m) {
         BoardMove::Pawn {
             row: 8 - (m / 9) as u8,
             col: (m % 9) as u8,
         }
     } else {
-        let (base, orientation) = if m < 200 {
-            (100, WallOrientation::Horizontal)
+        let orientation = if is_hwall_move(m) {
+            WallOrientation::Horizontal
         } else {
-            (200, WallOrientation::Vertical)
+            WallOrientation::Vertical
         };
-        let slot = m - base;
+        let slot = wall_slot(m) as i16;
         BoardMove::Wall {
             row: 7 - (slot / 8) as u8,
             col: (slot % 8) as u8,
@@ -93,7 +126,7 @@ pub fn move_id_to_board(m: i16) -> BoardMove {
     }
 }
 
-/// Algebraic ("e2", "e3h") → ACE move encoding.
+/// Algebraic ("e2", "e3h") → dense move encoding.
 pub fn algebraic_to_move_id(text: &str) -> i16 {
     let b = text.as_bytes();
     let col = (b[0] - b'a') as i16;
@@ -101,8 +134,8 @@ pub fn algebraic_to_move_id(text: &str) -> i16 {
     if b.len() > 2 {
         let slot = (7 - row) * 8 + col;
         match b[2] {
-            b'h' => 100 + slot,
-            b'v' => 200 + slot,
+            b'h' => MOVE_HW_BASE + slot,
+            b'v' => MOVE_VW_BASE + slot,
             _ => panic!("bad wall suffix in {text}"),
         }
     } else {
@@ -110,15 +143,18 @@ pub fn algebraic_to_move_id(text: &str) -> i16 {
     }
 }
 
-/// ACE move encoding → algebraic.
+/// Dense move encoding → algebraic.
 pub fn move_id_to_algebraic(m: i16) -> String {
-    if m < 100 {
+    if is_pawn_move(m) {
         let r = m / 9;
         let c = m % 9;
         format!("{}{}", (b'a' + c as u8) as char, 9 - r)
     } else {
-        let (base, suffix) = if m < 200 { (100, 'h') } else { (200, 'v') };
-        let slot = m - base;
+        let (suffix, slot) = if is_hwall_move(m) {
+            ('h', m - MOVE_HW_BASE)
+        } else {
+            ('v', m - MOVE_VW_BASE)
+        };
         let r = slot / 8;
         let c = slot % 8;
         format!("{}{}{}", (b'a' + c as u8) as char, 8 - r, suffix)
@@ -292,12 +328,12 @@ mod tests {
         // pawn: e9 = our (8,4) = ACE cell 4
         assert_eq!(algebraic_to_move_id("e9"), 4);
         assert_eq!(move_id_to_algebraic(4), "e9");
-        // wall: d8v = our wall (7,3) = ACE vw slot 3
-        assert_eq!(algebraic_to_move_id("d8v"), 203);
-        assert_eq!(move_id_to_algebraic(203), "d8v");
-        // wall: a1h = our wall (0,0) = ACE hw slot 56
-        assert_eq!(algebraic_to_move_id("a1h"), 156);
-        assert_eq!(move_id_to_algebraic(156), "a1h");
+        // wall: d8v = our wall (7,3) = dense vw slot 3
+        assert_eq!(algebraic_to_move_id("d8v"), 148);
+        assert_eq!(move_id_to_algebraic(148), "d8v");
+        // wall: a1h = our wall (0,0) = dense hw slot 56
+        assert_eq!(algebraic_to_move_id("a1h"), 137);
+        assert_eq!(move_id_to_algebraic(137), "a1h");
     }
 
     #[test]
@@ -362,7 +398,7 @@ mod tests {
             g.make_move(algebraic_to_move_id(m));
             board.apply_algebraic(m);
         }
-        let slot = (algebraic_to_move_id("h6h") - 100) as usize;
+        let slot = crate::titanium::wall_slot(algebraic_to_move_id("h6h"));
         assert!(
             g.wall_legal(0, slot),
             "ACE must accept h6h (off-topology fast path)"
@@ -395,7 +431,7 @@ mod tests {
             g.make_move(algebraic_to_move_id(m));
             board.apply_algebraic(m);
         }
-        let slot = (algebraic_to_move_id("a6h") - 100) as usize;
+        let slot = crate::titanium::wall_slot(algebraic_to_move_id("a6h"));
         let row = 7 - (slot / 8) as u8;
         let col = (slot % 8) as u8;
         let ti_legal: Vec<_> = generate_legal_moves(&board)

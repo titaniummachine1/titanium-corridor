@@ -25,7 +25,10 @@ use crate::titanium::dist::{
     fill_contested, fill_corridor_delta, fill_sparse_route_masks, materialize_distance_layers,
     shortest_route_bits, wall_incr_refresh_flags, width_in_layers,
 };
-use crate::titanium::move_id_to_board;
+use crate::titanium::{
+    is_hwall_move, is_pawn_move, is_vwall_move, is_wall_move, move_id_to_board, wall_slot,
+    MOVE_HW_BASE, MOVE_VW_BASE,
+};
 use crate::util::clock::{Duration, Instant};
 
 use crate::cat::prune::{
@@ -82,26 +85,6 @@ fn tt_pack_depth(depth: i32) -> i32 {
 #[inline]
 fn tt_unpack_depth(meta: i32) -> i32 {
     (meta >> TT_DEPTH_SHIFT) & TT_DEPTH_MASK
-}
-
-#[inline]
-fn ace_to_hist(m: i16) -> Option<u8> {
-    match m {
-        0..=80 => Some(m as u8),
-        100..=163 => Some((m - 19) as u8),
-        200..=263 => Some((m - 55) as u8),
-        _ => None,
-    }
-}
-
-#[inline]
-fn hist_to_ace(h: u8) -> i16 {
-    match h {
-        0..=80 => h as i16,
-        81..=144 => h as i16 + 19,
-        145..=208 => h as i16 + 55,
-        _ => -1,
-    }
 }
 
 #[inline]
@@ -417,7 +400,7 @@ mod lazy_smp_tests {
     #[test]
     fn value_filtered_moves_are_monotonic_by_threshold() {
         let root_moves: Vec<i16> = (0..40).collect();
-        let mut heat_by_id = [0i32; 264];
+        let mut heat_by_id = [0i32; HIST_SPAN];
         // Deliberately non-uniform, non-monotonic-by-id heat so the test
         // isn't accidentally satisfied by move ordering alone.
         for (i, &mv) in root_moves.iter().enumerate() {
@@ -1051,7 +1034,7 @@ fn lazy_smp_value_threshold_pct(worker_id: usize) -> i32 {
 /// move is useless.
 fn lazy_smp_value_filtered_moves(
     root_moves: &[i16],
-    heat_by_id: &[i32; 264],
+    heat_by_id: &[i32; HIST_SPAN],
     max_heat: i32,
     threshold_pct: i32,
 ) -> Vec<i16> {
@@ -1149,7 +1132,8 @@ impl SharedTitaniumTt {
             .expect("shared TT write lock poisoned");
         let was_empty = slot.meta == 0;
         let stale_gen = !pure_mode && !was_empty && slot.entry_gen != tt_gen;
-        let deeper = !was_empty && !stale_gen && tt_unpack_depth(entry.meta) >= tt_unpack_depth(slot.meta);
+        let deeper =
+            !was_empty && !stale_gen && tt_unpack_depth(entry.meta) >= tt_unpack_depth(slot.meta);
         if was_empty || stale_gen || deeper {
             *slot = entry;
             if was_empty {
@@ -1215,7 +1199,7 @@ impl TiBridge {
         }
     }
 
-    /// Full legal moves via Titanium `movegen` → ACE encoding.
+    /// Full legal moves via Titanium `movegen` → dense encoding.
     fn gen_legal_ace(&mut self, out: &mut [i16; 160]) -> usize {
         let mut ti_buf = [BoardMove::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
         let n = generate_legal_moves_slice_cached(
@@ -1243,8 +1227,8 @@ pub fn board_move_to_move_id(mv: BoardMove) -> i16 {
         } => {
             let slot = (7 - row as i16) * 8 + col as i16;
             match orientation {
-                WallOrientation::Horizontal => 100 + slot,
-                WallOrientation::Vertical => 200 + slot,
+                WallOrientation::Horizontal => MOVE_HW_BASE + slot,
+                WallOrientation::Vertical => MOVE_VW_BASE + slot,
             }
         }
     }
@@ -1869,15 +1853,14 @@ mod score_label_tests {
     }
 
     #[test]
-    fn dense_history_codes_round_trip_ace_move_classes() {
-        for ace in [0, 80, 100, 163, 200, 263] {
-            let hist = ace_to_hist(ace).expect("valid ACE move");
-            assert_eq!(hist_to_ace(hist), ace);
+    fn dense_history_codes_cover_all_move_ids() {
+        for m in [0, 80, 81, 144, 145, 208] {
+            assert!(is_pawn_move(m) || is_wall_move(m));
+            assert_eq!(m as usize, m as usize);
         }
-        for invalid in [-2, 81, 99, 164, 199, 264, 511] {
-            assert_eq!(ace_to_hist(invalid), None);
+        for invalid in [-2, 209, 511] {
+            assert!(!is_pawn_move(invalid) && !is_wall_move(invalid));
         }
-        assert_eq!(hist_to_ace(209), -1);
     }
 
     #[test]
@@ -1896,7 +1879,7 @@ mod score_label_tests {
     fn sf_history_switch_reads_pawn_destination_from_the_selected_table() {
         let mut search = TitaniumSearch::new(crate::titanium::game::GameState::new());
         let pawn_destination = 42i16;
-        let pawn_hist = ace_to_hist(pawn_destination).unwrap() as usize;
+        let pawn_hist = pawn_destination as usize;
         search.history_tbl[pawn_hist] = 17;
         search.hist_sf[0][pawn_hist] = -29;
 
@@ -1951,7 +1934,7 @@ mod score_label_tests {
         let pawn_entries: Vec<_> = result
             .root_defense_diag
             .iter()
-            .filter(|e| e.mv < 100)
+            .filter(|e| is_pawn_move(e.mv))
             .collect();
         assert_eq!(pawn_entries.len(), 3, "W23 has three pawn root moves");
 
@@ -3557,7 +3540,7 @@ impl TitaniumSearch {
     /// Long-lived session path — the next `think` reuses prior analysis.
     pub fn apply_move(&mut self, m: i16) {
         self.g.make_move(m);
-        if m >= 100 {
+        if is_wall_move(m) {
             self.cached_stamp = -1;
         }
         if self.pure_mode {
@@ -3618,13 +3601,10 @@ impl TitaniumSearch {
     /// otherwise. Pawn destinations already occupy valid move IDs.
     #[inline]
     fn move_hist(&self, stm: usize, m: i16) -> i32 {
-        let Some(h) = ace_to_hist(m) else {
-            return 0;
-        };
         if self.sf_history {
-            self.hist_sf[stm][h as usize]
+            self.hist_sf[stm][m as usize]
         } else {
-            self.history_tbl[h as usize]
+            self.history_tbl[m as usize]
         }
     }
 
@@ -3633,32 +3613,23 @@ impl TitaniumSearch {
     /// (a saturated entry that stops earning bonuses decays on every malus).
     #[inline]
     fn sf_hist_apply(&mut self, stm: usize, m: i16, bonus: i32) {
-        let Some(m_h) = ace_to_hist(m) else {
-            return;
-        };
-        let h = &mut self.hist_sf[stm][m_h as usize];
+        let h = &mut self.hist_sf[stm][m as usize];
         *h += bonus - ((*h as i64 * bonus.unsigned_abs() as i64) / SF_HIST_MAX as i64) as i32;
     }
 
     /// Same gravity formula on the continuation-history surface.
     #[inline]
     fn cont_hist_apply(&mut self, prev_move: i16, m: i16, bonus: i32) {
-        let (Some(prev_h), Some(m_h)) = (ace_to_hist(prev_move), ace_to_hist(m)) else {
-            return;
-        };
-        let h = &mut self.cont_hist[prev_h as usize * HIST_SPAN + m_h as usize];
+        let h = &mut self.cont_hist[prev_move as usize * HIST_SPAN + m as usize];
         *h += bonus - ((*h as i64 * bonus.unsigned_abs() as i64) / SF_HIST_MAX as i64) as i32;
     }
 
     #[inline]
     fn cont_hist_read(&self, prev_move: i16, m: i16) -> i32 {
-        if prev_move <= 0 {
+        if prev_move < 0 {
             return 0;
         }
-        let (Some(prev_h), Some(m_h)) = (ace_to_hist(prev_move), ace_to_hist(m)) else {
-            return 0;
-        };
-        self.cont_hist[prev_h as usize * HIST_SPAN + m_h as usize]
+        self.cont_hist[prev_move as usize * HIST_SPAN + m as usize]
     }
 
     /// Wall-structure bucket for the correction history: the incremental
@@ -4544,10 +4515,10 @@ impl TitaniumSearch {
         if self.dir_masks_key_lo != k_lo || self.dir_masks_key_hi != k_hi {
             if self.cached_stamp == self.g.wall_stamp - 1 && self.g.hist_len > 0 {
                 let m = self.g.hist_m[self.g.hist_len - 1];
-                if m >= 100 {
-                    let slot = (m % 100) as usize;
+                if is_wall_move(m) {
+                    let slot = wall_slot(m);
                     let z = &ZOBRIST;
-                    let (parent_lo, parent_hi, wall_type) = if m < 200 {
+                    let (parent_lo, parent_hi, wall_type) = if is_hwall_move(m) {
                         (k_lo ^ z.hw_lo[slot], k_hi ^ z.hw_hi[slot], 0)
                     } else {
                         (k_lo ^ z.vw_lo[slot], k_hi ^ z.vw_hi[slot], 1)
@@ -4738,7 +4709,7 @@ impl TitaniumSearch {
             // recompute a player's field only if the wall cuts a shortest-path edge
             // (|dist diff| === 1); equal-dist edges lie on no shortest path.
             let m = self.g.hist_m[self.g.hist_len - 1];
-            if m >= 100 {
+            if is_wall_move(m) {
                 let (refresh0, refresh1) =
                     wall_incr_refresh_flags(&self.d0[self.dist0_idx], &self.d1[self.dist1_idx], m);
                 if !refresh0
@@ -5160,9 +5131,9 @@ impl TitaniumSearch {
                 }
                 saw_legal_wall = true;
                 let mv = if wall_type == 0 {
-                    100 + slot as i16
+                    MOVE_HW_BASE + slot as i16
                 } else {
-                    200 + slot as i16
+                    MOVE_VW_BASE + slot as i16
                 };
                 self.g.make_move(mv);
                 let child_winner = self.zero_wall_winner_for_current_topology();
@@ -5314,9 +5285,9 @@ impl TitaniumSearch {
                             }
                             saw_legal_wall = true;
                             let mv = if wall_type == 0 {
-                                100 + slot as i16
+                                MOVE_HW_BASE + slot as i16
                             } else {
-                                200 + slot as i16
+                                MOVE_VW_BASE + slot as i16
                             };
                             self.g.make_move(mv);
                             let child_winner = self.one_wall_nonholder_winner();
@@ -6134,23 +6105,23 @@ impl TitaniumSearch {
         for slot in 0..64 {
             if check_legal {
                 if self.g.wall_legal(0, slot) {
-                    out[n] = 100 + slot as i16;
+                    out[n] = MOVE_HW_BASE + slot as i16;
                     n += 1;
                 }
                 if self.g.wall_legal(1, slot) {
-                    out[n] = 200 + slot as i16;
+                    out[n] = MOVE_VW_BASE + slot as i16;
                     n += 1;
                 }
             } else {
                 // lazy: geometry only; path-seal checked when the move is searched
                 if self.g.wall_fits(0, slot) {
                     crate::titanium::lazy_seal::lazy_seal_record_wall_generated();
-                    out[n] = 100 + slot as i16;
+                    out[n] = MOVE_HW_BASE + slot as i16;
                     n += 1;
                 }
                 if self.g.wall_fits(1, slot) {
                     crate::titanium::lazy_seal::lazy_seal_record_wall_generated();
-                    out[n] = 200 + slot as i16;
+                    out[n] = MOVE_VW_BASE + slot as i16;
                     n += 1;
                 }
             }
@@ -6207,7 +6178,7 @@ impl TitaniumSearch {
         let mut wall_candidate_n = 0usize;
 
         for slot in 0..64 {
-            for (wall_type, base) in [(0usize, 100i16), (1usize, 200i16)] {
+            for (wall_type, base) in [(0usize, MOVE_HW_BASE), (1usize, MOVE_VW_BASE)] {
                 if !self.g.wall_fits(wall_type, slot) {
                     continue;
                 }
@@ -6236,8 +6207,8 @@ impl TitaniumSearch {
                 } => {
                     let slot = i16::from(row) * 8 + i16::from(col);
                     match orientation {
-                        WallOrientation::Horizontal => 100 + slot,
-                        WallOrientation::Vertical => 200 + slot,
+                        WallOrientation::Horizontal => MOVE_HW_BASE + slot,
+                        WallOrientation::Vertical => MOVE_VW_BASE + slot,
                     }
                 }
                 BoardMove::Pawn { .. } => continue,
@@ -6282,7 +6253,7 @@ impl TitaniumSearch {
         let bridge = self.bridge.as_mut().expect("dead-zone bridge");
         let reachable = bridge.bfs.both_reachable_mask(&bridge.board);
         for slot in 0..64 {
-            for (wall_type, base) in [(0usize, 100i16), (1usize, 200i16)] {
+            for (wall_type, base) in [(0usize, MOVE_HW_BASE), (1usize, MOVE_VW_BASE)] {
                 if !self.g.wall_fits(wall_type, slot) {
                     continue;
                 }
@@ -6312,7 +6283,7 @@ impl TitaniumSearch {
         tt_move: i16,
         cm_move: i16,
         prev_move: i16,
-        cat_prior: Option<(&[i32; 264], u32)>,
+        cat_prior: Option<(&[i32; HIST_SPAN], u32)>,
     ) {
         let dist_me = if self.g.turn == 0 {
             &self.d0[self.dist0_idx]
@@ -6326,7 +6297,7 @@ impl TitaniumSearch {
             let m = moves[i];
             sc[i] = if m == tt_move {
                 2_000_000_000
-            } else if m < 100 {
+            } else if is_pawn_move(m) {
                 let progress = 1_000_000 - dist_me[m as usize] as i32 * 1000;
                 // Legacy mode intentionally keeps its exact pawn ordering. In
                 // the SF-history A/B, history is only a ±499 tie-break; one
@@ -6456,7 +6427,7 @@ impl TitaniumSearch {
     }
 
     fn q_search_wall_dist_changed(&mut self, ply: usize, wall_move: i16) -> bool {
-        if wall_move < 100 || self.g.hist_len == 0 {
+        if !is_wall_move(wall_move) || self.g.hist_len == 0 {
             return false;
         }
         let p0 = self.g.pawn[0] as usize;
@@ -6483,7 +6454,7 @@ impl TitaniumSearch {
         if parent_static == i32::MIN {
             return false;
         }
-        if prev_move >= 100 {
+        if is_wall_move(prev_move) {
             if !self.q_search_wall_dist_changed(ply, prev_move) {
                 return false;
             }
@@ -6822,10 +6793,8 @@ impl TitaniumSearch {
         if n == 0 {
             return Ok(self.evaluate(depth));
         }
-        let cm_move = if prev_move > 0 {
-            ace_to_hist(prev_move)
-                .map(|prev_h| self.cm[prev_h as usize])
-                .unwrap_or(0)
+        let cm_move = if prev_move >= 0 {
+            self.cm[prev_move as usize]
         } else {
             0
         };
@@ -6834,7 +6803,7 @@ impl TitaniumSearch {
         // ordering prior for walls the history table knows nothing about.
         // Cheap BFF impact heatmap (bitboard path-set + flood): a move's
         // impact is a heatmap lookup (wall = hottest touched square).
-        let mut heat_by_id = [0i32; 264];
+        let mut heat_by_id = [0i32; HIST_SPAN];
         let mut max_move_impact = 0u32;
         // Walls and pawn moves are normalized separately: a pawn destination's
         // heat can dwarf every wall's heat, which previously made the best wall
@@ -6849,7 +6818,7 @@ impl TitaniumSearch {
                     let h = move_impact_heat(mv, &cat);
                     heat_by_id[moves[i] as usize] = h;
                     max_move_impact = max_move_impact.max(h.max(0) as u32);
-                    if moves[i] >= 100 {
+                    if is_wall_move(moves[i]) {
                         max_wall_impact = max_wall_impact.max(h.max(0) as u32);
                     }
                 }
@@ -6886,7 +6855,7 @@ impl TitaniumSearch {
                     &mut flank_scratch,
                 );
                 for i in 0..n {
-                    if moves[i] < 100 {
+                    if is_pawn_move(moves[i]) {
                         continue; // pawn moves -- route-touch only makes sense for walls
                     }
                     if let crate::core::board::Move::Wall {
@@ -6976,7 +6945,7 @@ impl TitaniumSearch {
             };
             if lmp_cutoff
                 && ply > 0
-                && m >= 100
+                && is_wall_move(m)
                 && m != tt_move
                 && self.move_hist(self.g.turn, m) <= 0
                 && best > -MATE + 200
@@ -6988,10 +6957,10 @@ impl TitaniumSearch {
             // The CAT and dead-zone paths both emit geometry-only (pseudo-legal)
             // walls, so they STILL need the seal check — only the pure ti_movegen
             // path (full legal gen) can skip it.
-            if m >= 100 {
+            if is_wall_move(m) {
                 if let Some(seal) = lazy_seal.as_mut() {
-                    let wt = if m < 200 { 0 } else { 1 };
-                    let slot = (m % 100) as usize;
+                    let wt = if is_hwall_move(m) { 0 } else { 1 };
+                    let slot = wall_slot(m);
                     if !seal.allows_lazy_wall(&mut self.g, wt, slot) {
                         continue; // sealing wall: pseudo-legal only
                     }
@@ -7051,7 +7020,7 @@ impl TitaniumSearch {
                 && i > 0
                 && i <= ACE_EME_TOP_MOVES
                 && depth >= ACE_LMR_MIN_DEPTH
-                && m >= 100
+                && is_wall_move(m)
                 && m != tt_move
             {
                 // EME — extend only the top ordered walls (see ACE_EME_TOP_MOVES)
@@ -7061,7 +7030,7 @@ impl TitaniumSearch {
                     .map(|s| -s)
             } else if i >= ACE_LMR_AFTER_MOVE
                 && depth >= ACE_LMR_MIN_DEPTH
-                && m >= 100
+                && is_wall_move(m)
                 && m != tt_move
             {
                 let attention_ratio = if cat_lmr_active && max_wall_impact > 0 {
@@ -7146,8 +7115,8 @@ impl TitaniumSearch {
                         ((depth - 1).max(0) as f64 / 30.0).clamp(0.0, 1.0),
                         (i as f64 / 128.0).clamp(0.0, 1.0),
                         (red as f64 / 4.0).clamp(0.0, 1.0),
-                        if m < 200 { 1.0 } else { 0.0 },
-                        if m >= 200 { 1.0 } else { 0.0 },
+                        if is_hwall_move(m) { 1.0 } else { 0.0 },
+                        if is_vwall_move(m) { 1.0 } else { 0.0 },
                     ];
                     let sidecar = self.reduction_sidecar.as_ref().expect("checked above");
                     let probability = sidecar.predict(&hidden, &context);
@@ -7222,15 +7191,13 @@ impl TitaniumSearch {
                             nodes: self.nodes.saturating_sub(nodes_before),
                             hidden,
                             total_legal_moves: n,
-                            history_score: ace_to_hist(m)
-                                .map(|m_h| self.history_tbl[m_h as usize])
-                                .unwrap_or(0),
+                            history_score: self.history_tbl[m as usize],
                         });
                     }
                 }
                 pipeline_result
             } else if self.cat_lmr_v16
-                && m < 100
+                && is_pawn_move(m)
                 && i > 0
                 && depth >= ACE_LMR_MIN_DEPTH
                 && m != tt_move
@@ -7319,7 +7286,7 @@ impl TitaniumSearch {
                 }
             }
             if self.sf_history {
-                if m >= 100 {
+                if is_wall_move(m) {
                     searched_walls[searched_wall_count] = m;
                     searched_wall_count += 1;
                 } else {
@@ -7329,7 +7296,7 @@ impl TitaniumSearch {
             }
 
             // RaceProof(b): best non-wall root alternative
-            if ply == 0 && m < 100 && score > self.root_pawn_score {
+            if ply == 0 && is_pawn_move(m) && score > self.root_pawn_score {
                 self.root_pawn_score = score;
                 self.root_pawn_best = m;
             }
@@ -7359,17 +7326,13 @@ impl TitaniumSearch {
                     }
                     if alpha >= beta {
                         flag = 1;
-                        if m >= 100 {
+                        if is_wall_move(m) {
                             if self.killers[ply][0] != m {
                                 self.killers[ply][1] = self.killers[ply][0];
                                 self.killers[ply][0] = m;
                             }
-                            if let Some(m_h) = ace_to_hist(m) {
-                                self.history_tbl[m_h as usize] += depth * depth;
-                            }
-                            if ace_to_hist(m)
-                                .is_some_and(|m_h| self.history_tbl[m_h as usize] > 100_000_000)
-                            {
+                            self.history_tbl[m as usize] += depth * depth;
+                            if self.history_tbl[m as usize] > 100_000_000 {
                                 for h in self.history_tbl.iter_mut() {
                                     *h >>= 1;
                                 }
@@ -7384,9 +7347,9 @@ impl TitaniumSearch {
                             // keyed by the previous move.
                             let stm = self.g.turn;
                             let bonus = depth * depth;
-                            if m >= 100 {
+                            if is_wall_move(m) {
                                 self.sf_hist_apply(stm, m, bonus);
-                                if prev_move > 0 {
+                                if prev_move >= 0 {
                                     self.cont_hist_apply(prev_move, m, bonus);
                                 }
                             } else {
@@ -7396,7 +7359,7 @@ impl TitaniumSearch {
                                 let pm = searched_walls[j];
                                 if pm != m {
                                     self.sf_hist_apply(stm, pm, -bonus);
-                                    if prev_move > 0 {
+                                    if prev_move >= 0 {
                                         self.cont_hist_apply(prev_move, pm, -bonus);
                                     }
                                 }
@@ -7412,8 +7375,8 @@ impl TitaniumSearch {
                                 }
                             }
                         }
-                        if let Some(prev_h) = ace_to_hist(prev_move).filter(|_| prev_move > 0) {
-                            self.cm[prev_h as usize] = m;
+                        if prev_move >= 0 {
+                            self.cm[prev_move as usize] = m;
                         }
                         break;
                     }
@@ -7498,7 +7461,9 @@ impl TitaniumSearch {
         } else {
             let was_empty = self.tt_meta[idx] == 0;
             let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
-            let deeper = !was_empty && !stale_gen && depth.clamp(0, TT_DEPTH_MAX) >= tt_unpack_depth(self.tt_meta[idx]);
+            let deeper = !was_empty
+                && !stale_gen
+                && depth.clamp(0, TT_DEPTH_MAX) >= tt_unpack_depth(self.tt_meta[idx]);
             if was_empty || stale_gen || deeper {
                 crate::bench_instr::bump(|b| &mut b.tt_store);
                 self.tt_key_hi[idx] = self.g.hash_hi;
@@ -7527,7 +7492,9 @@ impl TitaniumSearch {
         {
             let was_empty = self.tt_meta[idx] == 0;
             let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
-            let deeper = !was_empty && !stale_gen && depth.clamp(0, TT_DEPTH_MAX) >= tt_unpack_depth(self.tt_meta[idx]);
+            let deeper = !was_empty
+                && !stale_gen
+                && depth.clamp(0, TT_DEPTH_MAX) >= tt_unpack_depth(self.tt_meta[idx]);
             if was_empty || stale_gen || deeper {
                 crate::bench_instr::bump(|b| &mut b.tt_store);
                 self.tt_key_hi[idx] = self.g.hash_hi;
@@ -7722,7 +7689,7 @@ impl TitaniumSearch {
 
         self.root_best = best_move;
         self.root_score = best_score;
-        if best_move < 100 {
+        if is_pawn_move(best_move) {
             self.root_pawn_best = best_move;
             self.root_pawn_score = best_score;
         }
@@ -7826,7 +7793,7 @@ impl TitaniumSearch {
             };
             self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
 
-            let is_pawn_move = m < 100;
+            let is_pawn_move = is_pawn_move(m);
             let cat_heat = heat_by_id[m as usize];
             if better_clean_win_candidate(
                 search_score,
@@ -7837,7 +7804,7 @@ impl TitaniumSearch {
                 i,
                 best_score,
                 best_static,
-                best_move < 100,
+                crate::titanium::is_pawn_move(best_move),
                 best_opp_dist_after,
                 best_cat_heat,
                 best_order,
@@ -7853,7 +7820,7 @@ impl TitaniumSearch {
 
         self.root_best = best_move;
         self.root_score = best_score;
-        if best_move < 100 {
+        if is_pawn_move(best_move) {
             self.root_pawn_best = best_move;
             self.root_pawn_score = best_score;
         }
@@ -8107,7 +8074,11 @@ impl TitaniumSearch {
         self.tt_adaptive = false;
         self.apply_think_start_state();
 
-        let depth_limit = if max_depth > 0 { max_depth.min(TT_DEPTH_MAX) } else { 128 };
+        let depth_limit = if max_depth > 0 {
+            max_depth.min(TT_DEPTH_MAX)
+        } else {
+            128
+        };
         let root_moves_raw = self.ordered_root_moves_snapshot(depth_limit);
         if root_moves_raw.is_empty() {
             return self.think(time_ms, max_depth, full, log, engine_label);
@@ -8116,7 +8087,7 @@ impl TitaniumSearch {
         // EXPERIMENT: CAT impact-heat per root move, computed once against
         // the root position, used below to VALUE-filter (not count-filter)
         // each worker's root move list.
-        let mut heat_by_id = [0i32; 264];
+        let mut heat_by_id = [0i32; HIST_SPAN];
         let mut max_heat = 0i32;
         if let Some(bridge) = self.bridge.as_ref() {
             let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
@@ -8435,7 +8406,11 @@ impl TitaniumSearch {
         let mut last_pawn_best: i16 = -1;
         let mut last_pawn_score: i32 = i32::MIN;
         let mut depth_log: Vec<AceDepthLogEntry> = Vec::new();
-        let max_depth = if max_depth > 0 { max_depth.min(TT_DEPTH_MAX) } else { 128 };
+        let max_depth = if max_depth > 0 {
+            max_depth.min(TT_DEPTH_MAX)
+        } else {
+            128
+        };
         let root_q_left = if self.q_search { self.q_max } else { 0 };
 
         // Dynamic iterative-deepening startup: probe the TT for the root position.
@@ -8719,7 +8694,7 @@ impl TitaniumSearch {
         // without a pawn alternative are kept. Worst-case gate cost was
         // reserved out of the search deadline up front (gate_reserve_ms).
         if self.race_proof
-            && last_best >= 100
+            && is_wall_move(last_best)
             && self.g.wl[self.g.turn] == 1
             && last_pawn_best >= 0
             && last_score < MATE - 200
