@@ -390,6 +390,15 @@ pub struct RaceOutcomeStats {
     pub two_wall_decisive: u64,
     /// Calls that declined because the exact subset did not cover the state.
     pub two_wall_unknown: u64,
+    /// Exactly one side has 0 walls: refuse-to-place race bounds.
+    pub broke_calls: u64,
+    pub broke_decisive: u64,
+    pub broke_unknown: u64,
+    pub broke_lower: u64,
+    pub broke_upper: u64,
+    /// ab() cut tallies for the broke-side theorems.
+    pub broke_cut_fail_high: u64,
+    pub broke_cut_fail_low: u64,
 }
 
 impl RaceOutcomeStats {
@@ -403,7 +412,7 @@ impl RaceOutcomeStats {
 
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{},"one_wall_calls":{},"one_wall_decisive":{},"one_wall_unknown":{},"two_wall_calls":{},"two_wall_decisive":{},"two_wall_unknown":{}}}"#,
+            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{},"one_wall_calls":{},"one_wall_decisive":{},"one_wall_unknown":{},"two_wall_calls":{},"two_wall_decisive":{},"two_wall_unknown":{},"broke_calls":{},"broke_decisive":{},"broke_unknown":{},"broke_lower":{},"broke_upper":{},"broke_cut_fail_high":{},"broke_cut_fail_low":{}}}"#,
             self.calls,
             self.gate1_decisive,
             self.gate1_unknown,
@@ -423,6 +432,13 @@ impl RaceOutcomeStats {
             self.two_wall_calls,
             self.two_wall_decisive,
             self.two_wall_unknown,
+            self.broke_calls,
+            self.broke_decisive,
+            self.broke_unknown,
+            self.broke_lower,
+            self.broke_upper,
+            self.broke_cut_fail_high,
+            self.broke_cut_fail_low,
         )
     }
 }

@@ -1485,6 +1485,49 @@ mod score_label_tests {
         game
     }
 
+    fn pawn_sq_fixture(p0: usize, p1: usize, hands: [i32; 2], turn: usize) -> GameState {
+        use crate::titanium::game::ZOBRIST;
+        let mut game = GameState::new();
+        game.pawn = [p0, p1];
+        game.wl = hands;
+        game.turn = turn;
+        game.hash_lo = ZOBRIST.pawn_lo[0][p0] ^ ZOBRIST.pawn_lo[1][p1];
+        game.hash_hi = ZOBRIST.pawn_hi[0][p0] ^ ZOBRIST.pawn_hi[1][p1];
+        if turn != 0 {
+            game.hash_lo ^= ZOBRIST.turn_lo;
+            game.hash_hi ^= ZOBRIST.turn_hi;
+        }
+        game
+    }
+
+    /// Oracle-certified empty-board (p0, p1) with turn=0 where STM wins (`stm_wins`)
+    /// or loses the pure race. Builds the empty topology race table once.
+    fn find_empty_board_pure_race_pair(stm_wins: bool) -> (usize, usize) {
+        let mut search = enabled_two_wall_search(GameState::new());
+        search.race_proof = true;
+        search.g.wl = [0, 0];
+        let slot = search
+            .race_tbl(true)
+            .expect("empty-board race_tbl must build under test caps");
+        for p0 in 0..81usize {
+            for p1 in 0..81usize {
+                if p0 == p1 {
+                    continue;
+                }
+                search.g.pawn = [p0, p1];
+                search.g.turn = 0;
+                let rv = search.race_value(slot);
+                if rv == 0 {
+                    continue;
+                }
+                if (rv > 0) == stm_wins {
+                    return (p0, p1);
+                }
+            }
+        }
+        panic!("no empty-board pure-race fixture for stm_wins={stm_wins}");
+    }
+
     fn enabled_two_wall_search(game: GameState) -> Box<TitaniumSearch> {
         let mut search = TitaniumSearch::new(game);
         search.two_wall_race_resolved = Some(true);
@@ -1572,6 +1615,86 @@ mod score_label_tests {
             let mut search = enabled_two_wall_search(game);
             assert_eq!(search.two_wall_monopoly_race_bound(), RaceBound::Unknown);
         }
+    }
+
+    #[test]
+    fn broke_side_lower_when_opp_out_of_walls_and_stm_wins_pure_race() {
+        let (p0, p1) = find_empty_board_pure_race_pair(true);
+        let game = pawn_sq_fixture(p0, p1, [3, 0], 0);
+        let mut search = enabled_two_wall_search(game);
+        search.race_proof = true;
+        search.rp_build_ok = true;
+        match search.one_side_broke_race_bound() {
+            RaceBound::Lower(v) => {
+                assert!(
+                    v > RACE_WIN_FLOOR && v <= RACE_MATE,
+                    "expected DTM-preserving Lower, got {v}"
+                );
+            }
+            other => panic!("expected Lower, got {other:?} (p0={p0} p1={p1})"),
+        }
+        assert_eq!(search.race_outcome_stats.broke_decisive, 1);
+    }
+
+    #[test]
+    fn broke_side_upper_when_stm_out_of_walls_and_loses_pure_race() {
+        let (p0, p1) = find_empty_board_pure_race_pair(false);
+        let game = pawn_sq_fixture(p0, p1, [0, 4], 0);
+        let mut search = enabled_two_wall_search(game);
+        search.race_proof = true;
+        search.rp_build_ok = true;
+        match search.one_side_broke_race_bound() {
+            RaceBound::Upper(v) => {
+                assert!(
+                    v < -RACE_WIN_FLOOR && v >= -RACE_MATE,
+                    "expected DTM-preserving Upper, got {v}"
+                );
+            }
+            other => panic!("expected Upper, got {other:?} (p0={p0} p1={p1})"),
+        }
+        assert_eq!(search.race_outcome_stats.broke_decisive, 1);
+    }
+
+    #[test]
+    fn broke_side_declines_when_wallless_player_wins_but_opp_still_has_walls() {
+        // STM has 0 walls and wins pure race, but opp still has walls and can
+        // spoil — must NOT emit Lower.
+        let (p0, p1) = find_empty_board_pure_race_pair(true);
+        let game = pawn_sq_fixture(p0, p1, [0, 3], 0);
+        let mut search = enabled_two_wall_search(game);
+        search.race_proof = true;
+        search.rp_build_ok = true;
+        assert_eq!(search.one_side_broke_race_bound(), RaceBound::Unknown);
+        assert_eq!(search.race_outcome_stats.broke_unknown, 1);
+    }
+
+    #[test]
+    fn broke_side_declines_when_walled_stm_loses_pure_race() {
+        // STM has walls, opp has none, but STM loses pure race — STM may still
+        // spend walls to reverse. Must NOT emit Upper (and must not Lower).
+        let (p0, p1) = find_empty_board_pure_race_pair(false);
+        let game = pawn_sq_fixture(p0, p1, [4, 0], 0);
+        let mut search = enabled_two_wall_search(game);
+        search.race_proof = true;
+        search.rp_build_ok = true;
+        assert_eq!(search.one_side_broke_race_bound(), RaceBound::Unknown);
+        assert_eq!(search.race_outcome_stats.broke_unknown, 1);
+    }
+
+    #[test]
+    fn broke_side_declines_when_both_armed_or_both_broke() {
+        let (p0, p1) = find_empty_board_pure_race_pair(true);
+        let both_armed = pawn_sq_fixture(p0, p1, [2, 2], 0);
+        let mut search = enabled_two_wall_search(both_armed);
+        search.race_proof = true;
+        assert_eq!(search.one_side_broke_race_bound(), RaceBound::Unknown);
+        assert_eq!(search.race_outcome_stats.broke_calls, 0);
+
+        let both_broke = pawn_sq_fixture(p0, p1, [0, 0], 0);
+        let mut search = enabled_two_wall_search(both_broke);
+        search.race_proof = true;
+        assert_eq!(search.one_side_broke_race_bound(), RaceBound::Unknown);
+        assert_eq!(search.race_outcome_stats.broke_calls, 0);
     }
 
     #[test]
@@ -4883,17 +5006,24 @@ impl TitaniumSearch {
     /// Exact fixed-topology winner after discarding every remaining wall.
     /// The result is a winner, not DTM: optional-wall callers expose a bound.
     fn zero_wall_winner_for_current_topology(&mut self) -> Option<usize> {
+        self.zero_wall_exact_score_for_current_topology()
+            .map(|score| {
+                if score > 0 {
+                    self.g.turn
+                } else {
+                    self.g.turn ^ 1
+                }
+            })
+    }
+
+    /// Exact race score (`±(RACE_MATE - dtm)`) after discarding remaining hands.
+    /// Checks only the temporary `wl=[0,0]` state — original hands do not gate it.
+    fn zero_wall_exact_score_for_current_topology(&mut self) -> Option<i32> {
         let saved_hands = self.g.wl;
         self.g.wl = [0, 0];
         let score = self.exact_hands_empty_score(false);
         self.g.wl = saved_hands;
-        score.map(|score| {
-            if score > 0 {
-                self.g.turn
-            } else {
-                self.g.turn ^ 1
-            }
-        })
+        score
     }
 
     #[inline]
@@ -5021,6 +5151,50 @@ impl TitaniumSearch {
                 RaceBound::Unknown
             }
         }
+    }
+
+    /// Exactly one side has 0 walls in hand: refuse-to-place race bounds.
+    ///
+    /// Arrival-time vs game-result: a pure-race projection is NOT always a cut.
+    /// Only these two theorems are used:
+    /// - opp has 0 walls and STM wins pure race → Lower (STM can refuse to place)
+    /// - STM has 0 walls and STM loses pure race → Upper (opp can refuse to place)
+    ///
+    /// Bounds preserve exact projected DTM (`±(RACE_MATE - dtm)`), not just the floor.
+    ///
+    /// Not a cut: wallless side wins while the other still has walls (they can spoil);
+    /// or walled side loses pure race (they can still spend walls to reverse).
+    fn one_side_broke_race_bound(&mut self) -> RaceBound {
+        if !self.race_proof {
+            return RaceBound::Unknown;
+        }
+        let w0 = self.g.wl[0];
+        let w1 = self.g.wl[1];
+        // Exactly one side broke. Both-zero is the exact race path; both-armed declines.
+        if (w0 == 0) == (w1 == 0) {
+            return RaceBound::Unknown;
+        }
+        self.race_outcome_stats.broke_calls += 1;
+        let Some(score) = self.zero_wall_exact_score_for_current_topology() else {
+            self.race_outcome_stats.broke_unknown += 1;
+            return RaceBound::Unknown;
+        };
+        let stm = self.g.turn;
+        let opp = stm ^ 1;
+        // Opp broke + STM wins pure race → Lower(exact projected win score).
+        if self.g.wl[opp] == 0 && score > 0 {
+            self.race_outcome_stats.broke_decisive += 1;
+            self.race_outcome_stats.broke_lower += 1;
+            return RaceBound::Lower(score);
+        }
+        // STM broke + STM loses pure race → Upper(exact projected loss score).
+        if self.g.wl[stm] == 0 && score < 0 {
+            self.race_outcome_stats.broke_decisive += 1;
+            self.race_outcome_stats.broke_upper += 1;
+            return RaceBound::Upper(score);
+        }
+        self.race_outcome_stats.broke_unknown += 1;
+        RaceBound::Unknown
     }
 
     /// Sound monopoly-only subset for exactly two remaining walls.
@@ -5355,6 +5529,15 @@ impl TitaniumSearch {
         if w_me_i == 0 && w_opp_i == 0 && (!self.cert_eval_leaves_only || depth <= 0) {
             match self.try_hands_empty_endgame(d_me_i, d_opp_i) {
                 HandsEmptyPipelineOutcome::Score(s) => return s,
+            }
+        }
+        // Soft eval when the refuse-to-place theorem already proves the race.
+        // Uses a mid-band score (not RACE_WIN_FLOOR) so search can still refine.
+        if self.race_proof && (w_me_i == 0) != (w_opp_i == 0) {
+            match self.one_side_broke_race_bound() {
+                RaceBound::Lower(_) => return 1800,
+                RaceBound::Upper(_) => return -1800,
+                RaceBound::Exact(_) | RaceBound::Unknown => {}
             }
         }
         if self.race_proof
@@ -6261,6 +6444,23 @@ impl TitaniumSearch {
         let ndm_hi = self.dir_masks_key_hi;
         let ndm_cache = self.dir_masks_cache;
         let pv_node = beta > alpha.saturating_add(1);
+        // Exactly one side out of walls: refuse-to-place race cuts (covers [k,0]/[0,k]).
+        if (self.g.wl[0] == 0) != (self.g.wl[1] == 0) {
+            match self.one_side_broke_race_bound() {
+                RaceBound::Lower(value) if value >= beta => {
+                    self.race_outcome_stats.broke_cut_fail_high += 1;
+                    return Ok(beta);
+                }
+                RaceBound::Upper(value) if value <= alpha => {
+                    self.race_outcome_stats.broke_cut_fail_low += 1;
+                    return Ok(alpha);
+                }
+                RaceBound::Lower(_)
+                | RaceBound::Upper(_)
+                | RaceBound::Exact(_)
+                | RaceBound::Unknown => {}
+            }
+        }
         if self.g.wl[0] + self.g.wl[1] == 1 && (!self.one_wall_race_pv_only || pv_node) {
             match self.one_wall_race_bound() {
                 RaceBound::Lower(value) if value >= beta => return Ok(beta),

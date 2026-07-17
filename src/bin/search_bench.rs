@@ -15,7 +15,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 use titanium::algebraic_to_move_id;
 use titanium::bench_instr;
-use titanium::cat::build::{build_impact_heatmap, build_impact_heatmap_legacy};
+use titanium::cat::build::build_impact_heatmap;
 use titanium::cat::CorridorAttention;
 use titanium::core::board::Board;
 use titanium::movegen::prewarm;
@@ -463,15 +463,38 @@ fn bench_profile(sec: u64, position: &str, moves: Option<&str>, full: bool, thre
     });
 }
 
-fn cat_micro_run(board: &Board, catv6: bool, iterations: usize) -> (u128, u64) {
+/// Single cold think for per-move flamegraph replay.
+fn bench_think_once(time_ms: u64, moves: Option<&str>, full: bool, threads: usize) {
+    reset_lazy_seal_stats();
+    let moves_s = moves.unwrap_or("").trim();
+    let mut search = fresh_search("startpos", if moves_s.is_empty() { None } else { Some(moves_s) });
+    let t0 = Instant::now();
+    let r = run_think(&mut search, time_ms, MAX_DEPTH, full, false, threads);
+    let wall_ms = t0.elapsed().as_millis() as u64;
+    emit_result(
+        "think",
+        "startpos",
+        &r,
+        wall_ms,
+        full,
+        false,
+        threads,
+        &format!(
+            ",\"time_ms\":{time_ms},\"moves\":{}",
+            json_str(moves_s)
+        ),
+    );
+    println!("{}", r.race_outcome_stats.to_json());
+    if let Some(instr) = bench_instr::take_json_report() {
+        println!("{instr}");
+    }
+}
+
+fn cat_micro_run(board: &Board, iterations: usize) -> (u128, u64) {
     let mut checksum = 0u64;
     let t0 = Instant::now();
     for i in 0..iterations {
-        let cat = if catv6 {
-            build_impact_heatmap(black_box(board))
-        } else {
-            build_impact_heatmap_legacy(black_box(board))
-        };
+        let cat = build_impact_heatmap(black_box(board));
         let sq = (i * 37) % 81;
         checksum =
             checksum.wrapping_add(u64::from(cat.square_heat((sq / 9) as u8, (sq % 9) as u8)));
@@ -484,61 +507,41 @@ fn bench_cat_micro(position: &str, ply: Option<usize>, iterations: usize, rounds
     let board = load_board(position, ply);
     for _ in 0..100 {
         black_box(build_impact_heatmap(&board));
-        black_box(build_impact_heatmap_legacy(&board));
     }
 
-    let mut legacy_ns = Vec::with_capacity(rounds);
     let mut catv6_ns = Vec::with_capacity(rounds);
     for round in 0..rounds {
-        let order = if round % 2 == 0 {
-            [(false, "legacy"), (true, "catv6")]
-        } else {
-            [(true, "catv6"), (false, "legacy")]
-        };
-        for (catv6, label) in order {
-            let (elapsed_ns, checksum) = cat_micro_run(&board, catv6, iterations);
-            let ns_per_call = elapsed_ns as f64 / iterations as f64;
-            let calls_per_sec = 1_000_000_000.0 / ns_per_call;
-            println!(
-                "{{\"bench_type\":\"cat_micro_raw\",\"position\":{},\"ply\":{},\"round\":{},\"variant\":{},\"iterations\":{},\"elapsed_ns\":{},\"ns_per_call\":{:.2},\"calls_per_sec\":{:.0},\"checksum\":{}}}",
-                json_str(position),
-                ply.map_or_else(|| "null".to_string(), |v| v.to_string()),
-                round + 1,
-                json_str(label),
-                iterations,
-                elapsed_ns,
-                ns_per_call,
-                calls_per_sec,
-                checksum,
-            );
-            if catv6 {
-                catv6_ns.push(ns_per_call);
-            } else {
-                legacy_ns.push(ns_per_call);
-            }
-        }
+        let (elapsed_ns, checksum) = cat_micro_run(&board, iterations);
+        let ns_per_call = elapsed_ns as f64 / iterations as f64;
+        let calls_per_sec = 1_000_000_000.0 / ns_per_call;
+        println!(
+            "{{\"bench_type\":\"cat_micro_raw\",\"position\":{},\"ply\":{},\"round\":{},\"variant\":\"catv6\",\"iterations\":{},\"elapsed_ns\":{},\"ns_per_call\":{:.2},\"calls_per_sec\":{:.0},\"checksum\":{}}}",
+            json_str(position),
+            ply.map_or_else(|| "null".to_string(), |v| v.to_string()),
+            round + 1,
+            iterations,
+            elapsed_ns,
+            ns_per_call,
+            calls_per_sec,
+            checksum,
+        );
+        catv6_ns.push(ns_per_call);
     }
 
-    let legacy_median = median_f64(&legacy_ns);
     let catv6_median = median_f64(&catv6_ns);
     println!(
-        "{{\"bench_type\":\"cat_micro_summary\",\"position\":{},\"ply\":{},\"rounds\":{},\"iterations_per_round\":{},\"legacy_median_ns_per_call\":{:.2},\"catv6_median_ns_per_call\":{:.2},\"legacy_calls_per_sec\":{:.0},\"catv6_calls_per_sec\":{:.0},\"speedup\":{:.4},\"time_reduction_pct\":{:.2}}}",
+        "{{\"bench_type\":\"cat_micro_summary\",\"position\":{},\"ply\":{},\"rounds\":{},\"iterations_per_round\":{},\"catv6_median_ns_per_call\":{:.2},\"catv6_calls_per_sec\":{:.0}}}",
         json_str(position),
         ply.map_or_else(|| "null".to_string(), |v| v.to_string()),
         rounds,
         iterations,
-        legacy_median,
         catv6_median,
-        1_000_000_000.0 / legacy_median,
         1_000_000_000.0 / catv6_median,
-        legacy_median / catv6_median,
-        100.0 * (1.0 - catv6_median / legacy_median),
     );
 }
 
 fn dump_cat_planes(position: &str, ply: Option<usize>) {
     let board = load_board(position, ply);
-    let legacy = build_impact_heatmap_legacy(&board);
     let catv6 = build_impact_heatmap(&board);
     let values = |cat: &CorridorAttention| {
         (0..81usize)
@@ -549,11 +552,10 @@ fn dump_cat_planes(position: &str, ply: Option<usize>) {
     let moves = position_moves(position);
     let limit = ply.unwrap_or(moves.len()).min(moves.len());
     println!(
-        "{{\"bench_type\":\"cat_dump\",\"position\":{},\"ply\":{},\"moves\":{},\"legacy\":[{}],\"catv6\":[{}]}}",
+        "{{\"bench_type\":\"cat_dump\",\"position\":{},\"ply\":{},\"moves\":{},\"catv6\":[{}]}}",
         json_str(position),
         limit,
         json_str(&moves[..limit].join(" ")),
-        values(&legacy),
         values(&catv6),
     );
 }
@@ -634,6 +636,10 @@ fn main() {
             let sec = parse_u64(&args, "--sec", 10);
             bench_profile(sec, position, moves, full, threads);
         }
+        "think" => {
+            let ms = parse_u64(&args, "--ms", 1000);
+            bench_think_once(ms, moves, full, threads);
+        }
         "catmicro" => {
             let iterations = parse_usize(&args, "--iters", 10_000);
             let rounds = parse_usize(&args, "--runs", 7);
@@ -654,7 +660,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "unknown mode {other}; use time|depth|profile|instr|catmicro|catdump [--position NAME] [--full] [--sec N] [--runs N]"
+                "unknown mode {other}; use time|depth|profile|think|instr|catmicro|catdump [--position NAME] [--moves ...] [--ms N] [--full] [--sec N] [--runs N]"
             );
             std::process::exit(2);
         }
