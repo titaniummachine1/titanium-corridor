@@ -31,3 +31,11 @@ id_rsa.*
 
 # Local strength baseline reference (archived binary + weights)
 baseline/
+
+# Local build and benchmark output
+/target-*/
+/runs/
+/.clean-build-*/
+/ab_bench_results.json
+/cat_reuse_ab.json
+/scripts/*_results.txt
