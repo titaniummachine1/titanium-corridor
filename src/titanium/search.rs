@@ -50,8 +50,9 @@ use crate::titanium::game::{GameState, ZOBRIST};
 use crate::titanium::net::{net, net_frozen, Net, MAX_NET_H, NET_BKT, NET_MIRC, NET_MIRS};
 use crate::titanium::packed_state::FEATURE_SCHEMA;
 use crate::titanium::race::{
-    race_outcome_detailed, race_outcome_with_dist, solve_race_config, PlyEstimate, RaceBound,
-    RaceOutcomeStats, RaceScratch, RACE_MATE, RACE_STATES, RACE_WIN_FLOOR,
+    bff_tempo_margin_close, jump_aware_goal_distances, race_outcome_detailed,
+    race_outcome_with_dist, solve_race_config, PlyEstimate, RaceBound, RaceOutcomeStats,
+    RaceScratch, RACE_MATE, RACE_STATES, RACE_WIN_FLOOR,
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
 use crate::util::grid::FLOOD_PLAYABLE;
@@ -1632,6 +1633,22 @@ mod score_label_tests {
                 );
             }
             other => panic!("expected Lower, got {other:?} (p0={p0} p1={p1})"),
+        }
+        assert_eq!(search.race_outcome_stats.broke_decisive, 1);
+    }
+
+    #[test]
+    fn broke_side_lower_jump_path_fixture() {
+        // P0 can jump over P1 (46 -> 28) on the exact empty-board race path.
+        // With P1 unable to place, the refuse-to-place theorem must preserve
+        // that jump-aware winner as a Lower bound.
+        let game = pawn_sq_fixture(46, 37, [3, 0], 0);
+        let mut search = enabled_two_wall_search(game);
+        search.race_proof = true;
+        search.rp_build_ok = true;
+        match search.one_side_broke_race_bound() {
+            RaceBound::Lower(v) => assert!(v > RACE_WIN_FLOOR && v <= RACE_MATE),
+            other => panic!("expected jump-aware Lower, got {other:?}"),
         }
         assert_eq!(search.race_outcome_stats.broke_decisive, 1);
     }
@@ -5512,20 +5529,44 @@ impl TitaniumSearch {
         let _eval_timer = crate::bench_instr::OpTimer::start(|b| &mut b.evaluate);
         let me = self.g.turn;
         let opp = 1 - me;
-        let d_me_u = if me == 0 {
-            self.d0[self.dist0_idx][self.g.pawn[0]]
+        let mut d_me_i = if me == 0 {
+            self.d0[self.dist0_idx][self.g.pawn[0]] as i32
         } else {
-            self.d1[self.dist1_idx][self.g.pawn[1]]
+            self.d1[self.dist1_idx][self.g.pawn[1]] as i32
         };
-        let d_opp_u = if opp == 0 {
-            self.d0[self.dist0_idx][self.g.pawn[0]]
+        let mut d_opp_i = if opp == 0 {
+            self.d0[self.dist0_idx][self.g.pawn[0]] as i32
         } else {
-            self.d1[self.dist1_idx][self.g.pawn[1]]
+            self.d1[self.dist1_idx][self.g.pawn[1]] as i32
         };
         let w_me_i = self.g.wl[me];
         let w_opp_i = self.g.wl[opp];
-        let d_me_i = d_me_u as i32;
-        let d_opp_i = d_opp_u as i32;
+        let bff_d_me_i = d_me_i;
+        let bff_d_opp_i = d_opp_i;
+
+        if self.race_proof && w_me_i == 0 && w_opp_i == 0 {
+            let d0 = &self.d0[self.dist0_idx];
+            let d1 = &self.d1[self.dist1_idx];
+            self.race_outcome_stats.jump_dist_calls += 1;
+            if bff_tempo_margin_close(&self.g, d0, d1) {
+                let ja = jump_aware_goal_distances(&mut self.g);
+                self.race_outcome_stats.jump_dist_upgrades += 1;
+                let new_me = if me == 0 { ja.d0 } else { ja.d1 };
+                let new_opp = if opp == 0 { ja.d0 } else { ja.d1 };
+                if new_me != u8::MAX {
+                    d_me_i = new_me as i32;
+                }
+                if new_opp != u8::MAX {
+                    d_opp_i = new_opp as i32;
+                }
+                let bff_fav_me = bff_d_me_i <= bff_d_opp_i;
+                let jump_fav_me = d_me_i <= d_opp_i;
+                if bff_fav_me != jump_fav_me {
+                    self.race_outcome_stats.jump_dist_cuts_avoided += 1;
+                }
+            }
+        }
+
         if w_me_i == 0 && w_opp_i == 0 && (!self.cert_eval_leaves_only || depth <= 0) {
             match self.try_hands_empty_endgame(d_me_i, d_opp_i) {
                 HandsEmptyPipelineOutcome::Score(s) => return s,
@@ -5651,13 +5692,13 @@ impl TitaniumSearch {
                     width_in_layers(
                         &self.d1_layers[self.dist1_idx],
                         self.d1_layer_depth[self.dist1_idx],
-                        d_opp_u,
+                        d_opp_i as u8,
                     )
                 } else {
                     width_in_layers(
                         &self.d0_layers[self.dist0_idx],
                         self.d0_layer_depth[self.dist0_idx],
-                        d_opp_u,
+                        d_opp_i as u8,
                     )
                 }) as usize
             } else if me == 0 {

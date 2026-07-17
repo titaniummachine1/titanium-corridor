@@ -287,12 +287,108 @@ fn cell_manhattan(a: usize, b: usize) -> usize {
 /// Alternating-ply ETA for `side` to travel `distance` steps when `turn` moves
 /// next. Side to move gets a free half-ply (one step sooner).
 #[inline(always)]
-fn arrival_ply(side: usize, turn: usize, distance: u8) -> i16 {
+pub fn arrival_ply(side: usize, turn: usize, distance: u8) -> i16 {
     if distance == 0 {
         0
     } else {
         2 * distance as i16 - i16::from(side == turn)
     }
+}
+
+/// Jump-aware goal distances for both players (precise BFF twin).
+///
+/// Each side is measured independently with the opponent frozen at its current
+/// cell, using legal `gen_pawn_moves` (orthogonal steps + jumps). `u8::MAX` means
+/// unreachable. This is cheaper than full `race_tbl` retrograde and corrects
+/// wall-only BFF when jumps matter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JumpAwareDist {
+    pub d0: u8,
+    pub d1: u8,
+}
+
+#[inline(always)]
+fn is_goal_cell(side: usize, cell: usize) -> bool {
+    if side == 0 {
+        cell < 9
+    } else {
+        cell >= 72
+    }
+}
+
+/// Solo jump-aware BFS for `side` with the opponent pawn frozen.
+fn jump_aware_goal_distance_one(g: &mut GameState, side: usize) -> u8 {
+    let start = g.pawn[side];
+    if is_goal_cell(side, start) {
+        return 0;
+    }
+
+    let saved_p0 = g.pawn[0];
+    let saved_p1 = g.pawn[1];
+    let saved_turn = g.turn;
+
+    let mut dist = [u8::MAX; 81];
+    let mut queue = [0usize; 81];
+    let mut head = 0usize;
+    let mut tail = 0usize;
+    dist[start] = 0;
+    queue[tail] = start;
+    tail += 1;
+
+    let mut buf = [0i16; 16];
+    while head < tail {
+        let cur = queue[head];
+        head += 1;
+        let steps = dist[cur];
+        if steps >= 254 {
+            continue;
+        }
+
+        g.pawn[side] = cur;
+        g.turn = side;
+        let nm = g.gen_pawn_moves(&mut buf, 0);
+        for j in 0..nm {
+            let dst = buf[j] as usize;
+            if dist[dst] != u8::MAX {
+                continue;
+            }
+            let next = steps + 1;
+            if is_goal_cell(side, dst) {
+                g.pawn[0] = saved_p0;
+                g.pawn[1] = saved_p1;
+                g.turn = saved_turn;
+                return next;
+            }
+            dist[dst] = next;
+            queue[tail] = dst;
+            tail += 1;
+        }
+    }
+
+    g.pawn[0] = saved_p0;
+    g.pawn[1] = saved_p1;
+    g.turn = saved_turn;
+    u8::MAX
+}
+
+/// Jump-aware dual distances for both players on the current fixed topology.
+pub fn jump_aware_goal_distances(g: &mut GameState) -> JumpAwareDist {
+    JumpAwareDist {
+        d0: jump_aware_goal_distance_one(g, 0),
+        d1: jump_aware_goal_distance_one(g, 1),
+    }
+}
+
+/// True when BFF dual distances put the race inside the ±1-tempo band.
+pub fn bff_tempo_margin_close(g: &GameState, d0: &[u8; 81], d1: &[u8; 81]) -> bool {
+    let r0 = d0[g.pawn[0]];
+    let r1 = d1[g.pawn[1]];
+    if r0 == u8::MAX || r1 == u8::MAX {
+        return false;
+    }
+    let eta0 = arrival_ply(0, g.turn, r0);
+    let eta1 = arrival_ply(1, g.turn, r1);
+    (eta0 - eta1).abs() <= 1
 }
 
 /// Gate 1 only (ETA `delta_eta > 1` interception-impossible). Gate 2 is
@@ -399,6 +495,11 @@ pub struct RaceOutcomeStats {
     /// ab() cut tallies for the broke-side theorems.
     pub broke_cut_fail_high: u64,
     pub broke_cut_fail_low: u64,
+    /// Jump-aware dual-distance upgrade path (±1 BFF tempo band).
+    pub jump_dist_calls: u64,
+    pub jump_dist_upgrades: u64,
+    /// Heuristic sign would differ under BFF vs jump-aware distances.
+    pub jump_dist_cuts_avoided: u64,
 }
 
 impl RaceOutcomeStats {
@@ -412,7 +513,7 @@ impl RaceOutcomeStats {
 
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{},"one_wall_calls":{},"one_wall_decisive":{},"one_wall_unknown":{},"two_wall_calls":{},"two_wall_decisive":{},"two_wall_unknown":{},"broke_calls":{},"broke_decisive":{},"broke_unknown":{},"broke_lower":{},"broke_upper":{},"broke_cut_fail_high":{},"broke_cut_fail_low":{}}}"#,
+            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{},"one_wall_calls":{},"one_wall_decisive":{},"one_wall_unknown":{},"two_wall_calls":{},"two_wall_decisive":{},"two_wall_unknown":{},"broke_calls":{},"broke_decisive":{},"broke_unknown":{},"broke_lower":{},"broke_upper":{},"broke_cut_fail_high":{},"broke_cut_fail_low":{},"jump_dist_calls":{},"jump_dist_upgrades":{},"jump_dist_cuts_avoided":{}}}"#,
             self.calls,
             self.gate1_decisive,
             self.gate1_unknown,
@@ -439,6 +540,9 @@ impl RaceOutcomeStats {
             self.broke_upper,
             self.broke_cut_fail_high,
             self.broke_cut_fail_low,
+            self.jump_dist_calls,
+            self.jump_dist_upgrades,
+            self.jump_dist_cuts_avoided,
         )
     }
 }
@@ -1644,6 +1748,56 @@ mod tests {
         assert!(decisive > 0);
     }
 
+    /// Service A must expose only sound alpha-beta bounds on the empty board:
+    /// every decisive Lower/Upper agrees with the exact race-table sign, while
+    /// unresolved states remain Unknown.
+    #[test]
+    fn empty_board_pure_race_exact_lower_upper_sanity() {
+        let mut g = GameState::new();
+        let mut exact_scratch = ReferenceScratch::new();
+        let mut exact = vec![0i16; RACE_STATES];
+        solve_race_config_reference(&mut g, &mut exact_scratch, &mut exact);
+
+        let mut d0 = [0u8; 81];
+        let mut d1 = [0u8; 81];
+        g.compute_dist(0, &mut d0);
+        g.compute_dist(1, &mut d1);
+
+        let mut lower = 0usize;
+        let mut upper = 0usize;
+        let mut unknown = 0usize;
+        for p0 in 9..81 {
+            for p1 in 0..72 {
+                if p0 == p1 {
+                    continue;
+                }
+                for turn in 0..2 {
+                    let id = state_id(p0, p1, turn);
+                    if exact[id] == 0 {
+                        continue;
+                    }
+                    g.pawn = [p0, p1];
+                    g.turn = turn;
+                    match race_outcome_gates_ab_with_dist(&g, &d0, &d1) {
+                        RaceBound::Lower(_) => {
+                            lower += 1;
+                            assert!(exact[id] > 0, "Lower on exact loss id={id}");
+                        }
+                        RaceBound::Upper(_) => {
+                            upper += 1;
+                            assert!(exact[id] < 0, "Upper on exact win id={id}");
+                        }
+                        RaceBound::Exact(_) => panic!("Service A returned Exact"),
+                        RaceBound::Unknown => unknown += 1,
+                    }
+                }
+            }
+        }
+        assert!(lower > 0, "empty board must exercise a Lower bound");
+        assert!(upper > 0, "empty board must exercise an Upper bound");
+        assert!(unknown > 0, "empty board must retain unresolved races");
+    }
+
     // ── 2. Fixed-wall sample configs ─────────────────────────────────────────
 
     #[test]
@@ -1918,6 +2072,60 @@ mod tests {
         let p0 = 18;
         let p1 = 9;
         assert_eq!(tbl[state_id(p0, p1, 0)], 1);
+    }
+
+    #[test]
+    fn jump_aware_far_apart_matches_bff_on_empty_board() {
+        let mut g = GameState::new();
+        g.pawn[0] = 40;
+        g.pawn[1] = 49;
+        g.turn = 0;
+        let mut d0 = [0u8; 81];
+        let mut d1 = [0u8; 81];
+        g.compute_dist(0, &mut d0);
+        g.compute_dist(1, &mut d1);
+        let ja = jump_aware_goal_distances(&mut g);
+        assert_eq!(ja.d0, d0[g.pawn[0]]);
+        assert_eq!(ja.d1, d1[g.pawn[1]]);
+        assert_eq!(g.pawn, [40, 49]);
+        assert_eq!(g.turn, 0);
+    }
+
+    #[test]
+    fn jump_aware_shortens_vs_bff_on_leapfrog_line() {
+        let mut g = GameState::new();
+        g.pawn[0] = 46;
+        g.pawn[1] = 37;
+        g.turn = 0;
+        let mut d0 = [0u8; 81];
+        g.compute_dist(0, &mut d0);
+        let ja = jump_aware_goal_distances(&mut g);
+        assert!(ja.d0 < d0[g.pawn[0]], "jump path should beat wall-only BFF");
+    }
+
+    #[test]
+    fn bff_tempo_margin_close_detects_tight_race() {
+        let mut g = GameState::new();
+        g.pawn[0] = 46;
+        g.pawn[1] = 37;
+        g.turn = 0;
+        let mut d0 = [0u8; 81];
+        let mut d1 = [0u8; 81];
+        g.compute_dist(0, &mut d0);
+        g.compute_dist(1, &mut d1);
+        assert!(bff_tempo_margin_close(&g, &d0, &d1));
+    }
+
+    #[test]
+    fn jump_aware_restores_game_state() {
+        let mut g = GameState::new();
+        g.pawn[0] = 46;
+        g.pawn[1] = 37;
+        g.turn = 1;
+        g.wl = [0, 0];
+        let before = (g.pawn, g.turn, g.wl);
+        let _ = jump_aware_goal_distances(&mut g);
+        assert_eq!((g.pawn, g.turn, g.wl), before);
     }
 
     #[test]
@@ -3905,6 +4113,37 @@ mod tests {
         );
     }
 
+    /// A fixed legal walled topology with interacting shortest routes must not
+    /// let the separated-path diagnostic manufacture a Service-A bound.
+    #[test]
+    fn service_a_declines_overlapping_walled_paths() {
+        let (oracle, overlap, contact_free, verdict, cls) = gate2_diag(92, 21, 20, 1);
+        assert_eq!(oracle, 11);
+        assert!(!overlap || !contact_free);
+        assert_eq!(verdict, RaceVerdict::Loss);
+        assert_eq!(cls, RaceClass::ProvenP1);
+
+        // Gate 2 is intentionally non-decisive: interaction remains possible.
+        let seed = 0xACE5_2026u64 ^ (92u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+        let mut rng = seed;
+        let topo = loop {
+            if let Some(t) = generate_legal_full_wall_topology(&mut rng, 256) {
+                break t;
+            }
+        };
+        let mut g = topo.g;
+        g.pawn = [21, 20];
+        g.turn = 1;
+        let mut d0 = [0u8; 81];
+        let mut d1 = [0u8; 81];
+        g.compute_dist(0, &mut d0);
+        g.compute_dist(1, &mut d1);
+        assert_eq!(
+            race_outcome_gates_ab_with_dist(&g, &d0, &d1),
+            RaceBound::Unknown
+        );
+    }
+
     /// Counterexample 2 — NON-ADJACENT pawns (manhattan 4). The corrected
     /// contact-aware test STILL reports "separated" (no shortest-path-set
     /// contact), yet the pure-race verdict is WRONG-SIGN: the trailing pawn
@@ -3962,6 +4201,15 @@ mod tests {
             wt.classify(id),
             RaceClass::ProvenP1,
             "p1 jumps over p0 and wins first"
+        );
+        assert_eq!(oracle[id], 7, "exact oracle must preserve the jump race");
+        gg.pawn = [37, 28];
+        gg.turn = 1;
+        let mut jump_buf = [0i16; 16];
+        let jump_count = gg.gen_pawn_moves(&mut jump_buf, 0);
+        assert!(
+            jump_buf[..jump_count].contains(&46),
+            "p1 must have the pinned jump 28->46"
         );
 
         // Mirror by vertical reflection (row r -> 8-r) and player swap:
