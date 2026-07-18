@@ -607,6 +607,7 @@ mod lazy_smp_tests {
                 opening_book: None,
                 root_defense_diag: Vec::new(),
                 race: RaceResultInfo::from_score(depth * 10),
+                timing: TimingDiag::default(),
             }
         }
 
@@ -1274,6 +1275,85 @@ impl RaceResultInfo {
     }
 }
 
+/// Post-search clock/ID diagnostics for time-management telemetry.
+/// Filled after search from existing depth_log + stop path; does not change
+/// search decisions. Cheap enough for default release match builds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimingDiag {
+    /// Caller-supplied hard budget (`go` time_ms).
+    pub allocated_hard_ms: u64,
+    /// Soft stop budget = hard * (0.85 or 0.92 when losing).
+    pub allocated_soft_ms: u64,
+    /// Hard budget minus RaceProof gate reserve.
+    pub searchable_ms: u64,
+    pub gate_reserve_ms: u64,
+    pub elapsed_ms: u64,
+    /// `elapsed - searchable` (negative = unfinished budget).
+    pub hard_overshoot_ms: i64,
+    /// `elapsed - soft`.
+    pub soft_overshoot_ms: i64,
+    pub last_iter_ms: u64,
+    pub prev_iter_ms: u64,
+    pub best_move_changes: u32,
+    pub partial_iter_used: bool,
+    /// Soft fraction in basis points (8500 or 9200).
+    pub soft_fraction_bp: u16,
+}
+
+impl TimingDiag {
+    fn from_think(
+        time_ms: u64,
+        gate_reserve_ms: u64,
+        _last_score: i32,
+        elapsed_ms: u64,
+        depth_log: &[AceDepthLogEntry],
+        best_move_changes: u32,
+        partial_iter_used: bool,
+        soft_ms: u64,
+    ) -> Self {
+        let soft = soft_ms.min(time_ms).max(1);
+        let searchable = time_ms.saturating_sub(gate_reserve_ms);
+        let (last_iter_ms, prev_iter_ms) = iter_costs_ms(depth_log);
+        let frac = soft as f64 / time_ms.max(1) as f64;
+        Self {
+            allocated_hard_ms: time_ms,
+            allocated_soft_ms: soft,
+            searchable_ms: searchable,
+            gate_reserve_ms,
+            elapsed_ms,
+            hard_overshoot_ms: elapsed_ms as i64 - searchable as i64,
+            soft_overshoot_ms: elapsed_ms as i64 - soft as i64,
+            last_iter_ms,
+            prev_iter_ms,
+            best_move_changes,
+            partial_iter_used,
+            soft_fraction_bp: (frac * 10_000.0).round() as u16,
+        }
+    }
+}
+
+fn iter_costs_ms(depth_log: &[AceDepthLogEntry]) -> (u64, u64) {
+    let n = depth_log.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let last = depth_log[n - 1].elapsed_ms.saturating_sub(if n >= 2 {
+        depth_log[n - 2].elapsed_ms
+    } else {
+        0
+    });
+    let prev = if n >= 2 {
+        depth_log[n - 2].elapsed_ms.saturating_sub(if n >= 3 {
+            depth_log[n - 3].elapsed_ms
+        } else {
+            0
+        })
+    } else {
+        0
+    };
+    (last, prev)
+}
+
 #[derive(Clone)]
 pub struct ThinkResult {
     pub mv: i16,
@@ -1302,6 +1382,7 @@ pub struct ThinkResult {
     /// Last lost-position root defense pass (one entry per legal root move searched).
     pub root_defense_diag: Vec<RootDefenseDiag>,
     pub race: RaceResultInfo,
+    pub timing: TimingDiag,
 }
 
 /// One complete late-move pipeline observation. These records are emitted only
@@ -1377,6 +1458,20 @@ mod score_label_tests {
     fn labels_race_scores_as_forced_races() {
         assert_eq!(score_label(RACE_MATE - 30), "race win in 30");
         assert_eq!(score_label(-(RACE_MATE - 17)), "race loss in 17");
+    }
+
+    #[test]
+    fn stability_soft_extends_on_instability_and_shortens_when_quiet() {
+        let base = TitaniumSearch::stability_soft_fraction(0, 0, 0, 0);
+        assert!((base - 0.85).abs() < 1e-9);
+        let unstable = TitaniumSearch::stability_soft_fraction(0, 3, -50, 0);
+        assert!(unstable > base);
+        assert!(unstable <= 1.0);
+        let quiet = TitaniumSearch::stability_soft_fraction(0, 0, 0, 3);
+        assert!(quiet < base);
+        assert!(quiet >= 0.55);
+        let losing_base = TitaniumSearch::stability_soft_fraction(-100, 0, 0, 0);
+        assert!((losing_base - 0.92).abs() < 1e-9);
     }
 
     #[test]
@@ -4391,9 +4486,64 @@ impl TitaniumSearch {
         }
     }
 
+    /// Stockfish-style soft budget as a fraction of hard `time_ms`.
+    ///
+    /// - Base: [`ace_time_fraction`] (0.85 / 0.92 when losing)
+    /// - Unstable (best-move flips, score drops): extend toward hard
+    /// - Stable (same best, quiet score): shorten to save clock for later
+    ///
+    /// Hard deadline stays `time_ms`; this only moves the soft stop.
+    pub(crate) fn stability_soft_fraction(
+        last_score: i32,
+        best_move_changes: u32,
+        score_delta: i32,
+        stable_iters: u32,
+    ) -> f64 {
+        let mut frac = Self::ace_time_fraction(last_score);
+        // Best-move instability → spend more (up to +0.15).
+        if best_move_changes > 0 {
+            frac += 0.05 * (best_move_changes.min(3) as f64);
+        }
+        // Eval falling from STM POV (score dropped) → extend.
+        if score_delta <= -40 {
+            frac += 0.08;
+        } else if score_delta >= 80 {
+            // Big jump up can also be unstable aspiration; slight extend.
+            frac += 0.03;
+        }
+        // Quiet + stable PV → save time for later stages.
+        if stable_iters >= 3 && best_move_changes == 0 && score_delta.abs() < 30 {
+            frac -= 0.10;
+        } else if stable_iters >= 2 && best_move_changes == 0 && score_delta.abs() < 20 {
+            frac -= 0.05;
+        }
+        frac.clamp(0.55, 1.0)
+    }
+
+    fn stability_soft_ms(
+        time_ms: u64,
+        last_score: i32,
+        best_move_changes: u32,
+        score_delta: i32,
+        stable_iters: u32,
+    ) -> u64 {
+        let frac = Self::stability_soft_fraction(
+            last_score,
+            best_move_changes,
+            score_delta,
+            stable_iters,
+        );
+        ((time_ms as f64) * frac).round() as u64
+    }
+
+    #[allow(dead_code)] // kept as fixed-fraction reference; live path uses soft_over_time_budget
     fn ace_over_time_budget(t0: Instant, time_ms: u64, last_score: i32) -> bool {
         let budget = time_ms as f64 * Self::ace_time_fraction(last_score);
         t0.elapsed().as_millis() as f64 > budget
+    }
+
+    fn soft_over_time_budget(t0: Instant, soft_ms: u64) -> bool {
+        t0.elapsed().as_millis() as u64 > soft_ms
     }
 
     /// Projects the next ID iteration's cost as `max(last two iteration
@@ -7842,6 +7992,7 @@ impl TitaniumSearch {
                 opening_book: self.pending_opening_book_diag.take(),
                 root_defense_diag: Vec::new(),
                 race: RaceResultInfo::default(),
+                timing: TimingDiag::default(),
             };
         }
         if self.cheap_cert {
@@ -7896,6 +8047,11 @@ impl TitaniumSearch {
                     opening_book: None,
                     root_defense_diag: Vec::new(),
                     race: solution.info,
+                    timing: TimingDiag {
+                        allocated_hard_ms: time_ms,
+                        elapsed_ms: rt0.elapsed().as_millis() as u64,
+                        ..TimingDiag::default()
+                    },
                 };
             }
         }
@@ -7943,6 +8099,11 @@ impl TitaniumSearch {
                         opening_book: None,
                         root_defense_diag: Vec::new(),
                         race: RaceResultInfo::exact(rv.signum() as i8, rk as u16),
+                        timing: TimingDiag {
+                            allocated_hard_ms: time_ms,
+                            elapsed_ms: rt0.elapsed().as_millis() as u64,
+                            ..TimingDiag::default()
+                        },
                     };
                 }
             }
@@ -8038,6 +8199,7 @@ impl TitaniumSearch {
                 opening_book: self.pending_opening_book_diag.take(),
                 root_defense_diag: Vec::new(),
                 race: RaceResultInfo::default(),
+                timing: TimingDiag::default(),
             };
         }
 
@@ -8378,6 +8540,11 @@ impl TitaniumSearch {
         let mut last_score = 0;
         let mut last_depth = 0;
         let mut stable = 0;
+        let mut best_move_changes: u32 = 0;
+        let mut score_delta: i32 = 0;
+        let mut soft_ms =
+            Self::stability_soft_ms(time_ms, last_score, best_move_changes, score_delta, stable);
+        let mut partial_iter_used = false;
         // RaceProof(b); -1 sentinel — pawn-move id 0 (a1) is legal
         let mut last_pawn_best: i16 = -1;
         let mut last_pawn_score: i32 = i32::MIN;
@@ -8450,13 +8617,20 @@ impl TitaniumSearch {
         };
 
         for d in start_depth..=max_depth {
-            if !full && d > 1 && Self::ace_over_time_budget(t0, time_ms, last_score) {
-                *stop_reason = "ace_over_time_budget_before_depth";
+            soft_ms = Self::stability_soft_ms(
+                time_ms,
+                last_score,
+                best_move_changes,
+                score_delta,
+                stable,
+            );
+            if !full && d > 1 && Self::soft_over_time_budget(t0, soft_ms) {
+                *stop_reason = "stability_soft_budget_before_depth";
                 break;
             }
             if self.use_predict_stop
                 && !full
-                && Self::predicted_over_time_budget(t0, time_ms, &depth_log)
+                && Self::predicted_over_time_budget(t0, soft_ms, &depth_log)
             {
                 *stop_reason = "predicted_over_time_budget_before_depth";
                 break;
@@ -8513,14 +8687,33 @@ impl TitaniumSearch {
             };
             match result {
                 Ok(sc) => {
+                    if self.root_best != last_best
+                        && last_best != super::TITANIUM_NO_MOVE
+                        && self.root_best >= 0
+                    {
+                        best_move_changes = best_move_changes.saturating_add(1);
+                    }
                     stable = if self.root_best == last_best {
                         stable + 1
                     } else {
                         0
                     };
+                    // Score swing vs previous completed ID step (0 on first).
+                    if last_depth > 0 {
+                        score_delta = sc - last_score;
+                    } else {
+                        score_delta = 0;
+                    }
                     last_best = self.root_best;
                     last_score = sc;
                     last_depth = d;
+                    soft_ms = Self::stability_soft_ms(
+                        time_ms,
+                        last_score,
+                        best_move_changes,
+                        score_delta,
+                        stable,
+                    );
                     if self.root_pawn_best >= 0 {
                         // RaceProof(b)
                         last_pawn_best = self.root_pawn_best;
@@ -8572,6 +8765,7 @@ impl TitaniumSearch {
                                 if self.use_partial_iter && self.root_best >= 0 {
                                     last_best = self.root_best;
                                     last_score = self.root_score;
+                                    partial_iter_used = true;
                                 }
                                 *stop_reason = "time_up";
                                 break;
@@ -8605,6 +8799,7 @@ impl TitaniumSearch {
                                 if self.use_partial_iter && self.root_best >= 0 {
                                     last_best = self.root_best;
                                     last_score = self.root_score;
+                                    partial_iter_used = true;
                                 }
                                 *stop_reason = "time_up";
                                 break;
@@ -8639,6 +8834,7 @@ impl TitaniumSearch {
                         last_best = self.root_best;
                         last_score = self.root_score;
                         last_depth = d;
+                        partial_iter_used = true;
                         if self.root_pawn_best >= 0 {
                             last_pawn_best = self.root_pawn_best;
                             last_pawn_score = self.root_pawn_score;
@@ -8648,8 +8844,8 @@ impl TitaniumSearch {
                     break; // state already restored by unwinding unmakes
                 }
             }
-            if !full && Self::ace_over_time_budget(t0, time_ms, last_score) {
-                *stop_reason = "ace_over_time_budget_after_depth";
+            if !full && Self::soft_over_time_budget(t0, soft_ms) {
+                *stop_reason = "stability_soft_budget_after_depth";
                 break;
             }
         }
@@ -8765,6 +8961,17 @@ impl TitaniumSearch {
         self.race_outcome_stats.race_tbl_lru_rebuilds =
             self.rc_solves.saturating_sub(rc_solves_at_start);
 
+        let timing = TimingDiag::from_think(
+            time_ms,
+            gate_reserve_ms,
+            last_score,
+            ms,
+            &depth_log,
+            best_move_changes,
+            partial_iter_used,
+            soft_ms,
+        );
+
         ThinkResult {
             mv: last_best,
             score: last_score,
@@ -8788,6 +8995,7 @@ impl TitaniumSearch {
             opening_book: self.pending_opening_book_diag.take(),
             root_defense_diag: self.root_defense_diag.clone(),
             race: RaceResultInfo::from_score(last_score),
+            timing,
         }
     }
 }

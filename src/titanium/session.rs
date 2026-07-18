@@ -1,3 +1,4 @@
+
 //! Titanium session wire protocol: `reset` / `position [MOVES]` /
 //! `makemove MOVE` / `go TIME_SEC` / `quit`. Holds one warm search per process
 //! so its TT and ordering tables persist between plies.
@@ -281,8 +282,38 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                     reply_error(&mut stdout, "terminal position");
                     continue;
                 }
-                let time_sec: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4.0);
-                let time_ms = (time_sec * 1000.0).max(1.0) as u64;
+                let (time_ms, sched) = if parts.get(1).map(|s| *s) == Some("rem") {
+                    let rem_sec: f64 =
+                        parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(4.0);
+                    let remaining_ms = (rem_sec * 1000.0).max(0.0) as u64;
+                    // Plan-30 (~60-ply mean / 2); extend with min(d0,d1) when
+                    // eval says the race still has more own-moves left.
+                    let ja = super::race::jump_aware_goal_distances(&mut search.g);
+                    let d0 = if ja.d0 == u8::MAX {
+                        None
+                    } else {
+                        Some(u32::from(ja.d0))
+                    };
+                    let d1 = if ja.d1 == u8::MAX {
+                        None
+                    } else {
+                        Some(u32::from(ja.d1))
+                    };
+                    let budget = super::time_alloc::allocate_move_budget_with_dists(
+                        remaining_ms,
+                        search.g.hist_len,
+                        search.g.turn,
+                        search.g.pawn,
+                        d0,
+                        d1,
+                    );
+                    (budget.move_ms.max(1), Some(budget))
+                } else {
+                    let time_sec: f64 =
+                        parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4.0);
+                    let time_ms = (time_sec * 1000.0).max(1.0) as u64;
+                    (time_ms, None)
+                };
                 #[cfg(not(target_arch = "wasm32"))]
                 let result =
                     search.think_with_threads(time_ms, 128, false, true, engine_flag, threads);
@@ -302,9 +333,39 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                         .map(|d| d.to_string())
                         .collect::<Vec<_>>()
                         .join(",");
+                    let elapsed_ms = result.ms;
+                    let nps = result.nodes.saturating_mul(1000) / elapsed_ms.max(1);
+                    let root_score_text = super::search::score_label(result.score);
+                    let t = result.timing;
+                    let (
+                        sched_move_ms,
+                        sched_optimum_ms,
+                        sched_remaining_ms,
+                        sched_safety_ms,
+                        sched_spendable_ms,
+                        sched_expected,
+                        sched_p95,
+                        sched_spend_factor,
+                        sched_geom,
+                        sched_ply,
+                    ) = match sched {
+                        Some(b) => (
+                            b.move_ms,
+                            b.optimum_ms,
+                            b.remaining_ms,
+                            b.safety_ms,
+                            b.spendable_ms,
+                            b.expected_own_moves,
+                            b.p95_own_moves,
+                            b.spend_factor,
+                            b.geom_ply_lb,
+                            b.ply,
+                        ),
+                        None => (0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0),
+                    };
                     let _ = writeln!(
                         stdout,
-                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}]}}",
+                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}],\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"nps\":{},\"allocatedHardMs\":{},\"allocatedSoftMs\":{},\"searchableMs\":{},\"gateReserveMs\":{},\"hardOvershootMs\":{},\"softOvershootMs\":{},\"lastIterMs\":{},\"prevIterMs\":{},\"bestMoveChanges\":{},\"partialIterUsed\":{},\"softFractionBp\":{},\"schedMoveMs\":{},\"schedOptimumMs\":{},\"schedRemainingMs\":{},\"schedSafetyMs\":{},\"schedSpendableMs\":{},\"schedReserveOwnMoves\":{:.2},\"schedExpectedOwnMoves\":{:.2},\"schedP95OwnMoves\":{:.2},\"schedSpendFactor\":{:.2},\"schedGeomPlyLb\":{},\"schedPly\":{}}}",
                         engine_flag,
                         result.stop_reason,
                         result.depth,
@@ -314,6 +375,34 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                         result.total_nodes,
                         result.main_completed_depth,
                         helper_depths,
+                        result.score,
+                        root_score_text,
+                        result.white_dist,
+                        result.black_dist,
+                        elapsed_ms,
+                        nps,
+                        t.allocated_hard_ms,
+                        t.allocated_soft_ms,
+                        t.searchable_ms,
+                        t.gate_reserve_ms,
+                        t.hard_overshoot_ms,
+                        t.soft_overshoot_ms,
+                        t.last_iter_ms,
+                        t.prev_iter_ms,
+                        t.best_move_changes,
+                        if t.partial_iter_used { "true" } else { "false" },
+                        t.soft_fraction_bp,
+                        sched_move_ms,
+                        sched_optimum_ms,
+                        sched_remaining_ms,
+                        sched_safety_ms,
+                        sched_spendable_ms,
+                        sched_expected,
+                        sched_expected,
+                        sched_p95,
+                        sched_spend_factor,
+                        sched_geom,
+                        sched_ply,
                     );
                     let _ = stdout.flush();
                 }
