@@ -299,6 +299,11 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                     } else {
                         Some(u32::from(ja.d1))
                     };
+                    // LengthBound comes from cheap geom inside the allocator.
+                    // Do NOT call certify() here: match clocks are wall-time
+                    // go→bestmove, and hands-empty certify can steal seconds
+                    // before search (C1 hot-path bug). Exact max_plies belongs
+                    // only when search already has Exact DTM, not a per-move cert.
                     let budget = super::time_alloc::allocate_move_budget_with_dists(
                         remaining_ms,
                         search.g.hist_len,

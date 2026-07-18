@@ -16,6 +16,8 @@
 
 use crate::titanium::dist::fill_ace_dist_from_pawn;
 use crate::titanium::game::GameState;
+use crate::titanium::race::{estimated_plies_to_result, RaceBound, RACE_WIN_FLOOR};
+use crate::titanium::time_alloc::LengthBound;
 use crate::util::clock::Instant;
 
 /// Budget / deadline abort. Mirrors the JS `BUDGET_EX` throw: it unwinds
@@ -56,7 +58,11 @@ impl Default for CertifyOpts {
     }
 }
 
-/// Result of [`certify`] (the subset the search consumes).
+/// Result of [`certify`] — score cut plus remaining-game length for TM.
+///
+/// `bound` is the αβ [`RaceBound`] (Lower/Upper floor when proven). `length` is
+/// never confused with that cut: min may come from geometry / walking ETA; max
+/// is set only for a known forced end (exact terminal or exact DTM).
 #[derive(Debug, Clone)]
 pub struct CertifyReport {
     /// `Some(side)` if that side's win is proven; `None` otherwise.
@@ -64,6 +70,63 @@ pub struct CertifyReport {
     /// Total certify nodes burned (used for the search's failure-memo work
     /// accounting — a deadline-starved run stamps only the work it actually did).
     pub nodes: u64,
+    /// Score cut for search (`Lower`/`Upper` floor, or `Unknown`).
+    pub bound: RaceBound,
+    /// Remaining-game length for time management / horizon (not an αβ cut).
+    pub length: LengthBound,
+}
+
+/// Pack proven side + node count into typed score/length fields.
+fn pack_report(game: &GameState, proven: Option<usize>, nodes: u64) -> CertifyReport {
+    let geom = LengthBound::optimistic_board(game.turn, game.pawn);
+    if game.winner() >= 0 {
+        let w = game.winner() as usize;
+        let bound = if w == game.turn {
+            RaceBound::Lower(RACE_WIN_FLOOR)
+        } else {
+            RaceBound::Upper(-RACE_WIN_FLOOR)
+        };
+        return CertifyReport {
+            proven: Some(w),
+            nodes,
+            bound,
+            length: LengthBound::exact(0),
+        };
+    }
+    let Some(winner) = proven else {
+        return CertifyReport {
+            proven: None,
+            nodes,
+            bound: RaceBound::Unknown,
+            length: geom,
+        };
+    };
+    let bound = if winner == game.turn {
+        RaceBound::Lower(RACE_WIN_FLOOR)
+    } else {
+        RaceBound::Upper(-RACE_WIN_FLOOR)
+    };
+    // Walking ETA raises min only — certify does not invent an exact DTM max.
+    let mut length = geom;
+    let mut d0 = [0u8; 81];
+    let mut d1 = [0u8; 81];
+    game.compute_dist(0, &mut d0);
+    game.compute_dist(1, &mut d1);
+    let wd = if winner == 0 {
+        d0[game.pawn[0]]
+    } else {
+        d1[game.pawn[1]]
+    };
+    if wd != u8::MAX {
+        let est = estimated_plies_to_result(game, winner, wd) as u32;
+        length = length.merge(LengthBound::with_min(est));
+    }
+    CertifyReport {
+        proven: Some(winner),
+        nodes,
+        bound,
+        length,
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -400,26 +463,18 @@ fn restore(g: &mut GameState, s: &Snapshot) {
 pub fn certify(game: &mut GameState, opts: &CertifyOpts) -> CertifyReport {
     let w = game.winner();
     if w >= 0 {
-        return CertifyReport {
-            proven: Some(w as usize),
-            nodes: 0,
-        };
+        return pack_report(game, Some(w as usize), 0);
     }
     if game.wl[0] + game.wl[1] > 3 {
-        return CertifyReport {
-            proven: None,
-            nodes: 0,
-        };
+        return pack_report(game, None, 0);
     }
     if game.wl[0] == 0 && game.wl[1] == 0 {
         let winner = no_wall_race_winner(game);
-        return CertifyReport {
-            proven: match opts.side {
-                Some(s @ (0 | 1)) if s != winner => None,
-                _ => Some(winner),
-            },
-            nodes: 0,
+        let proven = match opts.side {
+            Some(s @ (0 | 1)) if s != winner => None,
+            _ => Some(winner),
         };
+        return pack_report(game, proven, 0);
     }
     let mut d0 = [0u8; 81];
     let mut d1 = [0u8; 81];
@@ -457,19 +512,13 @@ pub fn certify(game: &mut GameState, opts: &CertifyOpts) -> CertifyReport {
         total_nodes += nodes;
         match verdict {
             Ok(true) => {
-                return CertifyReport {
-                    proven: Some(s),
-                    nodes: total_nodes,
-                }
+                return pack_report(game, Some(s), total_nodes);
             }
             Ok(false) => {}
             Err(Budget) => restore(game, &before),
         }
     }
-    CertifyReport {
-        proven: None,
-        nodes: total_nodes,
-    }
+    pack_report(game, None, total_nodes)
 }
 
 /// Upfront one-wall relaxation check — for the soundness counterexample ONLY
@@ -532,6 +581,10 @@ mod tests {
         );
         assert_eq!(report.proven, Some(0));
         assert_eq!(report.nodes, 0);
+        assert_eq!(report.bound, RaceBound::Lower(RACE_WIN_FLOOR));
+        assert!(report.length.min_plies.is_some());
+        // Certify does not invent Exact DTM for no-wall shortcut.
+        assert!(report.length.max_plies.is_none());
     }
 
     #[test]
@@ -547,6 +600,8 @@ mod tests {
         );
         assert_eq!(report.proven, None);
         assert_eq!(report.nodes, 0);
+        assert_eq!(report.bound, RaceBound::Unknown);
+        assert!(report.length.min_plies.is_some());
     }
 
     #[test]
@@ -561,5 +616,16 @@ mod tests {
         );
         assert_eq!(report.proven, None);
         assert_eq!(report.nodes, 0);
+        assert_eq!(report.bound, RaceBound::Unknown);
+    }
+
+    #[test]
+    fn terminal_position_emits_exact_zero_length() {
+        let mut g = race_game(4, 40, 0); // p0 already on goal row
+        assert!(g.winner() >= 0);
+        let report = certify(&mut g, &CertifyOpts::default());
+        assert_eq!(report.proven, Some(0));
+        assert_eq!(report.length, LengthBound::exact(0));
+        assert_eq!(report.bound, RaceBound::Lower(RACE_WIN_FLOOR));
     }
 }

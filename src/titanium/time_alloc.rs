@@ -21,7 +21,7 @@ pub const MAX_RATIO: f64 = 1.25;
 /// Remaining-game length bound for TM / horizon (not an αβ score cut).
 ///
 /// Separate from [`super::race::RaceBound`]: min/max plies must not be confused
-/// with Lower/Upper mate scores. `certify()` (C1) should fill both later.
+/// with Lower/Upper mate scores. `certify()` fills both (C1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LengthBound {
     /// Optimistic lower bound on plies until some terminal (geom / exact DTM).
@@ -39,9 +39,54 @@ impl LengthBound {
         }
     }
 
+    /// Exact remaining length (forced end in exactly `plies`).
+    #[inline]
+    pub fn exact(plies: u32) -> Self {
+        Self {
+            min_plies: Some(plies),
+            max_plies: Some(plies),
+        }
+    }
+
+    /// Raise `min_plies` only (never invents a max).
+    #[inline]
+    pub fn with_min(plies: u32) -> Self {
+        Self {
+            min_plies: Some(plies),
+            max_plies: None,
+        }
+    }
+
+    /// Tighten two bounds: max of mins, min of maxes. Drops `max` if it would
+    /// fall below `min` (refuse an unsound short-game dump).
+    #[inline]
+    pub fn merge(self, other: Self) -> Self {
+        let min_plies = match (self.min_plies, other.min_plies) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let max_plies = match (self.max_plies, other.max_plies) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let max_plies = match (min_plies, max_plies) {
+            (Some(lo), Some(hi)) if lo > hi => None,
+            _ => max_plies,
+        };
+        Self {
+            min_plies,
+            max_plies,
+        }
+    }
+
     /// Own-move floor implied by `min_plies` (STM moves on odd remaining plies).
     pub fn min_own_moves(&self) -> u32 {
         self.min_plies.map(own_moves_lb_from_plies).unwrap_or(0)
+    }
+
+    /// Own-move ceiling from `max_plies` when a forced end is known.
+    pub fn max_own_moves(&self) -> Option<u32> {
+        self.max_plies.map(|p| own_moves_lb_from_plies(p).max(1))
     }
 }
 
@@ -216,8 +261,31 @@ pub fn allocate_move_budget_with_dists(
     dist0: Option<u32>,
     dist1: Option<u32>,
 ) -> MoveBudget {
+    allocate_move_budget_with_length(
+        remaining_ms,
+        ply,
+        stm,
+        pawn,
+        dist0,
+        dist1,
+        LengthBound::optimistic_board(stm, pawn),
+    )
+}
+
+/// Like [`allocate_move_budget_with_dists`], merging an oracle/certify
+/// [`LengthBound`]. `max_plies` may shrink the spend horizon (forced short game);
+/// `min_plies` may only raise it.
+pub fn allocate_move_budget_with_length(
+    remaining_ms: u64,
+    ply: usize,
+    stm: usize,
+    pawn: [usize; 2],
+    dist0: Option<u32>,
+    dist1: Option<u32>,
+    length_hint: LengthBound,
+) -> MoveBudget {
     let geom_ply_lb = geometric_terminal_ply_lb(stm, pawn);
-    let length = LengthBound::optimistic_board(stm, pawn);
+    let length = LengthBound::optimistic_board(stm, pawn).merge(length_hint);
     let p95 = reserve_own_moves_p95(ply);
     let own_played = (ply / 2) as f64;
     // Mean-game own-move plan (~60 plies / 2) → remaining plan tail.
@@ -226,7 +294,14 @@ pub fn allocate_move_budget_with_dists(
     let eval_lb = eval_race_own_moves_lb(dist0, dist1) as f64;
     // LengthBound min → own-move floor (always applied; may only raise plan).
     let length_own = length.min_own_moves() as f64;
-    let expected_own_moves = plan_tail.max(eval_lb).max(length_own).max(1.0);
+    let mut expected_own_moves = plan_tail.max(eval_lb).max(length_own).max(1.0);
+    // Forced short game: do not reserve for mean-game plan beyond known end.
+    if let Some(max_own) = length.max_own_moves() {
+        expected_own_moves = expected_own_moves
+            .min(max_own as f64)
+            .max(length_own)
+            .max(1.0);
+    }
 
     let safety = if remaining_ms == 0 {
         0
@@ -360,5 +435,54 @@ mod tests {
             60_000, 0, 0, [76, 4], Some(45), None,
         );
         assert!((one.expected_own_moves - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exact_max_plies_shrinks_horizon() {
+        let base = allocate_move_budget(60_000, 0, 0, [76, 4]);
+        assert!((base.expected_own_moves - 30.0).abs() < 1e-9);
+
+        // Startpos geom min=7; exact(12) tightens to min=max=12 → 6 own moves.
+        let short = allocate_move_budget_with_length(
+            60_000,
+            0,
+            0,
+            [76, 4],
+            None,
+            None,
+            LengthBound::exact(12),
+        );
+        assert_eq!(short.length, LengthBound::exact(12));
+        assert!((short.expected_own_moves - 6.0).abs() < 1e-9);
+        assert!(short.optimum_ms > base.optimum_ms);
+
+        // max < geom min → drop max (refuse unsound short-game dump).
+        let bad = allocate_move_budget_with_length(
+            60_000,
+            0,
+            0,
+            [76, 4],
+            None,
+            None,
+            LengthBound {
+                min_plies: None,
+                max_plies: Some(3),
+            },
+        );
+        assert!(bad.length.max_plies.is_none());
+        assert!((bad.expected_own_moves - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn length_bound_merge_tightens() {
+        let a = LengthBound::with_min(7).merge(LengthBound::exact(12));
+        // exact(12) min=12 beats with_min(7); max=12 kept.
+        assert_eq!(a, LengthBound::exact(12));
+        let b = LengthBound::exact(8).merge(LengthBound {
+            min_plies: Some(3),
+            max_plies: Some(20),
+        });
+        assert_eq!(b.min_plies, Some(8));
+        assert_eq!(b.max_plies, Some(8));
     }
 }

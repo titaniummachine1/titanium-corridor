@@ -102,6 +102,28 @@ impl RaceBound {
             RaceBound::Unknown => 0,
         }
     }
+
+    /// Remaining-game length implied by a score cut — never invents Exact from
+    /// a floor. `Exact` → min=max=DTM; DTM-band Lower/Upper → max only.
+    #[inline]
+    pub fn length_bound(self) -> crate::titanium::time_alloc::LengthBound {
+        use crate::titanium::time_alloc::LengthBound;
+        match self {
+            RaceBound::Exact(v) => LengthBound::exact((RACE_MATE - v.abs()) as u32),
+            RaceBound::Lower(v) | RaceBound::Upper(v) => {
+                let abs = v.abs();
+                if abs > RACE_WIN_FLOOR && abs <= RACE_MATE {
+                    LengthBound {
+                        min_plies: None,
+                        max_plies: Some((RACE_MATE - abs) as u32),
+                    }
+                } else {
+                    LengthBound::default()
+                }
+            }
+            RaceBound::Unknown => LengthBound::default(),
+        }
+    }
 }
 
 /// Secondary time metadata for Service A — never exact DTM.
@@ -117,6 +139,8 @@ pub enum PlyEstimate {
 pub struct RaceDeduction {
     pub bound: RaceBound,
     pub estimated_plies: PlyEstimate,
+    /// TM length hint derived from `bound` + walking ETA (never confuses score cuts).
+    pub length: crate::titanium::time_alloc::LengthBound,
 }
 
 /// Approximate plies for the proven winner to reach its goal (may exceed exact DTM).
@@ -500,6 +524,12 @@ pub struct RaceOutcomeStats {
     pub jump_dist_upgrades: u64,
     /// Heuristic sign would differ under BFF vs jump-aware distances.
     pub jump_dist_cuts_avoided: u64,
+    /// Experimental wall-ignorance loss certificate (env-gated, default off).
+    pub wall_ignore_calls: u64,
+    pub wall_ignore_decisive: u64,
+    pub wall_ignore_unknown: u64,
+    pub wall_ignore_cut_fail_high: u64,
+    pub wall_ignore_cut_fail_low: u64,
 }
 
 impl RaceOutcomeStats {
@@ -513,7 +543,7 @@ impl RaceOutcomeStats {
 
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{},"one_wall_calls":{},"one_wall_decisive":{},"one_wall_unknown":{},"two_wall_calls":{},"two_wall_decisive":{},"two_wall_unknown":{},"broke_calls":{},"broke_decisive":{},"broke_unknown":{},"broke_lower":{},"broke_upper":{},"broke_cut_fail_high":{},"broke_cut_fail_low":{},"jump_dist_calls":{},"jump_dist_upgrades":{},"jump_dist_cuts_avoided":{}}}"#,
+            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{},"one_wall_calls":{},"one_wall_decisive":{},"one_wall_unknown":{},"two_wall_calls":{},"two_wall_decisive":{},"two_wall_unknown":{},"broke_calls":{},"broke_decisive":{},"broke_unknown":{},"broke_lower":{},"broke_upper":{},"broke_cut_fail_high":{},"broke_cut_fail_low":{},"jump_dist_calls":{},"jump_dist_upgrades":{},"jump_dist_cuts_avoided":{},"wall_ignore_calls":{},"wall_ignore_decisive":{},"wall_ignore_unknown":{},"wall_ignore_cut_fail_high":{},"wall_ignore_cut_fail_low":{}}}"#,
             self.calls,
             self.gate1_decisive,
             self.gate1_unknown,
@@ -543,6 +573,11 @@ impl RaceOutcomeStats {
             self.jump_dist_calls,
             self.jump_dist_upgrades,
             self.jump_dist_cuts_avoided,
+            self.wall_ignore_calls,
+            self.wall_ignore_decisive,
+            self.wall_ignore_unknown,
+            self.wall_ignore_cut_fail_high,
+            self.wall_ignore_cut_fail_low,
         )
     }
 }
@@ -586,9 +621,15 @@ pub fn race_outcome_detailed(g: &mut GameState, s: &mut RaceScratch) -> RaceDedu
     } else {
         winner_table_bound(g, s, None)
     };
+    let estimated_plies = ply_estimate_for_bound(g, bound);
+    let mut length = bound.length_bound();
+    if let PlyEstimate::Approx(p) = estimated_plies {
+        length = length.merge(crate::titanium::time_alloc::LengthBound::with_min(p as u32));
+    }
     RaceDeduction {
-        estimated_plies: ply_estimate_for_bound(g, bound),
+        estimated_plies,
         bound,
+        length,
     }
 }
 

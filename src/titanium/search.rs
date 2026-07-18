@@ -5155,10 +5155,13 @@ impl TitaniumSearch {
         if !enabled {
             return RaceBound::Unknown;
         }
+        self.race_outcome_stats.wall_ignore_calls += 1;
         let mut scratch = CertScratch::new();
         let Some(verdict) = try_wall_ignorance_loss_cert(&mut self.g, &mut scratch, true) else {
+            self.race_outcome_stats.wall_ignore_unknown += 1;
             return RaceBound::Unknown;
         };
+        self.race_outcome_stats.wall_ignore_decisive += 1;
         if verdict.winner == self.g.turn {
             RaceBound::Lower(RACE_WIN_FLOOR)
         } else {
@@ -6733,8 +6736,14 @@ impl TitaniumSearch {
         }
         if depth <= 0 {
             match self.wall_ignore_race_bound() {
-                RaceBound::Lower(v) if v >= beta => return Ok(beta),
-                RaceBound::Upper(v) if v <= alpha => return Ok(alpha),
+                RaceBound::Lower(v) if v >= beta => {
+                    self.race_outcome_stats.wall_ignore_cut_fail_high += 1;
+                    return Ok(beta);
+                }
+                RaceBound::Upper(v) if v <= alpha => {
+                    self.race_outcome_stats.wall_ignore_cut_fail_low += 1;
+                    return Ok(alpha);
+                }
                 RaceBound::Lower(_)
                 | RaceBound::Upper(_)
                 | RaceBound::Exact(_)
@@ -6829,8 +6838,14 @@ impl TitaniumSearch {
         }
 
         match self.wall_ignore_race_bound() {
-            RaceBound::Lower(v) if v >= beta => return Ok(beta),
-            RaceBound::Upper(v) if v <= alpha => return Ok(alpha),
+            RaceBound::Lower(v) if v >= beta => {
+                self.race_outcome_stats.wall_ignore_cut_fail_high += 1;
+                return Ok(beta);
+            }
+            RaceBound::Upper(v) if v <= alpha => {
+                self.race_outcome_stats.wall_ignore_cut_fail_low += 1;
+                return Ok(alpha);
+            }
             RaceBound::Lower(_)
             | RaceBound::Upper(_)
             | RaceBound::Exact(_)
