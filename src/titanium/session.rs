@@ -347,6 +347,7 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                         sched_p95,
                         sched_spend_factor,
                         sched_geom,
+                        sched_len_min,
                         sched_ply,
                     ) = match sched {
                         Some(b) => (
@@ -359,13 +360,14 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                             b.p95_own_moves,
                             b.spend_factor,
                             b.geom_ply_lb,
+                            b.length.min_plies.unwrap_or(0),
                             b.ply,
                         ),
-                        None => (0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0),
+                        None => (0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0, 0),
                     };
                     let _ = writeln!(
                         stdout,
-                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}],\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"nps\":{},\"allocatedHardMs\":{},\"allocatedSoftMs\":{},\"searchableMs\":{},\"gateReserveMs\":{},\"hardOvershootMs\":{},\"softOvershootMs\":{},\"lastIterMs\":{},\"prevIterMs\":{},\"bestMoveChanges\":{},\"partialIterUsed\":{},\"softFractionBp\":{},\"schedMoveMs\":{},\"schedOptimumMs\":{},\"schedRemainingMs\":{},\"schedSafetyMs\":{},\"schedSpendableMs\":{},\"schedReserveOwnMoves\":{:.2},\"schedExpectedOwnMoves\":{:.2},\"schedP95OwnMoves\":{:.2},\"schedSpendFactor\":{:.2},\"schedGeomPlyLb\":{},\"schedPly\":{}}}",
+                        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}],\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"nps\":{},\"allocatedHardMs\":{},\"allocatedSoftMs\":{},\"searchableMs\":{},\"gateReserveMs\":{},\"hardOvershootMs\":{},\"softOvershootMs\":{},\"lastIterMs\":{},\"prevIterMs\":{},\"bestMoveChanges\":{},\"partialIterUsed\":{},\"softFractionBp\":{},\"schedMoveMs\":{},\"schedOptimumMs\":{},\"schedRemainingMs\":{},\"schedSafetyMs\":{},\"schedSpendableMs\":{},\"schedReserveOwnMoves\":{:.2},\"schedExpectedOwnMoves\":{:.2},\"schedP95OwnMoves\":{:.2},\"schedSpendFactor\":{:.2},\"schedGeomPlyLb\":{},\"schedLengthMinPlies\":{},\"schedPly\":{}}}",
                         engine_flag,
                         result.stop_reason,
                         result.depth,
@@ -402,6 +404,7 @@ pub fn run_titanium_session_stdio(engine_flag: &str, threads: usize) {
                         sched_p95,
                         sched_spend_factor,
                         sched_geom,
+                        sched_len_min,
                         sched_ply,
                     );
                     let _ = stdout.flush();

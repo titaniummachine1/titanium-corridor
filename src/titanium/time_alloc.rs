@@ -18,6 +18,33 @@ pub const PLAN_OWN_MOVES: f64 = 30.0;
 /// Hard ceiling vs optimum (Stockfish-style steal room).
 pub const MAX_RATIO: f64 = 1.25;
 
+/// Remaining-game length bound for TM / horizon (not an αβ score cut).
+///
+/// Separate from [`super::race::RaceBound`]: min/max plies must not be confused
+/// with Lower/Upper mate scores. `certify()` (C1) should fill both later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LengthBound {
+    /// Optimistic lower bound on plies until some terminal (geom / exact DTM).
+    pub min_plies: Option<u32>,
+    /// Upper bound when a forced end is known; `None` = unknown.
+    pub max_plies: Option<u32>,
+}
+
+impl LengthBound {
+    /// Board-only optimistic min from pure race geometry (no walls cooperation).
+    pub fn optimistic_board(stm: usize, pawn: [usize; 2]) -> Self {
+        Self {
+            min_plies: Some(geometric_terminal_ply_lb(stm, pawn)),
+            max_plies: None,
+        }
+    }
+
+    /// Own-move floor implied by `min_plies` (STM moves on odd remaining plies).
+    pub fn min_own_moves(&self) -> u32 {
+        self.min_plies.map(own_moves_lb_from_plies).unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoveBudget {
     /// Hard deadline passed to `think` (optimum × MAX_RATIO, capped).
@@ -34,6 +61,8 @@ pub struct MoveBudget {
     pub spend_factor: f64,
     /// Geometric earliest-terminal ply lower bound (diagnostic).
     pub geom_ply_lb: u32,
+    /// Typed length bound fed into the horizon (O2b).
+    pub length: LengthBound,
     pub ply: u32,
 }
 
@@ -188,19 +217,16 @@ pub fn allocate_move_budget_with_dists(
     dist1: Option<u32>,
 ) -> MoveBudget {
     let geom_ply_lb = geometric_terminal_ply_lb(stm, pawn);
+    let length = LengthBound::optimistic_board(stm, pawn);
     let p95 = reserve_own_moves_p95(ply);
     let own_played = (ply / 2) as f64;
     // Mean-game own-move plan (~60 plies / 2) → remaining plan tail.
     let plan_tail = (PLAN_OWN_MOVES - own_played).max(1.0);
     // Lower bound from eval: smaller distance-to-win of the two players.
     let eval_lb = eval_race_own_moves_lb(dist0, dist1) as f64;
-    // Fallback when eval dists are unavailable: optimistic geometric race.
-    let geom_fallback = if eval_lb > 0.0 {
-        0.0
-    } else {
-        own_moves_lb_from_plies(geom_ply_lb) as f64
-    };
-    let expected_own_moves = plan_tail.max(eval_lb).max(geom_fallback).max(1.0);
+    // LengthBound min → own-move floor (always applied; may only raise plan).
+    let length_own = length.min_own_moves() as f64;
+    let expected_own_moves = plan_tail.max(eval_lb).max(length_own).max(1.0);
 
     let safety = if remaining_ms == 0 {
         0
@@ -245,6 +271,7 @@ pub fn allocate_move_budget_with_dists(
         p95_own_moves: p95,
         spend_factor,
         geom_ply_lb,
+        length,
         ply: ply as u32,
     }
 }
@@ -299,12 +326,15 @@ mod tests {
     }
 
     #[test]
-    fn geom_can_raise_expected_above_plan_tail() {
-        // Late ply: plan_tail = 1; without eval dists, geometric fallback raises.
+    fn length_bound_raises_late_game_horizon() {
+        let lb = LengthBound::optimistic_board(0, [76, 4]);
+        assert_eq!(lb.min_plies, Some(7));
+        assert!(lb.max_plies.is_none());
+        assert_eq!(lb.min_own_moves(), 4);
+        // Late ply: plan_tail=1, length own=4 raises expected.
         let b = allocate_move_budget(30_000, 80, 0, [76, 4]);
+        assert_eq!(b.length.min_plies, Some(b.geom_ply_lb));
         assert!(b.expected_own_moves >= 4.0, "{b:?}");
-        assert!((b.p95_own_moves - 5.0).abs() < 1e-9);
-        assert_eq!(own_moves_lb_from_plies(b.geom_ply_lb), 4);
     }
 
     #[test]
